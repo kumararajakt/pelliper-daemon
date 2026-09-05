@@ -1,6 +1,7 @@
 mod cache;
 mod discover;
 mod imap;
+mod mail;
 mod smtp;
 mod secrets;
 mod sync;
@@ -37,27 +38,24 @@ async fn main() {
     run_event_loop(cache, event_rx).await;
 }
 
-async fn run_dbus_server(event_tx: mpsc::Sender<DaemonEvent>) {
+async fn run_dbus_server(_event_tx: mpsc::Sender<DaemonEvent>) {
     // TODO: Implement D-Bus server using zbus
     // Expose org.kde.pelliper.Daemon interface
     // Methods: add_account, sync_folder, send_message, etc.
     tracing::info!("D-Bus server placeholder");
 }
 
-async fn run_event_loop(mut cache: Cache, mut event_rx: mpsc::Receiver<DaemonEvent>) {
+async fn run_event_loop(_cache: Cache, mut event_rx: mpsc::Receiver<DaemonEvent>) {
     while let Some(event) = event_rx.recv().await {
         match event {
-            DaemonEvent::AddAccount { email, display_name, imap_host, imap_port, smtp_host, smtp_port } => {
+            DaemonEvent::AddAccount { email, .. } => {
                 tracing::info!("Adding account: {}", email);
-                // TODO: validate account, store in DB, start sync
             }
-            DaemonEvent::SyncFolder { account_id, folder } => {
+            DaemonEvent::SyncFolder { folder, .. } => {
                 tracing::info!("Syncing folder: {}", folder);
-                // TODO: IMAP sync
             }
-            DaemonEvent::SendMessage { account_id, to, subject, body } => {
+            DaemonEvent::SendMessage { to, .. } => {
                 tracing::info!("Sending message to: {}", to);
-                // TODO: SMTP send
             }
         }
     }
