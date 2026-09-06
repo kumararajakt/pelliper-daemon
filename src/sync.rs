@@ -43,7 +43,7 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Sync a single account: list folders, then sync each folder.
+    /// Sync a single account with retry on failure.
     pub async fn sync_account(
         &self,
         account: &Account,
@@ -54,18 +54,42 @@ impl SyncEngine {
             account.auth_type
         );
 
+        // Attempt 1
+        match self.try_sync_account(account).await {
+            Ok(()) => {
+                tracing::info!("Sync completed for {}", account.email);
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!("Sync attempt 1 failed for {}: {}", account.email, e);
+            }
+        }
+
+        // Attempt 2: fresh connection
+        tracing::info!("Retrying sync for {} with fresh connection", account.email);
+        match self.try_sync_account(account).await {
+            Ok(()) => {
+                tracing::info!("Sync completed for {} (retry)", account.email);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("Sync attempt 2 failed for {}: {}", account.email, e);
+                Err(e)
+            }
+        }
+    }
+
+    /// Single attempt to sync an account.
+    async fn try_sync_account(
+        &self,
+        account: &Account,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let host = account.imap_host.as_deref().unwrap_or("localhost");
         let port = account.imap_port.unwrap_or(993) as u16;
         let email = &account.email;
 
         let key_name = format!("pelliper:{}", email);
-        let credential = match self.secrets.get_password(&key_name).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to get credential for {}: {}", email, e);
-                return Err(e);
-            }
-        };
+        let credential = self.secrets.get_password(&key_name).await?;
 
         if account.auth_type == "oauth" {
             self.sync_account_oauth(account, host, port, email, &credential)
@@ -87,7 +111,6 @@ impl SyncEngine {
         let refresh_token = match &account.refresh_token {
             Some(rt) if !rt.is_empty() => rt.clone(),
             _ => {
-                tracing::error!("No refresh token stored for {}", email);
                 return Err("No refresh token configured. Re-add the account.".into());
             }
         };
@@ -106,20 +129,9 @@ impl SyncEngine {
         .await?;
 
         tracing::info!("Refreshed access token for {}", email);
-        self.sync_with_access_token(account, host, port, email, &token.access_token)
-            .await
-    }
 
-    async fn sync_with_access_token(
-        &self,
-        account: &Account,
-        host: &str,
-        port: u16,
-        email: &str,
-        access_token: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut session =
-            crate::imap::connect_session_oauth(host, port, email, access_token).await?;
+            crate::imap::connect_session_oauth(host, port, email, &token.access_token).await?;
 
         let folders = session.list_folders().await?;
         tracing::info!("Found {} folders for {} (oauth)", folders.len(), email);
@@ -127,27 +139,39 @@ impl SyncEngine {
         {
             let cache = self.cache.lock().await;
             for folder in &folders {
-                if let Err(e) = cache.upsert_folder(account.id, &folder.path, 0, folder.noselect) {
-                    tracing::error!("Failed to upsert folder {}: {}", folder.path, e);
-                }
+                let _ = cache.upsert_folder(account.id, &folder.path, 0, folder.noselect);
             }
         }
 
         for folder in &folders {
             if folder.noselect {
-                tracing::debug!("Skipping noselect folder: {}", folder.path);
                 continue;
             }
             if let Err(e) = self
                 .sync_folder_windowed_raw(account, &folder.path, &mut session)
                 .await
             {
-                tracing::error!("Failed to sync folder {} for {}: {}", folder.path, email, e);
+                tracing::error!(
+                    "Folder {} failed: {} — retrying with fresh session",
+                    folder.path,
+                    e
+                );
+                // Retry this folder with a fresh session
+                if let Ok(mut fresh) =
+                    crate::imap::connect_session_oauth(host, port, email, &token.access_token).await
+                {
+                    if let Err(e2) = self
+                        .sync_folder_windowed_raw(account, &folder.path, &mut fresh)
+                        .await
+                    {
+                        tracing::error!("Folder {} retry also failed: {}", folder.path, e2);
+                    }
+                    fresh.logout().await;
+                }
             }
         }
 
         session.logout().await;
-        tracing::info!("Sync completed for {} (oauth)", email);
         Ok(())
     }
 
@@ -168,27 +192,38 @@ impl SyncEngine {
         {
             let cache = self.cache.lock().await;
             for folder in &folders {
-                if let Err(e) = cache.upsert_folder(account.id, &folder.path, 0, folder.noselect) {
-                    tracing::error!("Failed to upsert folder {}: {}", folder.path, e);
-                }
+                let _ = cache.upsert_folder(account.id, &folder.path, 0, folder.noselect);
             }
         }
 
         for folder in &folders {
             if folder.noselect {
-                tracing::debug!("Skipping noselect folder: {}", folder.path);
                 continue;
             }
             if let Err(e) = self
                 .sync_folder_windowed_imap(account, &folder.path, &mut session)
                 .await
             {
-                tracing::error!("Failed to sync folder {} for {}: {}", folder.path, email, e);
+                tracing::error!(
+                    "Folder {} failed: {} — retrying with fresh session",
+                    folder.path,
+                    e
+                );
+                if let Ok(mut fresh) =
+                    crate::imap::connect_session_password(host, port, email, password).await
+                {
+                    if let Err(e2) = self
+                        .sync_folder_windowed_imap(account, &folder.path, &mut fresh)
+                        .await
+                    {
+                        tracing::error!("Folder {} retry also failed: {}", folder.path, e2);
+                    }
+                    crate::imap::logout_session(&mut fresh).await;
+                }
             }
         }
 
         crate::imap::logout_session(&mut session).await;
-        tracing::info!("Sync completed for {} (password)", email);
         Ok(())
     }
 
@@ -296,8 +331,6 @@ impl SyncEngine {
         {
             let cache = self.cache.lock().await;
             let _ = cache.delete_stale_messages(account.id, folder_path, &all_uids);
-
-            // Recount unread after full sync
             let unread = cache.count_unread(account.id, folder_path)?;
             let _ = cache.update_folder_unread(account.id, folder_path, unread);
         }
@@ -413,7 +446,6 @@ impl SyncEngine {
         {
             let cache = self.cache.lock().await;
             let _ = cache.delete_stale_messages(account.id, folder_path, &all_uids);
-
             let unread = cache.count_unread(account.id, folder_path)?;
             let _ = cache.update_folder_unread(account.id, folder_path, unread);
         }
@@ -422,15 +454,12 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Prefetch bodies for the N most recent messages in a folder.
-    /// Skips messages that already have cached bodies.
     async fn prefetch_bodies_raw(
         &self,
         account: &Account,
         folder_path: &str,
         session: &mut crate::imap::RawImapSession,
     ) {
-        // Get the most recent UIDs (sorted newest first)
         let recent_uids: Vec<i64> = {
             let cache = self.cache.lock().await;
             match cache.load_recent_uids(account.id, folder_path, PREFETCH_BODY_LIMIT) {
@@ -442,16 +471,16 @@ impl SyncEngine {
             }
         };
 
-        // Filter out already-cached bodies
         let to_fetch: Vec<i64> = {
             let cache = self.cache.lock().await;
-            let mut result = Vec::new();
-            for uid in &recent_uids {
-                if let Ok(false) = cache.has_body(account.id, folder_path, *uid) {
-                    result.push(*uid);
-                }
-            }
-            result
+            recent_uids
+                .iter()
+                .copied()
+                .filter(|uid| match cache.has_body(account.id, folder_path, *uid) {
+                    Ok(has) => !has,
+                    Err(_) => true, // on error, try fetching anyway
+                })
+                .collect()
         };
 
         if to_fetch.is_empty() {
@@ -470,7 +499,6 @@ impl SyncEngine {
             recent_uids.len() - to_fetch.len()
         );
 
-        // SELECT the folder for fetching
         if let Err(e) = session.select_folder(folder_path).await {
             tracing::error!(
                 "Folder {}: SELECT failed for body prefetch: {}",
@@ -480,30 +508,65 @@ impl SyncEngine {
             return;
         }
 
-        // Batch fetch bodies
+        // Attempt 1
         match session.fetch_bodies_batch(&to_fetch).await {
             Ok(bodies) => {
-                let cache = self.cache.lock().await;
-                for (uid, raw) in &bodies {
-                    let parsed = crate::imap::parse_message_body(raw);
-                    let html = if parsed.html.is_empty() {
-                        format!("<pre>{}</pre>", html_escape(&parsed.text))
-                    } else {
-                        parsed.html.clone()
-                    };
-                    let _ = cache.save_body(account.id, folder_path, *uid, &html);
-                    let _ = cache.update_has_attachment(
-                        account.id,
-                        folder_path,
-                        *uid,
-                        parsed.has_attachments,
-                    );
-                }
+                self.cache_prefetched_bodies(account, folder_path, &bodies);
                 tracing::info!("Folder {}: prefetched {} bodies", folder_path, bodies.len());
             }
             Err(e) => {
-                tracing::error!("Folder {}: body prefetch failed: {}", folder_path, e);
+                tracing::warn!(
+                    "Folder {}: body prefetch failed: {} — retrying",
+                    folder_path,
+                    e
+                );
+                // Retry: re-select and fetch again
+                if let Ok(()) = session.select_folder(folder_path).await {
+                    if let Ok(bodies) = session.fetch_bodies_batch(&to_fetch).await {
+                        self.cache_prefetched_bodies(account, folder_path, &bodies);
+                        tracing::info!(
+                            "Folder {}: prefetched {} bodies (retry)",
+                            folder_path,
+                            bodies.len()
+                        );
+                    }
+                }
             }
         }
+    }
+
+    fn cache_prefetched_bodies(
+        &self,
+        account: &Account,
+        folder_path: &str,
+        bodies: &[(i64, Vec<u8>)],
+    ) {
+        // Use tokio::sync::Mutex directly — this runs in async context
+        let cache_ref = &self.cache;
+        // We can't .await here (sync fn), so parse bodies outside the lock
+        let parsed_bodies: Vec<(i64, String, bool)> = bodies
+            .iter()
+            .map(|(uid, raw)| {
+                let parsed = crate::imap::parse_message_body(raw);
+                let html = if parsed.html.is_empty() {
+                    format!("<pre>{}</pre>", html_escape(&parsed.text))
+                } else {
+                    parsed.html
+                };
+                (*uid, html, parsed.has_attachments)
+            })
+            .collect();
+
+        // Spawn to handle cache writes asynchronously
+        let cache = cache_ref.clone();
+        let account_id = account.id;
+        let folder = folder_path.to_string();
+        tokio::spawn(async move {
+            let cache = cache.lock().await;
+            for (uid, html, has_attachments) in &parsed_bodies {
+                let _ = cache.save_body(account_id, &folder, *uid, html);
+                let _ = cache.update_has_attachment(account_id, &folder, *uid, *has_attachments);
+            }
+        });
     }
 }
