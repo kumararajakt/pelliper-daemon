@@ -88,7 +88,6 @@ impl Daemon {
             smtp_port: Some(smtp_port as i64),
             smtp_security: Some("starttls".to_string()),
             username: Some(email.to_string()),
-            access_token: Some(auth_token.to_string()),
             refresh_token: if refresh_token.is_empty() { None } else { Some(refresh_token.to_string()) },
             enabled: true,
         };

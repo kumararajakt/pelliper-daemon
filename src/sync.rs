@@ -55,7 +55,7 @@ impl SyncEngine {
         }
     }
 
-    /// Sync using OAuth (OAUTHBEARER) via RawImapSession.
+    /// Sync using OAuth via RawImapSession. Refresh token stored in DB.
     async fn sync_account_oauth(
         &self,
         account: &Account,
@@ -64,47 +64,27 @@ impl SyncEngine {
         email: &str,
         _access_token: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Get refresh token from account and refresh the access token
         let refresh_token = match &account.refresh_token {
             Some(rt) if !rt.is_empty() => rt.clone(),
             _ => {
-                tracing::warn!("No refresh token for {}, using stored access token", email);
-                let access_token = account.access_token.as_deref().unwrap_or("");
-                return self.sync_with_access_token(account, host, port, email, access_token).await;
+                tracing::error!("No refresh token stored for {}", email);
+                return Err("No refresh token configured. Re-add the account.".into());
             }
         };
 
-        // Refresh the access token
         let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
             .unwrap_or_else(|_| "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com".to_string());
         let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET")
             .unwrap_or_default();
 
-        let token = match oauth::refresh_access_token(
+        let token = oauth::refresh_access_token(
             "https://oauth2.googleapis.com/token",
             &client_id,
             &client_secret,
             &refresh_token,
-        ).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!("Failed to refresh token for {}: {}", email, e);
-                // Fall back to stored access token
-                let access_token = account.access_token.as_deref().unwrap_or("");
-                return self.sync_with_access_token(account, host, port, email, access_token).await;
-            }
-        };
+        ).await?;
 
         tracing::info!("Refreshed access token for {}", email);
-
-        // Update the access token in DB
-        {
-            let mut cache = self.cache.lock().await;
-            if let Err(e) = cache.update_access_token(account.id, &token.access_token) {
-                tracing::error!("Failed to update access token in DB: {}", e);
-            }
-        }
-
         self.sync_with_access_token(account, host, port, email, &token.access_token).await
     }
 

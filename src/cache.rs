@@ -5,6 +5,26 @@ pub struct Cache {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Folder {
+    pub path: String,
+    pub unread_count: i32,
+    pub noselect: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Message {
+    pub uid: i64,
+    pub subject: Option<String>,
+    pub sender: Option<String>,
+    pub date: i64,
+    pub in_reply_to: Option<String>,
+    pub has_attachments: bool,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub preview: Option<String>,
+}
+
 impl Cache {
     pub fn open(data_dir: &PathBuf) -> Result<Self> {
         std::fs::create_dir_all(data_dir).ok();
@@ -33,6 +53,7 @@ impl Cache {
                 smtp_port INTEGER,
                 smtp_security TEXT DEFAULT 'starttls',
                 username TEXT,
+                refresh_token TEXT,
                 enabled INTEGER DEFAULT 1,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -117,7 +138,7 @@ impl Cache {
 
     pub fn load_accounts(&self) -> Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, access_token, refresh_token, enabled FROM accounts",
+            "SELECT id, email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, refresh_token, enabled FROM accounts",
         )?;
 
         let accounts = stmt
@@ -135,9 +156,8 @@ impl Cache {
                     smtp_port: row.get(9)?,
                     smtp_security: row.get(10)?,
                     username: row.get(11)?,
-                    access_token: row.get(12)?,
-                    refresh_token: row.get(13)?,
-                    enabled: row.get(14)?,
+                    refresh_token: row.get(12)?,
+                    enabled: row.get(13)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -147,7 +167,7 @@ impl Cache {
 
     pub fn insert_account(&mut self, account: &Account) -> Result<i64> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO accounts (email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, access_token, refresh_token, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT OR REPLACE INTO accounts (email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, refresh_token, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 account.email,
                 account.display_name,
@@ -160,7 +180,6 @@ impl Cache {
                 account.smtp_port,
                 account.smtp_security,
                 account.username,
-                account.access_token,
                 account.refresh_token,
                 account.enabled,
             ],
@@ -184,14 +203,6 @@ impl Cache {
             |row| row.get(0),
         )?;
         Ok(count > 0)
-    }
-
-    pub fn update_access_token(&mut self, account_id: i64, token: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE accounts SET access_token = ?1 WHERE id = ?2",
-            rusqlite::params![token, account_id],
-        )?;
-        Ok(())
     }
 
     pub fn upsert_folder(&self, account_id: i64, path: &str, unread_count: i32, noselect: bool) -> Result<()> {
@@ -254,6 +265,61 @@ impl Cache {
         )?;
         Ok(())
     }
+
+    pub fn load_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, unread_count, noselect FROM folders WHERE account_id = ?1 ORDER BY path",
+        )?;
+        let folders = stmt
+            .query_map(rusqlite::params![account_id], |row| {
+                Ok(Folder {
+                    path: row.get(0)?,
+                    unread_count: row.get(1)?,
+                    noselect: row.get::<_, i32>(2)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(folders)
+    }
+
+    pub fn load_messages(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uid, subject, sender, date, in_reply_to, has_attachments, is_read, is_starred, preview
+             FROM messages WHERE account_id = ?1 AND folder_path = ?2
+             ORDER BY date DESC LIMIT ?3 OFFSET ?4",
+        )?;
+        let messages = stmt
+            .query_map(rusqlite::params![account_id, folder_path, limit, offset], |row| {
+                Ok(Message {
+                    uid: row.get(0)?,
+                    subject: row.get(1)?,
+                    sender: row.get(2)?,
+                    date: row.get(3)?,
+                    in_reply_to: row.get(4)?,
+                    has_attachments: row.get::<_, i32>(5)? != 0,
+                    is_read: row.get::<_, i32>(6)? != 0,
+                    is_starred: row.get::<_, i32>(7)? != 0,
+                    preview: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    pub fn count_messages(&self, account_id: i64, folder_path: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, folder_path],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,7 +336,6 @@ pub struct Account {
     pub smtp_port: Option<i64>,
     pub smtp_security: Option<String>,
     pub username: Option<String>,
-    pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub enabled: bool,
 }

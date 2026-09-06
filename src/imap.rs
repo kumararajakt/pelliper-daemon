@@ -547,6 +547,10 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
     let date_str = parse_header(&header_text, "Date");
     let date = parse_date(&date_str);
 
+    if subject.is_empty() && sender.is_empty() && uid != 0 {
+        tracing::debug!("Empty headers for uid={}, header_text (first 200): {:?}", uid, &header_text[..header_text.len().min(200)]);
+    }
+
     Some(ImapMessageSummary {
         uid,
         subject,
@@ -681,18 +685,98 @@ fn parse_header(headers: &str, name: &str) -> String {
     for line in headers.lines() {
         if !found {
             if let Some(value) = line.strip_prefix(&prefix) {
-                result = value.trim().to_string();
+                result = decode_rfc2047(value.trim());
                 found = true;
             }
         } else if line.starts_with(' ') || line.starts_with('\t') {
             // RFC 822 continuation line — append with a space
             result.push(' ');
-            result.push_str(line.trim());
+            result.push_str(&decode_rfc2047(line.trim()));
         } else {
             break;
         }
     }
     result
+}
+
+/// Decode RFC 2047 encoded words: =?charset?encoding?text?=
+fn decode_rfc2047(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(start) = remaining.find("=?") {
+        // Copy text before the encoded word
+        output.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+
+        // Find the end of the encoded word
+        if let Some(end) = remaining.find("?=") {
+            let encoded = &remaining[2..end]; // skip =? and before ?=
+            remaining = &remaining[end + 2..]; // skip ?=
+
+            // Parse: charset?encoding?text
+            let parts: Vec<&str> = encoded.splitn(3, '?').collect();
+            if parts.len() == 3 {
+                let charset = parts[0].to_uppercase();
+                let encoding = parts[1].to_uppercase();
+                let text = parts[2];
+
+                let decoded_bytes = match encoding.as_str() {
+                    "B" => {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.decode(text).unwrap_or_default()
+                    }
+                    "Q" => decode_quoted_printable(text),
+                    _ => Vec::new(),
+                };
+
+                let decoded = if charset == "UTF-8" || charset == "UTF8" {
+                    String::from_utf8_lossy(&decoded_bytes).to_string()
+                } else {
+                    // Best effort: try UTF-8, fall back to lossy conversion
+                    String::from_utf8(decoded_bytes).unwrap_or_default()
+                };
+                output.push_str(&decoded);
+            } else {
+                output.push_str("=?");
+                output.push_str(encoded);
+                output.push_str("?=");
+            }
+        } else {
+            output.push_str(remaining);
+            break;
+        }
+    }
+    // If no encoded words found, return the original input
+    if output.is_empty() && !input.is_empty() {
+        return input.to_string();
+    }
+    output
+}
+
+/// Decode RFC 2047 Q-encoding (quoted-printable variant)
+fn decode_quoted_printable(input: &str) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && i + 2 < bytes.len() {
+            // =XX hex encoding
+            let hex = &input[i + 1..i + 3];
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                output.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'_' {
+            output.push(b' ');
+        } else {
+            output.push(bytes[i]);
+        }
+        i += 1;
+    }
+    output
 }
 
 /// Parse an RFC822 date string into a Unix timestamp (best-effort).
