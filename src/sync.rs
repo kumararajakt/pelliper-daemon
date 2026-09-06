@@ -72,16 +72,16 @@ impl SyncEngine {
         {
             let mut cache = self.cache.lock().await;
             for folder in &folders {
-                if let Err(e) = cache.upsert_folder(account.id, &folder.path, 0) {
+                if let Err(e) = cache.upsert_folder(account.id, &folder.path, 0, folder.noselect) {
                     tracing::error!("Failed to upsert folder {}: {}", folder.path, e);
                 }
             }
         }
 
-        // Fetch messages for each folder (skip virtual parent folders like [Gmail])
+        // Fetch messages for each folder (skip noselect virtual folders)
         for folder in &folders {
-            if folder.path == "[Gmail]" {
-                tracing::debug!("Skipping virtual folder: {}", folder.path);
+            if folder.noselect {
+                tracing::debug!("Skipping noselect folder: {}", folder.path);
                 continue;
             }
             if let Err(e) = self.sync_folder_messages_raw(account, &folder.path, &mut session).await {
@@ -112,16 +112,16 @@ impl SyncEngine {
         {
             let mut cache = self.cache.lock().await;
             for folder in &folders {
-                if let Err(e) = cache.upsert_folder(account.id, &folder.path, 0) {
+                if let Err(e) = cache.upsert_folder(account.id, &folder.path, 0, folder.noselect) {
                     tracing::error!("Failed to upsert folder {}: {}", folder.path, e);
                 }
             }
         }
 
-        // Fetch messages for each folder (skip virtual parent folders)
+        // Fetch messages for each folder (skip noselect virtual folders)
         for folder in &folders {
-            if folder.path == "[Gmail]" {
-                tracing::debug!("Skipping virtual folder: {}", folder.path);
+            if folder.noselect {
+                tracing::debug!("Skipping noselect folder: {}", folder.path);
                 continue;
             }
             if let Err(e) = self.sync_folder_messages_imap(account, &folder.path, &mut session).await {

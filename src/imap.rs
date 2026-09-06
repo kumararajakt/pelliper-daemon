@@ -290,6 +290,7 @@ async fn connect_tls(
 pub struct ImapFolder {
     pub path: String,
     pub delimiter: Option<String>,
+    pub noselect: bool,
 }
 
 /// Summary of an IMAP message (header-level fields only).
@@ -383,8 +384,8 @@ impl RawImapSession {
         let mut folders = Vec::new();
         for line in &untagged {
             // Format: * LIST (\flags) "delimiter" "name"
-            if let Some(name) = parse_list_response(line) {
-                folders.push(ImapFolder { path: name, delimiter: None });
+            if let Some((name, noselect)) = parse_list_response(line) {
+                folders.push(ImapFolder { path: name, delimiter: None, noselect });
             }
         }
 
@@ -450,12 +451,16 @@ impl RawImapSession {
 }
 
 /// Parse a LIST response line: * LIST (\flags) "delimiter" "name"
-fn parse_list_response(line: &str) -> Option<String> {
+fn parse_list_response(line: &str) -> Option<(String, bool)> {
     // Find the name — it's the last quoted or unquoted token
     let rest = line.strip_prefix("* LIST ")?;
-    // Skip flags: find closing paren
+    // Parse flags: find closing paren
+    let mut noselect = false;
     let after_flags = if rest.starts_with('(') {
-        rest.find(')')? + 1
+        let end = rest.find(')')? + 1;
+        let flags = &rest[1..end-1];
+        noselect = flags.contains("\\Noselect") || flags.contains("\\noselect");
+        end
     } else {
         0
     };
@@ -470,12 +475,13 @@ fn parse_list_response(line: &str) -> Option<String> {
         rest
     };
     // The rest is the folder name (may be quoted)
-    if rest.starts_with('"') {
+    let name = if rest.starts_with('"') {
         let end = rest[1..].find('"')? + 2;
-        Some(rest[1..end-1].to_string())
+        rest[1..end-1].to_string()
     } else {
-        Some(rest.to_string())
-    }
+        rest.to_string()
+    };
+    Some((name, noselect))
 }
 
 /// Parse a FETCH response line for UID, flags, and body.
@@ -580,7 +586,8 @@ pub async fn list_folders(
     for mailbox in &mailboxes {
         let name = mailbox.name().to_string();
         let delimiter = mailbox.delimiter().map(|d| d.to_string());
-        folders.push(ImapFolder { path: name, delimiter });
+        let noselect = mailbox.attributes().iter().any(|a| matches!(a, async_imap::imap_proto::types::NameAttribute::NoSelect));
+        folders.push(ImapFolder { path: name, delimiter, noselect });
     }
 
     tracing::info!("Discovered {} folders", folders.len());

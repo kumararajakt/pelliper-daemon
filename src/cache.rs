@@ -41,6 +41,7 @@ impl Cache {
                 account_id INTEGER NOT NULL,
                 path TEXT NOT NULL,
                 unread_count INTEGER DEFAULT 0,
+                noselect INTEGER DEFAULT 0,
                 PRIMARY KEY (account_id, path),
                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
@@ -104,6 +105,13 @@ impl Cache {
             );
             ",
         )?;
+
+        // Migration: add noselect column if missing
+        let _ = self.conn.execute(
+            "ALTER TABLE folders ADD COLUMN noselect INTEGER DEFAULT 0",
+            [],
+        );
+
         Ok(())
     }
 
@@ -174,11 +182,11 @@ impl Cache {
         Ok(count > 0)
     }
 
-    pub fn upsert_folder(&self, account_id: i64, path: &str, unread_count: i32) -> Result<()> {
+    pub fn upsert_folder(&self, account_id: i64, path: &str, unread_count: i32, noselect: bool) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO folders (account_id, path, unread_count) VALUES (?1, ?2, ?3)
-             ON CONFLICT(account_id, path) DO UPDATE SET unread_count = ?3",
-            rusqlite::params![account_id, path, unread_count],
+            "INSERT INTO folders (account_id, path, unread_count, noselect) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id, path) DO UPDATE SET unread_count = ?3, noselect = ?4",
+            rusqlite::params![account_id, path, unread_count, noselect as i32],
         )?;
         Ok(())
     }
