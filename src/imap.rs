@@ -456,6 +456,79 @@ impl RawImapSession {
     pub async fn logout(&mut self) {
         let _ = self.send_command("X LOGOUT").await;
     }
+
+    /// SELECT a folder (read-write).
+    pub async fn select_folder(&mut self, folder: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!("{} SELECT {}", tag, quote_imap_path(folder))).await?;
+        let (tagged, _) = self.read_response(&tag).await?;
+        if !tagged.contains("OK") {
+            return Err(format!("SELECT failed: {}", tagged).into());
+        }
+        Ok(())
+    }
+
+    /// Start IDLE on the currently selected folder.
+    /// Returns once the server sends the `+ go ahead` continuation.
+    pub async fn idle_start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!("{} IDLE", tag)).await?;
+        // Read until we get the continuation "+ go ahead"
+        let mut line = String::new();
+        loop {
+            line.clear();
+            self.reader.read_line(&mut line).await?;
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() { continue; }
+            if trimmed.starts_with('+') {
+                tracing::debug!("IDLE started: {}", trimmed);
+                return Ok(());
+            }
+            // Any other response means IDLE was rejected
+            return Err(format!("IDLE rejected: {}", trimmed).into());
+        }
+    }
+
+    /// Read one line during IDLE. Returns the untagged notification line.
+    /// Returns None if the server ended IDLE (tagged response).
+    pub async fn idle_read_line(&mut self) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut line = String::new();
+        line.clear();
+        self.reader.read_line(&mut line).await?;
+        let trimmed = line.trim_end().to_string();
+        if trimmed.is_empty() {
+            return Ok(Some(trimmed));
+        }
+        // Tagged response means IDLE ended (server timeout or BYE)
+        if !trimmed.starts_with('*') && !trimmed.starts_with('+') {
+            tracing::debug!("IDLE ended: {}", trimmed);
+            return Ok(None);
+        }
+        Ok(Some(trimmed))
+    }
+
+    /// Send DONE to stop IDLE, then read the tagged response.
+    pub async fn idle_done(&mut self, tag: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.writer.write_all(b"DONE\r\n").await?;
+        self.writer.flush().await?;
+        // Read until we get the tagged response
+        let mut line = String::new();
+        loop {
+            line.clear();
+            self.reader.read_line(&mut line).await?;
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() { continue; }
+            if trimmed.starts_with(tag) {
+                tracing::debug!("IDLE DONE: {}", trimmed);
+                return Ok(());
+            }
+        }
+    }
+
+    /// Get the current tag value (for IDLE tag tracking).
+    pub fn current_tag(&self) -> u32 {
+        self.tag
+    }
 }
 
 /// Parse a LIST response line: * LIST (\flags) "delimiter" "name"
@@ -596,6 +669,51 @@ pub async fn connect_session_oauth(
 ) -> Result<RawImapSession, Box<dyn std::error::Error + Send + Sync>> {
     let stream = connect_tls_stream(host, port).await?;
     do_oauth_session(stream, email, access_token).await
+}
+
+/// Connect with password and return a live RawImapSession.
+pub async fn connect_session_password_raw(
+    host: &str,
+    port: u16,
+    email: &str,
+    password: &str,
+) -> Result<RawImapSession, Box<dyn std::error::Error + Send + Sync>> {
+    let stream = connect_tls_stream(host, port).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+
+    // Read server greeting
+    line.clear();
+    reader.read_line(&mut line).await?;
+
+    // Send LOGIN
+    let tag = "A001";
+    let cmd = format!("{} LOGIN {} {}", tag, quote_imap_path(email), quote_imap_path(password));
+    write_half.write_all(cmd.as_bytes()).await?;
+    write_half.write_all(b"\r\n").await?;
+    write_half.flush().await?;
+
+    // Read until tagged OK
+    loop {
+        line.clear();
+        reader.read_line(&mut line).await?;
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() { continue; }
+        if trimmed.starts_with('+') {
+            write_half.write_all(b"\r\n").await?;
+            write_half.flush().await?;
+            continue;
+        }
+        if trimmed.starts_with('*') { continue; }
+        if trimmed.starts_with(tag) {
+            if trimmed.contains("OK") {
+                return Ok(RawImapSession { reader, writer: write_half, tag: 1 });
+            } else {
+                return Err(format!("LOGIN failed: {}", trimmed).into());
+            }
+        }
+    }
 }
 
 /// List all folders via an async-imap Session.

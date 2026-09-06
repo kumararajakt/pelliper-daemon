@@ -1,6 +1,7 @@
 mod cache;
 mod discover;
 mod imap;
+mod idle;
 mod mail;
 mod smtp;
 mod secrets;
@@ -11,15 +12,15 @@ use cache::{Cache, Account};
 use secrets::Secrets;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use zbus::connection::Builder;
 use zbus::interface;
-use zbus::object_server::SignalContext;
 
 struct Daemon {
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,
     sync_engine: sync::SyncEngine,
+    idle_tx: mpsc::Sender<idle::IdleCommand>,
 }
 
 #[interface(name = "org.kde.pelliper.Daemon")]
@@ -195,6 +196,16 @@ impl Daemon {
         let cache = self.cache.lock().await;
         cache.count_messages(account_id, folder_path).unwrap_or(0)
     }
+
+    /// Tell the IDLE manager to watch a specific folder for real-time updates.
+    /// Called by the UI whenever the user switches folders.
+    async fn set_idle_folder(&self, account_id: i64, folder_path: &str) {
+        tracing::info!("D-Bus: set_idle_folder account={} folder={}", account_id, folder_path);
+        let _ = self.idle_tx.send(idle::IdleCommand::SetFolder {
+            account_id,
+            folder_path: folder_path.to_string(),
+        }).await;
+    }
 }
 
 #[tokio::main]
@@ -230,9 +241,18 @@ async fn main() {
 
     let sync_engine = sync::SyncEngine::new(cache.clone(), secrets.clone());
 
+    // Create IDLE manager — one persistent connection per account
+    let (idle_notify_tx, mut idle_notify_rx) = mpsc::channel::<idle::IdleNotification>(16);
+    let (mut idle_manager, idle_tx) = idle::IdleManager::new(cache.clone(), secrets.clone(), idle_notify_tx);
+
     tracing::info!("Pelliper daemon started, data dir: {:?}", data_dir);
 
-    let daemon = Daemon { cache: cache.clone(), secrets, sync_engine: sync_engine.clone() };
+    let daemon = Daemon {
+        cache: cache.clone(),
+        secrets,
+        sync_engine: sync_engine.clone(),
+        idle_tx: idle_tx.clone(),
+    };
 
     // Register on D-Bus session bus
     let _conn = Builder::session()
@@ -260,9 +280,34 @@ async fn main() {
                         tracing::error!("Startup sync failed: {}", e);
                     }
                 });
+
+                // Spawn IDLE manager for the first enabled account
+                let accounts = cache_guard.load_accounts().unwrap_or_default();
+                if let Some(first) = accounts.into_iter().find(|a| a.enabled) {
+                    let account_id = first.id;
+                    tokio::spawn(async move {
+                        // Small delay to let initial sync finish
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        idle_manager.run(account_id).await;
+                    });
+                }
             }
         }
     }
+
+    // Spawn a task that reloads IDLE on folder changes from the UI
+    tokio::spawn(async move {
+        while let Some(notification) = idle_notify_rx.recv().await {
+            tracing::info!(
+                "IDLE notification: account={} folder={}",
+                notification.account_id,
+                notification.folder_path
+            );
+            // The cache was already updated by the IdleManager.
+            // QFileSystemWatcher on the SQLite file will trigger model reloads in the UI.
+            // Nothing more needed here.
+        }
+    });
 
     // Keep the daemon running
     std::future::pending::<()>().await;
