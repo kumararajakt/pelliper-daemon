@@ -349,6 +349,8 @@ pub struct ImapMessageSummary {
     pub is_starred: bool,
     pub has_attachments: bool,
     pub preview: String,
+    pub message_id: String,
+    pub references: String,
 }
 
 /// A raw IMAP session over a TLS stream, used for OAuth accounts where
@@ -483,7 +485,7 @@ impl RawImapSession {
         // Fetch from highest UID down, grab `limit` messages
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH {}:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)",
+            "{} UID FETCH {}:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
             tag, total
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
@@ -545,7 +547,7 @@ impl RawImapSession {
     ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH {} (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)",
+            "{} UID FETCH {} (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
             tag, uid_set
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
@@ -593,7 +595,7 @@ impl RawImapSession {
         // Fetch UID + headers + flags for all messages
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH 1:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)",
+            "{} UID FETCH 1:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
             tag
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
@@ -954,6 +956,12 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
     let sender = parse_header(&header_text, "From");
     let date_str = parse_header(&header_text, "Date");
     let date = parse_date(&date_str);
+    let message_id = parse_header(&header_text, "Message-ID");
+    let references = parse_header(&header_text, "References");
+    let in_reply_to = parse_header(&header_text, "In-Reply-To");
+
+    // Use In-Reply-To as fallback for References if empty
+    let references = if references.is_empty() { in_reply_to } else { references };
 
     if subject.is_empty() && sender.is_empty() && uid != 0 {
         tracing::debug!("Empty headers for uid={}, header_text (first 200): {:?}", uid, &header_text[..header_text.len().min(200)]);
@@ -968,6 +976,8 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
         is_starred,
         has_attachments: false,
         preview: String::new(),
+        message_id,
+        references,
     })
 }
 
@@ -1125,7 +1135,7 @@ pub async fn fetch_message_summaries(
     // Fetch all messages
     let messages_stream = timeout(
         IMAP_TIMEOUT,
-        session.uid_fetch("1:*", "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)"),
+        session.uid_fetch("1:*", "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)"),
     )
     .await??;
     let messages: Vec<_> = messages_stream.try_collect().await?;
@@ -1145,6 +1155,10 @@ pub async fn fetch_message_summaries(
         let sender = parse_header(&header_str, "From");
         let date_str = parse_header(&header_str, "Date");
         let date = parse_date(&date_str);
+        let message_id = parse_header(&header_str, "Message-ID");
+        let references = parse_header(&header_str, "References");
+        let in_reply_to = parse_header(&header_str, "In-Reply-To");
+        let references = if references.is_empty() { in_reply_to } else { references };
 
         summaries.push(ImapMessageSummary {
             uid,
@@ -1153,8 +1167,10 @@ pub async fn fetch_message_summaries(
             date,
             is_read,
             is_starred,
-            has_attachments: false, // will be detected when body is fetched
+            has_attachments: false,
             preview: String::new(),
+            message_id,
+            references,
         });
     }
 
@@ -1180,7 +1196,7 @@ pub async fn fetch_recent_summaries(
     let range = format!("{}:*", from_uid);
     let messages_stream = timeout(
         IMAP_TIMEOUT,
-        session.uid_fetch(&range, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)"),
+        session.uid_fetch(&range, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)"),
     )
     .await??;
     let messages: Vec<_> = messages_stream.try_collect().await?;
@@ -1199,6 +1215,10 @@ pub async fn fetch_recent_summaries(
         let sender = parse_header(&header_str, "From");
         let date_str = parse_header(&header_str, "Date");
         let date = parse_date(&date_str);
+        let message_id = parse_header(&header_str, "Message-ID");
+        let references = parse_header(&header_str, "References");
+        let in_reply_to = parse_header(&header_str, "In-Reply-To");
+        let references = if references.is_empty() { in_reply_to } else { references };
 
         summaries.push(ImapMessageSummary {
             uid,
@@ -1209,6 +1229,8 @@ pub async fn fetch_recent_summaries(
             is_starred,
             has_attachments: false,
             preview: String::new(),
+            message_id,
+            references,
         });
     }
 
@@ -1253,7 +1275,7 @@ pub async fn fetch_summaries_by_uids(
 ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
     let messages_stream = timeout(
         IMAP_TIMEOUT,
-        session.uid_fetch(uid_set, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)"),
+        session.uid_fetch(uid_set, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)"),
     )
     .await??;
     let messages: Vec<_> = messages_stream.try_collect().await?;
@@ -1272,6 +1294,10 @@ pub async fn fetch_summaries_by_uids(
         let sender = parse_header(&header_str, "From");
         let date_str = parse_header(&header_str, "Date");
         let date = parse_date(&date_str);
+        let message_id = parse_header(&header_str, "Message-ID");
+        let references = parse_header(&header_str, "References");
+        let in_reply_to = parse_header(&header_str, "In-Reply-To");
+        let references = if references.is_empty() { in_reply_to } else { references };
 
         summaries.push(ImapMessageSummary {
             uid,
@@ -1282,6 +1308,8 @@ pub async fn fetch_summaries_by_uids(
             is_starred,
             has_attachments: false,
             preview: String::new(),
+            message_id,
+            references,
         });
     }
 

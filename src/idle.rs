@@ -345,6 +345,8 @@ impl IdleWorker {
                 msg.is_starred,
                 msg.has_attachments,
                 &msg.preview,
+                &msg.message_id,
+                &msg.references,
             );
         }
 

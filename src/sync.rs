@@ -256,6 +256,8 @@ impl SyncEngine {
                     msg.is_starred,
                     msg.has_attachments,
                     &msg.preview,
+                    &msg.message_id,
+                    &msg.references,
                 );
             }
             let unread = recent.iter().filter(|m| !m.is_read).count() as i32;
@@ -313,6 +315,8 @@ impl SyncEngine {
                             msg.is_starred,
                             msg.has_attachments,
                             &msg.preview,
+                            &msg.message_id,
+                            &msg.references,
                         );
                     }
                     tracing::debug!(
@@ -371,6 +375,8 @@ impl SyncEngine {
                     msg.is_starred,
                     msg.has_attachments,
                     &msg.preview,
+                    &msg.message_id,
+                    &msg.references,
                 );
             }
             let unread = recent.iter().filter(|m| !m.is_read).count() as i32;
@@ -428,6 +434,8 @@ impl SyncEngine {
                             msg.is_starred,
                             msg.has_attachments,
                             &msg.preview,
+                            &msg.message_id,
+                            &msg.references,
                         );
                     }
                     tracing::debug!(

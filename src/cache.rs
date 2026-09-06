@@ -19,6 +19,8 @@ pub struct Message {
     pub sender: Option<String>,
     pub date: i64,
     pub in_reply_to: Option<String>,
+    pub message_id: Option<String>,
+    pub references: Option<String>,
     pub has_attachments: bool,
     pub is_read: bool,
     pub is_starred: bool,
@@ -75,6 +77,8 @@ impl Cache {
                 sender TEXT,
                 date INTEGER,
                 in_reply_to TEXT,
+                message_id TEXT,
+                references_ TEXT,
                 has_attachments INTEGER DEFAULT 0,
                 is_read INTEGER DEFAULT 0,
                 is_starred INTEGER DEFAULT 0,
@@ -130,6 +134,16 @@ impl Cache {
         // Migration: add noselect column if missing
         let _ = self.conn.execute(
             "ALTER TABLE folders ADD COLUMN noselect INTEGER DEFAULT 0",
+            [],
+        );
+
+        // Migration: add threading columns if missing
+        let _ = self.conn.execute(
+            "ALTER TABLE messages ADD COLUMN message_id TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE messages ADD COLUMN references_ TEXT",
             [],
         );
 
@@ -238,13 +252,15 @@ impl Cache {
         is_starred: bool,
         has_attachments: bool,
         preview: &str,
+        message_id: &str,
+        references: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO messages (account_id, folder_path, uid, subject, sender, date, is_read, is_starred, has_attachments, preview)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO messages (account_id, folder_path, uid, subject, sender, date, is_read, is_starred, has_attachments, preview, message_id, references_)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET
-                subject = ?4, sender = ?5, date = ?6, is_read = ?7, is_starred = ?8, has_attachments = ?9, preview = ?10",
-            rusqlite::params![account_id, folder_path, uid, subject, sender, date, is_read as i32, is_starred as i32, has_attachments as i32, preview],
+                subject = ?4, sender = ?5, date = ?6, is_read = ?7, is_starred = ?8, has_attachments = ?9, preview = ?10, message_id = ?11, references_ = ?12",
+            rusqlite::params![account_id, folder_path, uid, subject, sender, date, is_read as i32, is_starred as i32, has_attachments as i32, preview, message_id, references],
         )?;
         Ok(())
     }
@@ -302,7 +318,7 @@ impl Cache {
         limit: i64,
     ) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
-            "SELECT uid, subject, sender, date, in_reply_to, has_attachments, is_read, is_starred, preview
+            "SELECT uid, subject, sender, date, in_reply_to, message_id, references_, has_attachments, is_read, is_starred, preview
              FROM messages WHERE account_id = ?1 AND folder_path = ?2
              ORDER BY date DESC LIMIT ?3 OFFSET ?4",
         )?;
@@ -314,10 +330,12 @@ impl Cache {
                     sender: row.get(2)?,
                     date: row.get(3)?,
                     in_reply_to: row.get(4)?,
-                    has_attachments: row.get::<_, i32>(5)? != 0,
-                    is_read: row.get::<_, i32>(6)? != 0,
-                    is_starred: row.get::<_, i32>(7)? != 0,
-                    preview: row.get(8)?,
+                    message_id: row.get(5)?,
+                    references: row.get(6)?,
+                    has_attachments: row.get::<_, i32>(7)? != 0,
+                    is_read: row.get::<_, i32>(8)? != 0,
+                    is_starred: row.get::<_, i32>(9)? != 0,
+                    preview: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
