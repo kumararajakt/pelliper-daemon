@@ -1,14 +1,14 @@
 mod cache;
 mod discover;
-mod imap;
 mod idle;
+mod imap;
 mod mail;
-mod smtp;
-mod secrets;
-mod sync;
 mod oauth;
+mod secrets;
+mod smtp;
+mod sync;
 
-use cache::{Cache, Account};
+use cache::{Account, Cache};
 use secrets::Secrets;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,7 +72,10 @@ impl Daemon {
         };
 
         if !imap_ok {
-            tracing::warn!("IMAP connection test failed for {}, saving account anyway", email);
+            tracing::warn!(
+                "IMAP connection test failed for {}, saving account anyway",
+                email
+            );
         }
 
         // Save account to database
@@ -89,7 +92,11 @@ impl Daemon {
             smtp_port: Some(smtp_port as i64),
             smtp_security: Some("starttls".to_string()),
             username: Some(email.to_string()),
-            refresh_token: if refresh_token.is_empty() { None } else { Some(refresh_token.to_string()) },
+            refresh_token: if refresh_token.is_empty() {
+                None
+            } else {
+                Some(refresh_token.to_string())
+            },
             enabled: true,
         };
 
@@ -132,10 +139,13 @@ impl Daemon {
         tracing::info!("D-Bus: remove_account id={}", account_id);
 
         // Notify IDLE manager to stop watching this account
-        let _ = self.idle_tx.send(idle::IdleCommand::SetFolder {
-            account_id,
-            folder_path: String::new(),
-        }).await;
+        let _ = self
+            .idle_tx
+            .send(idle::IdleCommand::SetFolder {
+                account_id,
+                folder_path: String::new(),
+            })
+            .await;
 
         let cache = self.cache.lock().await;
         match cache.remove_account(account_id) {
@@ -204,7 +214,13 @@ impl Daemon {
     }
 
     /// Get messages for a folder. Returns JSON array.
-    async fn get_messages(&self, account_id: i64, folder_path: &str, offset: i64, limit: i64) -> String {
+    async fn get_messages(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        offset: i64,
+        limit: i64,
+    ) -> String {
         let cache = self.cache.lock().await;
         match cache.load_messages(account_id, folder_path, offset, limit) {
             Ok(messages) => serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string()),
@@ -224,15 +240,23 @@ impl Daemon {
     /// Tell the IDLE manager to watch a specific folder for real-time updates.
     /// Called by the UI whenever the user switches folders.
     async fn set_idle_folder(&self, account_id: i64, folder_path: &str) {
-        tracing::info!("D-Bus: set_idle_folder account={} folder={}", account_id, folder_path);
-        let _ = self.idle_tx.send(idle::IdleCommand::SetFolder {
+        tracing::info!(
+            "D-Bus: set_idle_folder account={} folder={}",
             account_id,
-            folder_path: folder_path.to_string(),
-        }).await;
+            folder_path
+        );
+        let _ = self
+            .idle_tx
+            .send(idle::IdleCommand::SetFolder {
+                account_id,
+                folder_path: folder_path.to_string(),
+            })
+            .await;
     }
 
     /// Load the body of a message. Returns HTML.
     /// Fetches from IMAP if not cached, then caches for next time.
+    /// Retries once with a fresh connection on failure.
     async fn load_body(&self, account_id: i64, folder_path: &str, uid: i64) -> String {
         // Check cache first
         {
@@ -243,8 +267,12 @@ impl Daemon {
             }
         }
 
-        // Fetch from IMAP
-        tracing::info!("Fetching body for account={} folder={} uid={}", account_id, folder_path, uid);
+        tracing::info!(
+            "Fetching body for account={} folder={} uid={}",
+            account_id,
+            folder_path,
+            uid
+        );
 
         let account = {
             let cache = self.cache.lock().await;
@@ -262,64 +290,74 @@ impl Daemon {
             None => return "<p>Account not found</p>".to_string(),
         };
 
+        // Attempt 1
+        match self.try_load_body(&account, folder_path, uid).await {
+            Ok((html, has_attachments)) => {
+                self.cache_body(account_id, folder_path, uid, &html, has_attachments)
+                    .await;
+                return html;
+            }
+            Err(e) => {
+                tracing::warn!("Body fetch attempt 1 failed for uid={}: {}", uid, e);
+            }
+        }
+
+        // Attempt 2: reconnect and retry once
+        tracing::info!("Retrying body fetch for uid={} with fresh connection", uid);
+        match self.try_load_body(&account, folder_path, uid).await {
+            Ok((html, has_attachments)) => {
+                self.cache_body(account_id, folder_path, uid, &html, has_attachments)
+                    .await;
+                html
+            }
+            Err(e) => {
+                tracing::error!("Body fetch attempt 2 failed for uid={}: {}", uid, e);
+                format!("<p>Failed to load message: {}</p>", e)
+            }
+        }
+    }
+}
+
+// Private helpers (not D-Bus methods)
+impl Daemon {
+    /// Single attempt to connect and fetch a message body.
+    async fn try_load_body(
+        &self,
+        account: &Account,
+        folder_path: &str,
+        uid: i64,
+    ) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
         let host = account.imap_host.as_deref().unwrap_or("localhost");
         let port = account.imap_port.unwrap_or(993) as u16;
 
-        // Connect
-        let connect_result = if account.auth_type == "oauth" {
-            let refresh_token = match account.refresh_token.as_deref() {
-                Some(rt) if !rt.is_empty() => rt,
-                _ => return "<p>No refresh token configured</p>".to_string(),
-            };
-            let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
-                .unwrap_or_else(|_| "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com".to_string());
+        let mut session = if account.auth_type == "oauth" {
+            let refresh_token = account
+                .refresh_token
+                .as_deref()
+                .ok_or("No refresh token configured")?;
+            let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
+                "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com"
+                    .to_string()
+            });
             let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
-
-            match oauth::refresh_access_token(
+            let token = oauth::refresh_access_token(
                 "https://oauth2.googleapis.com/token",
                 &client_id,
                 &client_secret,
                 refresh_token,
-            ).await {
-                Ok(token) => imap::connect_session_oauth(host, port, &account.email, &token.access_token).await,
-                Err(e) => Err(e),
-            }
+            )
+            .await?;
+            imap::connect_session_oauth(host, port, &account.email, &token.access_token).await?
         } else {
             let key_name = format!("pelliper:{}", account.email);
-            match self.secrets.get_password(&key_name).await {
-                Ok(password) => imap::connect_session_password_raw(host, port, &account.email, &password).await,
-                Err(e) => Err(e),
-            }
+            let password = self.secrets.get_password(&key_name).await?;
+            imap::connect_session_password_raw(host, port, &account.email, &password).await?
         };
 
-        let mut session = match connect_result {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("Failed to connect for body fetch: {}", e);
-                return format!("<p>Failed to connect: {}</p>", e);
-            }
-        };
-
-        // SELECT folder
-        if let Err(e) = session.select_folder(folder_path).await {
-            tracing::error!("SELECT failed for body fetch: {}", e);
-            session.logout().await;
-            return format!("<p>Failed to select folder: {}</p>", e);
-        }
-
-        // Fetch body
-        let raw_body = match session.fetch_body(uid).await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!("FETCH BODY failed: {}", e);
-                session.logout().await;
-                return format!("<p>Failed to fetch body: {}</p>", e);
-            }
-        };
-
+        session.select_folder(folder_path).await?;
+        let raw_body = session.fetch_body(uid).await?;
         session.logout().await;
 
-        // Parse MIME
         let parsed = imap::parse_message_body(&raw_body);
         let html = if parsed.html.is_empty() {
             format!("<pre>{}</pre>", parsed.text)
@@ -327,22 +365,34 @@ impl Daemon {
             parsed.html
         };
 
-        // Cache
-        {
-            let cache = self.cache.lock().await;
-            if let Err(e) = cache.save_body(account_id, folder_path, uid, &html) {
-                tracing::error!("Failed to cache body: {}", e);
-            }
-        }
+        Ok((html, parsed.has_attachments))
+    }
 
+    /// Cache body and update has_attachments flag.
+    async fn cache_body(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        html: &str,
+        has_attachments: bool,
+    ) {
+        let cache = self.cache.lock().await;
+        if let Err(e) = cache.save_body(account_id, folder_path, uid, html) {
+            tracing::error!("Failed to cache body: {}", e);
+        }
+        if let Err(e) = cache.update_has_attachment(account_id, folder_path, uid, has_attachments) {
+            tracing::error!("Failed to update has_attachments: {}", e);
+        }
         tracing::info!("Body loaded and cached for uid={}", uid);
-        html
     }
 }
 
 #[tokio::main]
 async fn main() {
-    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
 
     // Load .env file from data dir or current directory
     let data_dir = dirs::data_local_dir()
@@ -375,7 +425,8 @@ async fn main() {
 
     // Create IDLE manager — one persistent connection per account
     let (idle_notify_tx, mut idle_notify_rx) = mpsc::channel::<idle::IdleNotification>(16);
-    let (mut idle_manager, idle_tx) = idle::IdleManager::new(cache.clone(), secrets.clone(), idle_notify_tx);
+    let (mut idle_manager, idle_tx) =
+        idle::IdleManager::new(cache.clone(), secrets.clone(), idle_notify_tx);
 
     tracing::info!("Pelliper daemon started, data dir: {:?}", data_dir);
 

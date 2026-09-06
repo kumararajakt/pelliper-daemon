@@ -346,6 +346,19 @@ impl Cache {
         Ok(uids)
     }
 
+    /// Load the N most recent UIDs for a folder (sorted newest first).
+    pub fn load_recent_uids(&self, account_id: i64, folder_path: &str, limit: usize) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 ORDER BY date DESC LIMIT ?3",
+        )?;
+        let uids = stmt
+            .query_map(rusqlite::params![account_id, folder_path, limit as i64], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(uids)
+    }
+
     /// Count unread messages for a folder (from DB, not IMAP).
     pub fn count_unread(&self, account_id: i64, folder_path: &str) -> Result<i32> {
         let count: i32 = self.conn.query_row(
@@ -376,6 +389,15 @@ impl Cache {
             "INSERT INTO bodies (account_id, folder_path, uid, html) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET html = ?4",
             rusqlite::params![account_id, folder_path, uid, html],
+        )?;
+        Ok(())
+    }
+
+    /// Update has_attachments flag from actual body parse (corrects BODYSTRUCTURE guesses).
+    pub fn update_has_attachment(&self, account_id: i64, folder_path: &str, uid: i64, has: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET has_attachments = ?1 WHERE account_id = ?2 AND folder_path = ?3 AND uid = ?4",
+            rusqlite::params![has as i32, account_id, folder_path, uid],
         )?;
         Ok(())
     }

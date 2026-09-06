@@ -708,6 +708,86 @@ impl RawImapSession {
         }
     }
 
+    /// Fetch bodies for multiple UIDs in a single FETCH command (PEEK).
+    /// Returns Vec of (uid, raw_bytes).
+    pub async fn fetch_bodies_batch(
+        &mut self,
+        uids: &[i64],
+    ) -> Result<Vec<(i64, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let uid_set: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
+        let uid_set_str = uid_set.join(",");
+
+        let tag = self.next_tag();
+        self.send_command(&format!(
+            "{} UID FETCH {} (UID BODY.PEEK[])",
+            tag, uid_set_str
+        )).await?;
+
+        let mut results = Vec::new();
+        let mut current_uid: Option<i64> = None;
+        let mut body_data = Vec::new();
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            self.reader.read_line(&mut line).await?;
+            let trimmed = line.trim_end().to_string();
+            if trimmed.is_empty() { continue; }
+
+            if trimmed.starts_with('+') {
+                self.writer.write_all(b"+ \r\n").await?;
+                self.writer.flush().await?;
+                continue;
+            }
+
+            if trimmed.starts_with(&tag) {
+                // Save last body if pending
+                if let Some(uid) = current_uid.take() {
+                    if !body_data.is_empty() {
+                        results.push((uid, std::mem::take(&mut body_data)));
+                    }
+                }
+                break;
+            }
+
+            if trimmed.starts_with('*') {
+                // Check for new FETCH response — extract UID
+                if let Some(uid) = parse_uid_only(&trimmed) {
+                    // Save previous body if any
+                    if let Some(prev_uid) = current_uid.take() {
+                        if !body_data.is_empty() {
+                            results.push((prev_uid, std::mem::take(&mut body_data)));
+                        }
+                    }
+                    current_uid = Some(uid);
+                }
+
+                // Check for literal: BODY[] {<size>}
+                if let Some(body_pos) = trimmed.find("BODY[]") {
+                    let after_body = &trimmed[body_pos + 6..];
+                    if let Some(brace_start) = after_body.find('{') {
+                        if let Some(brace_end) = after_body[brace_start..].find('}') {
+                            let size_str = &after_body[brace_start + 1..brace_start + brace_end];
+                            if let Ok(size) = size_str.parse::<usize>() {
+                                body_data.resize(size, 0);
+                                self.reader.read_exact(&mut body_data).await?;
+                                let mut crlf = [0u8; 2];
+                                let _ = self.reader.read_exact(&mut crlf).await;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Mark a message as seen (read).
     pub async fn mark_seen(&mut self, uid: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let tag = self.next_tag();
