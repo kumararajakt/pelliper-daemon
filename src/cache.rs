@@ -22,14 +22,19 @@ impl Cache {
             "
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY,
-                email TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
                 display_name TEXT,
                 provider TEXT,
+                auth_type TEXT NOT NULL DEFAULT 'password',
                 imap_host TEXT,
                 imap_port INTEGER,
+                imap_security TEXT DEFAULT 'tls',
                 smtp_host TEXT,
                 smtp_port INTEGER,
-                enabled INTEGER DEFAULT 1
+                smtp_security TEXT DEFAULT 'starttls',
+                username TEXT,
+                enabled INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS folders (
@@ -104,7 +109,7 @@ impl Cache {
 
     pub fn load_accounts(&self) -> Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, email, display_name, provider, imap_host, imap_port, smtp_host, smtp_port, enabled FROM accounts",
+            "SELECT id, email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, enabled FROM accounts",
         )?;
 
         let accounts = stmt
@@ -114,11 +119,15 @@ impl Cache {
                     email: row.get(1)?,
                     display_name: row.get(2)?,
                     provider: row.get(3)?,
-                    imap_host: row.get(4)?,
-                    imap_port: row.get(5)?,
-                    smtp_host: row.get(6)?,
-                    smtp_port: row.get(7)?,
-                    enabled: row.get(8)?,
+                    auth_type: row.get(4)?,
+                    imap_host: row.get(5)?,
+                    imap_port: row.get(6)?,
+                    imap_security: row.get(7)?,
+                    smtp_host: row.get(8)?,
+                    smtp_port: row.get(9)?,
+                    smtp_security: row.get(10)?,
+                    username: row.get(11)?,
+                    enabled: row.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -126,21 +135,34 @@ impl Cache {
         Ok(accounts)
     }
 
-    pub fn insert_account(&self, account: &Account) -> Result<i64> {
+    pub fn insert_account(&mut self, account: &Account) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO accounts (email, display_name, provider, imap_host, imap_port, smtp_host, smtp_port, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO accounts (email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 account.email,
                 account.display_name,
                 account.provider,
+                account.auth_type,
                 account.imap_host,
                 account.imap_port,
+                account.imap_security,
                 account.smtp_host,
                 account.smtp_port,
+                account.smtp_security,
+                account.username,
                 account.enabled,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn account_exists(&self, email: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM accounts WHERE email = ?1",
+            rusqlite::params![email],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 }
 
@@ -150,9 +172,13 @@ pub struct Account {
     pub email: String,
     pub display_name: Option<String>,
     pub provider: Option<String>,
+    pub auth_type: String,
     pub imap_host: Option<String>,
     pub imap_port: Option<i64>,
+    pub imap_security: Option<String>,
     pub smtp_host: Option<String>,
     pub smtp_port: Option<i64>,
+    pub smtp_security: Option<String>,
+    pub username: Option<String>,
     pub enabled: bool,
 }

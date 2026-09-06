@@ -11,20 +11,36 @@ impl Secrets {
         }
     }
 
-    pub fn store_password(&self, account: &str, password: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let entry = Entry::new(&self.service_name, account)?;
-        entry.set_password(password)?;
-        Ok(())
+    pub async fn store_password(&self, account: &str, password: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let service = self.service_name.clone();
+        let account = account.to_string();
+        let password = password.to_string();
+        tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(&service, &account)?;
+            entry.set_password(&password)?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        })
+        .await?
     }
 
-    pub fn get_password(&self, account: &str) -> Result<String, Box<dyn std::error::Error>> {
-        let entry = Entry::new(&self.service_name, account)?;
-        Ok(entry.get_password()?)
+    pub async fn get_password(&self, account: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let service = self.service_name.clone();
+        let account = account.to_string();
+        tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(&service, &account)?;
+            Ok(entry.get_password()?)
+        })
+        .await?
     }
 
-    pub fn delete_password(&self, account: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let entry = Entry::new(&self.service_name, account)?;
-        entry.delete_credential()?;
-        Ok(())
+    pub async fn delete_password(&self, account: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let service = self.service_name.clone();
+        let account = account.to_string();
+        tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(&service, &account)?;
+            entry.delete_credential()?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        })
+        .await?
     }
 }
