@@ -33,5 +33,6 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "0.26"
 base64 = "0.22"
+rfc2047-decoder = "1"
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"

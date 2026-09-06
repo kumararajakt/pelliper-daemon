@@ -103,7 +103,7 @@ impl SyncEngine {
         tracing::info!("Found {} folders for {} (oauth)", folders.len(), email);
 
         {
-            let mut cache = self.cache.lock().await;
+            let cache = self.cache.lock().await;
             for folder in &folders {
                 if let Err(e) = cache.upsert_folder(account.id, &folder.path, 0, folder.noselect) {
                     tracing::error!("Failed to upsert folder {}: {}", folder.path, e);
@@ -143,7 +143,7 @@ impl SyncEngine {
         tracing::info!("Found {} folders for {} (password)", folders.len(), email);
 
         {
-            let mut cache = self.cache.lock().await;
+            let cache = self.cache.lock().await;
             for folder in &folders {
                 if let Err(e) = cache.upsert_folder(account.id, &folder.path, 0, folder.noselect) {
                     tracing::error!("Failed to upsert folder {}: {}", folder.path, e);

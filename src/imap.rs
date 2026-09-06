@@ -529,6 +529,80 @@ impl RawImapSession {
     pub fn current_tag(&self) -> u32 {
         self.tag
     }
+
+    /// Fetch the full body of a message by UID.
+    /// Returns the raw RFC822 message bytes.
+    pub async fn fetch_body(&mut self, uid: i64) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!(
+            "{} UID FETCH {} (BODY[])",
+            tag, uid
+        )).await?;
+
+        // Read response, collecting literal data
+        let mut body_data = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            self.reader.read_line(&mut line).await?;
+            let trimmed = line.trim_end().to_string();
+            if trimmed.is_empty() { continue; }
+
+            // Continuation — send + for literal
+            if trimmed.starts_with('+') {
+                self.writer.write_all(b"+ \r\n").await?;
+                self.writer.flush().await?;
+                continue;
+            }
+
+            // Tagged response — done
+            if trimmed.starts_with(&tag) {
+                if trimmed.contains("OK") && !body_data.is_empty() {
+                    return Ok(body_data);
+                } else if !trimmed.contains("OK") {
+                    return Err(format!("FETCH BODY[] failed: {}", trimmed).into());
+                }
+                // OK but no data — empty message
+                return Ok(Vec::new());
+            }
+
+            // Untagged line — check for literal
+            if trimmed.starts_with('*') {
+                // Look for literal: BODY[] {<size>}
+                if let Some(body_pos) = trimmed.find("BODY[]") {
+                    let after_body = &trimmed[body_pos + 6..];
+                    if let Some(brace_start) = after_body.find('{') {
+                        if let Some(brace_end) = after_body[brace_start..].find('}') {
+                            let size_str = &after_body[brace_start + 1..brace_start + brace_end];
+                            if let Ok(size) = size_str.parse::<usize>() {
+                                // Read exactly `size` bytes
+                                body_data.resize(size, 0);
+                                self.reader.read_exact(&mut body_data).await?;
+                                // Read trailing CRLF
+                                let mut crlf = [0u8; 2];
+                                let _ = self.reader.read_exact(&mut crlf).await;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Mark a message as seen (read).
+    pub async fn mark_seen(&mut self, uid: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!(
+            "{} UID STORE {} +FLAGS (\\Seen)",
+            tag, uid
+        )).await?;
+        let (tagged, _) = self.read_response(&tag).await?;
+        if !tagged.contains("OK") {
+            return Err(format!("STORE failed: {}", tagged).into());
+        }
+        Ok(())
+    }
 }
 
 /// Parse a LIST response line: * LIST (\flags) "delimiter" "name"
@@ -819,82 +893,14 @@ fn parse_header(headers: &str, name: &str) -> String {
 
 /// Decode RFC 2047 encoded words: =?charset?encoding?text?=
 fn decode_rfc2047(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut remaining = input;
-
-    while let Some(start) = remaining.find("=?") {
-        // Copy text before the encoded word
-        output.push_str(&remaining[..start]);
-        remaining = &remaining[start..];
-
-        // Find the end of the encoded word
-        if let Some(end) = remaining.find("?=") {
-            let encoded = &remaining[2..end]; // skip =? and before ?=
-            remaining = &remaining[end + 2..]; // skip ?=
-
-            // Parse: charset?encoding?text
-            let parts: Vec<&str> = encoded.splitn(3, '?').collect();
-            if parts.len() == 3 {
-                let charset = parts[0].to_uppercase();
-                let encoding = parts[1].to_uppercase();
-                let text = parts[2];
-
-                let decoded_bytes = match encoding.as_str() {
-                    "B" => {
-                        use base64::Engine;
-                        base64::engine::general_purpose::STANDARD.decode(text).unwrap_or_default()
-                    }
-                    "Q" => decode_quoted_printable(text),
-                    _ => Vec::new(),
-                };
-
-                let decoded = if charset == "UTF-8" || charset == "UTF8" {
-                    String::from_utf8_lossy(&decoded_bytes).to_string()
-                } else {
-                    // Best effort: try UTF-8, fall back to lossy conversion
-                    String::from_utf8(decoded_bytes).unwrap_or_default()
-                };
-                output.push_str(&decoded);
-            } else {
-                output.push_str("=?");
-                output.push_str(encoded);
-                output.push_str("?=");
-            }
-        } else {
-            output.push_str(remaining);
-            break;
-        }
+    use rfc2047_decoder::{Decoder, RecoverStrategy};
+    match Decoder::new()
+        .too_long_encoded_word_strategy(RecoverStrategy::Decode)
+        .decode(input.as_bytes())
+    {
+        Ok(s) => s,
+        Err(_) => input.to_string(),
     }
-    // If no encoded words found, return the original input
-    if output.is_empty() && !input.is_empty() {
-        return input.to_string();
-    }
-    output
-}
-
-/// Decode RFC 2047 Q-encoding (quoted-printable variant)
-fn decode_quoted_printable(input: &str) -> Vec<u8> {
-    let mut output = Vec::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'=' && i + 2 < bytes.len() {
-            // =XX hex encoding
-            let hex = &input[i + 1..i + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                output.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        if bytes[i] == b'_' {
-            output.push(b' ');
-        } else {
-            output.push(bytes[i]);
-        }
-        i += 1;
-    }
-    output
 }
 
 /// Parse an RFC822 date string into a Unix timestamp (best-effort).
@@ -912,4 +918,89 @@ fn parse_date(date_str: &str) -> i64 {
         return dt.timestamp();
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// MIME body parsing (via mail-parser crate)
+// ---------------------------------------------------------------------------
+
+pub struct ParsedBody {
+    pub html: String,
+    pub text: String,
+    pub has_attachments: bool,
+}
+
+/// Parse a raw RFC822 message into HTML + plain text parts.
+pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
+    use mail_parser::{MessageParser, PartType};
+
+    let parsed = match MessageParser::default().parse(raw) {
+        Some(p) => p,
+        None => {
+            let fallback = String::from_utf8_lossy(raw);
+            return ParsedBody {
+                html: format!("<pre>{}</pre>", html_escape(&fallback)),
+                text: fallback.to_string(),
+                has_attachments: false,
+            };
+        }
+    };
+
+    // Collect HTML parts
+    let mut html = String::new();
+    for part in parsed.html_bodies() {
+        match &part.body {
+            PartType::Html(s) => {
+                html.push_str(s);
+                html.push('\n');
+            }
+            _ => {}
+        }
+    }
+
+    // Collect plain text parts
+    let mut text = String::new();
+    for part in parsed.text_bodies() {
+        match &part.body {
+            PartType::Text(s) => {
+                text.push_str(s);
+                text.push('\n');
+            }
+            _ => {}
+        }
+    }
+
+    // Check for attachments
+    let has_attachments = parsed.attachments().next().is_some();
+
+    // If no HTML but we have text, wrap in <pre>
+    if html.is_empty() && !text.is_empty() {
+        html = format!("<pre>{}</pre>", html_escape(&text));
+    }
+
+    // If still empty, try body_text as fallback
+    if html.is_empty() && text.is_empty() {
+        if let Some(body_text) = parsed.body_text(0) {
+            text = body_text.to_string();
+            html = format!("<pre>{}</pre>", html_escape(&text));
+        }
+    }
+
+    tracing::debug!(
+        "mail-parser: html_len={} text_len={} attachments={}",
+        html.len(),
+        text.len(),
+        has_attachments
+    );
+
+    ParsedBody { html, text, has_attachments }
+}
+
+fn html_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }

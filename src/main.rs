@@ -206,6 +206,114 @@ impl Daemon {
             folder_path: folder_path.to_string(),
         }).await;
     }
+
+    /// Load the body of a message. Returns HTML.
+    /// Fetches from IMAP if not cached, then caches for next time.
+    async fn load_body(&self, account_id: i64, folder_path: &str, uid: i64) -> String {
+        // Check cache first
+        {
+            let cache = self.cache.lock().await;
+            if let Ok(Some(html)) = cache.load_body(account_id, folder_path, uid) {
+                tracing::debug!("Body cache hit for uid={}", uid);
+                return html;
+            }
+        }
+
+        // Fetch from IMAP
+        tracing::info!("Fetching body for account={} folder={} uid={}", account_id, folder_path, uid);
+
+        let account = {
+            let cache = self.cache.lock().await;
+            match cache.load_accounts() {
+                Ok(accounts) => accounts.into_iter().find(|a| a.id == account_id),
+                Err(e) => {
+                    tracing::error!("Failed to load accounts: {}", e);
+                    return format!("<p>Error loading account: {}</p>", e);
+                }
+            }
+        };
+
+        let account = match account {
+            Some(a) => a,
+            None => return "<p>Account not found</p>".to_string(),
+        };
+
+        let host = account.imap_host.as_deref().unwrap_or("localhost");
+        let port = account.imap_port.unwrap_or(993) as u16;
+
+        // Connect
+        let connect_result = if account.auth_type == "oauth" {
+            let refresh_token = match account.refresh_token.as_deref() {
+                Some(rt) if !rt.is_empty() => rt,
+                _ => return "<p>No refresh token configured</p>".to_string(),
+            };
+            let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
+                .unwrap_or_else(|_| "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com".to_string());
+            let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
+
+            match oauth::refresh_access_token(
+                "https://oauth2.googleapis.com/token",
+                &client_id,
+                &client_secret,
+                refresh_token,
+            ).await {
+                Ok(token) => imap::connect_session_oauth(host, port, &account.email, &token.access_token).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            let key_name = format!("pelliper:{}", account.email);
+            match self.secrets.get_password(&key_name).await {
+                Ok(password) => imap::connect_session_password_raw(host, port, &account.email, &password).await,
+                Err(e) => Err(e),
+            }
+        };
+
+        let mut session = match connect_result {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to connect for body fetch: {}", e);
+                return format!("<p>Failed to connect: {}</p>", e);
+            }
+        };
+
+        // SELECT folder
+        if let Err(e) = session.select_folder(folder_path).await {
+            tracing::error!("SELECT failed for body fetch: {}", e);
+            session.logout().await;
+            return format!("<p>Failed to select folder: {}</p>", e);
+        }
+
+        // Fetch body
+        let raw_body = match session.fetch_body(uid).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("FETCH BODY failed: {}", e);
+                session.logout().await;
+                return format!("<p>Failed to fetch body: {}</p>", e);
+            }
+        };
+
+        session.logout().await;
+
+        // Parse MIME
+        let parsed = imap::parse_message_body(&raw_body);
+        let html = if parsed.html.is_empty() {
+            format!("<pre>{}</pre>", parsed.text)
+        } else {
+            parsed.html
+        };
+
+        // Cache
+        {
+            let cache = self.cache.lock().await;
+            if let Err(e) = cache.save_body(account_id, folder_path, uid, &html) {
+                tracing::error!("Failed to cache body: {}", e);
+            }
+        }
+
+        tracing::info!("Body loaded and cached for uid={}", uid);
+        html
+    }
 }
 
 #[tokio::main]

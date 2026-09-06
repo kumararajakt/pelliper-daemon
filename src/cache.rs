@@ -320,6 +320,40 @@ impl Cache {
         )?;
         Ok(count)
     }
+
+    /// Load cached body HTML for a message. Returns None if not cached.
+    pub fn load_body(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<Option<String>> {
+        let result = self.conn.query_row(
+            "SELECT html FROM bodies WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+            rusqlite::params![account_id, folder_path, uid],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        match result {
+            Ok(html) => Ok(html),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Save body HTML to cache.
+    pub fn save_body(&self, account_id: i64, folder_path: &str, uid: i64, html: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO bodies (account_id, folder_path, uid, html) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET html = ?4",
+            rusqlite::params![account_id, folder_path, uid, html],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a body is already cached.
+    pub fn has_body(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM bodies WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+            rusqlite::params![account_id, folder_path, uid],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
 }
 
 #[derive(Debug, Clone)]
