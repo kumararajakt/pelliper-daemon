@@ -291,6 +291,52 @@ pub struct ImapFolder {
     pub path: String,
     pub delimiter: Option<String>,
     pub noselect: bool,
+    pub kind: FolderKind,
+}
+
+/// Semantic classification of a folder based on SPECIAL-USE attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum FolderKind {
+    Inbox,
+    Sent,
+    Drafts,
+    Trash,
+    Junk,
+    Archive,
+    Starred,
+    Custom,
+}
+
+impl FolderKind {
+    /// Parse from IMAP flag string (e.g., "\\Sent" -> Sent).
+    pub fn from_flag(flag: &str) -> Option<Self> {
+        match flag.to_lowercase().as_str() {
+            "\\inbox" | "inbox" => Some(FolderKind::Inbox),
+            "\\sent" | "sent" => Some(FolderKind::Sent),
+            "\\drafts" | "drafts" => Some(FolderKind::Drafts),
+            "\\trash" | "trash" => Some(FolderKind::Trash),
+            "\\junk" | "junk" | "\\spam" | "spam" => Some(FolderKind::Junk),
+            "\\archive" | "archive" | "\\all" | "all" => Some(FolderKind::Archive),
+            "\\flagged" | "flagged" | "\\starred" | "starred" => Some(FolderKind::Starred),
+            _ => None,
+        }
+    }
+
+    /// Classify by path heuristics (fallback when no SPECIAL-USE attribute).
+    pub fn from_path(path: &str) -> Self {
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        let lower = leaf.to_lowercase();
+        match lower.as_str() {
+            "inbox" => FolderKind::Inbox,
+            "sent" | "sent items" | "sent mail" | "sent messages" => FolderKind::Sent,
+            "drafts" | "draft" => FolderKind::Drafts,
+            "trash" | "deleted items" | "deleted messages" | "bin" | "deleted" => FolderKind::Trash,
+            "junk" | "junk e-mail" | "spam" => FolderKind::Junk,
+            "archive" | "archives" | "all mail" | "all" => FolderKind::Archive,
+            "starred" | "flagged" | "important" => FolderKind::Starred,
+            _ => FolderKind::Custom,
+        }
+    }
 }
 
 /// Summary of an IMAP message (header-level fields only).
@@ -391,9 +437,8 @@ impl RawImapSession {
 
         let mut folders = Vec::new();
         for line in &untagged {
-            // Format: * LIST (\flags) "delimiter" "name"
-            if let Some((name, noselect)) = parse_list_response(line) {
-                folders.push(ImapFolder { path: name, delimiter: None, noselect });
+            if let Some((name, noselect, kind)) = parse_list_response(line) {
+                folders.push(ImapFolder { path: name, delimiter: None, noselect, kind });
             }
         }
 
@@ -804,15 +849,27 @@ impl RawImapSession {
 }
 
 /// Parse a LIST response line: * LIST (\flags) "delimiter" "name"
-fn parse_list_response(line: &str) -> Option<(String, bool)> {
-    // Find the name — it's the last quoted or unquoted token
+/// Returns (name, noselect, kind).
+fn parse_list_response(line: &str) -> Option<(String, bool, FolderKind)> {
     let rest = line.strip_prefix("* LIST ")?;
-    // Parse flags: find closing paren
     let mut noselect = false;
+    let mut kind = FolderKind::Custom;
+    let mut special_use_found = false;
+
+    // Parse flags: find closing paren
     let after_flags = if rest.starts_with('(') {
         let end = rest.find(')')? + 1;
         let flags = &rest[1..end-1];
         noselect = flags.contains("\\Noselect") || flags.contains("\\noselect");
+
+        // Parse SPECIAL-USE attributes
+        for flag in flags.split_whitespace() {
+            if let Some(k) = FolderKind::from_flag(flag) {
+                kind = k;
+                special_use_found = true;
+                break;
+            }
+        }
         end
     } else {
         0
@@ -834,7 +891,13 @@ fn parse_list_response(line: &str) -> Option<(String, bool)> {
     } else {
         rest.to_string()
     };
-    Some((name, noselect))
+
+    // If no SPECIAL-USE attribute was found, classify by path
+    if !special_use_found {
+        kind = FolderKind::from_path(&name);
+    }
+
+    Some((name, noselect, kind))
 }
 
 /// Parse a FETCH response line for UID, flags, and body.
@@ -1016,7 +1079,30 @@ pub async fn list_folders(
         let name = mailbox.name().to_string();
         let delimiter = mailbox.delimiter().map(|d| d.to_string());
         let noselect = mailbox.attributes().iter().any(|a| matches!(a, async_imap::imap_proto::types::NameAttribute::NoSelect));
-        folders.push(ImapFolder { path: name, delimiter, noselect });
+
+        // Check SPECIAL-USE attributes first, fall back to path heuristics
+        let mut kind = FolderKind::Custom;
+        let mut special_use_found = false;
+        for attr in mailbox.attributes() {
+            match attr {
+                async_imap::imap_proto::types::NameAttribute::NoSelect => {},
+                async_imap::imap_proto::types::NameAttribute::NoInferiors => {},
+                async_imap::imap_proto::types::NameAttribute::Extension(ext) => {
+                    if let Some(k) = FolderKind::from_flag(ext) {
+                        kind = k;
+                        special_use_found = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !special_use_found {
+            kind = FolderKind::from_path(&name);
+        }
+
+        folders.push(ImapFolder { path: name, delimiter, noselect, kind });
     }
 
     tracing::info!("Discovered {} folders", folders.len());
