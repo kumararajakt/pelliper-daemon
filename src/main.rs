@@ -126,6 +126,30 @@ impl Daemon {
         saved
     }
 
+    /// Remove an account and all its data (folders, messages, bodies, attachments).
+    /// Returns true on success.
+    async fn remove_account(&self, account_id: i64) -> bool {
+        tracing::info!("D-Bus: remove_account id={}", account_id);
+
+        // Notify IDLE manager to stop watching this account
+        let _ = self.idle_tx.send(idle::IdleCommand::SetFolder {
+            account_id,
+            folder_path: String::new(),
+        }).await;
+
+        let mut cache = self.cache.lock().await;
+        match cache.remove_account(account_id) {
+            Ok(()) => {
+                tracing::info!("Account {} removed", account_id);
+                true
+            }
+            Err(e) => {
+                tracing::error!("Failed to remove account {}: {}", account_id, e);
+                false
+            }
+        }
+    }
+
     /// Trigger a full sync of all enabled accounts.
     async fn sync_all(&self) -> bool {
         tracing::info!("D-Bus: sync_all requested");

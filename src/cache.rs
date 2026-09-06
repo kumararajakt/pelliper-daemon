@@ -205,6 +205,18 @@ impl Cache {
         Ok(count > 0)
     }
 
+    /// Delete an account and all its folders, messages, bodies, and attachments.
+    pub fn remove_account(&self, account_id: i64) -> Result<()> {
+        // Foreign keys with ON DELETE CASCADE handle messages/bodies/folders
+        self.conn.execute("DELETE FROM attachments WHERE account_id = ?1", rusqlite::params![account_id])?;
+        self.conn.execute("DELETE FROM bodies WHERE account_id = ?1", rusqlite::params![account_id])?;
+        self.conn.execute("DELETE FROM messages WHERE account_id = ?1", rusqlite::params![account_id])?;
+        self.conn.execute("DELETE FROM folders WHERE account_id = ?1", rusqlite::params![account_id])?;
+        self.conn.execute("DELETE FROM accounts WHERE id = ?1", rusqlite::params![account_id])?;
+        tracing::info!("Removed account {} and all associated data", account_id);
+        Ok(())
+    }
+
     pub fn upsert_folder(&self, account_id: i64, path: &str, unread_count: i32, noselect: bool) -> Result<()> {
         self.conn.execute(
             "INSERT INTO folders (account_id, path, unread_count, noselect) VALUES (?1, ?2, ?3, ?4)
