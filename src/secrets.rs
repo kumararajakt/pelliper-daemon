@@ -1,5 +1,6 @@
 use keyring::Entry;
 
+#[derive(Clone)]
 pub struct Secrets {
     service_name: String,
 }

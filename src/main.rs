@@ -13,14 +13,28 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use zbus::connection::Builder;
 use zbus::interface;
+use zbus::object_server::SignalContext;
 
 struct Daemon {
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,
+    sync_engine: sync::SyncEngine,
 }
 
 #[interface(name = "org.kde.pelliper.Daemon")]
 impl Daemon {
+    /// Check if any accounts exist in the database.
+    async fn has_accounts(&self) -> bool {
+        let cache = self.cache.lock().await;
+        match cache.account_count() {
+            Ok(count) => count > 0,
+            Err(e) => {
+                tracing::error!("Failed to check accounts: {}", e);
+                false
+            }
+        }
+    }
+
     /// Add an account, test IMAP connection, and save to database.
     /// Returns true on success, false on failure.
     async fn add_account(
@@ -38,7 +52,7 @@ impl Daemon {
 
         // Check if account already exists
         {
-        let mut cache = self.cache.lock().await;
+            let mut cache = self.cache.lock().await;
             if let Ok(exists) = cache.account_exists(email) {
                 if exists {
                     tracing::warn!("Account already exists: {}", email);
@@ -81,14 +95,75 @@ impl Daemon {
             enabled: true,
         };
 
-        let mut cache = self.cache.lock().await;
-        match cache.insert_account(&account) {
-            Ok(id) => {
-                tracing::info!("Account saved with id {}: {}", id, email);
-                true
+        let saved = {
+            let mut cache = self.cache.lock().await;
+            match cache.insert_account(&account) {
+                Ok(id) => {
+                    tracing::info!("Account saved with id {}: {}", id, email);
+                    true
+                }
+                Err(e) => {
+                    tracing::error!("Failed to save account {}: {}", email, e);
+                    false
+                }
             }
+        };
+
+        // Trigger initial sync in the background
+        if saved {
+            let sync = self.sync_engine.clone();
+            let email_clone = email.to_string();
+            tokio::spawn(async move {
+                // Small delay to let the D-Bus response go out first
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                tracing::info!("Starting initial sync for {}", email_clone);
+                // Reload account from DB and sync
+                // For now, sync_all will pick up the new account
+                if let Err(e) = sync.sync_all().await {
+                    tracing::error!("Initial sync failed for {}: {}", email_clone, e);
+                }
+            });
+        }
+
+        saved
+    }
+
+    /// Trigger a full sync of all enabled accounts.
+    async fn sync_all(&self) -> bool {
+        tracing::info!("D-Bus: sync_all requested");
+        match self.sync_engine.sync_all().await {
+            Ok(()) => true,
             Err(e) => {
-                tracing::error!("Failed to save account {}: {}", email, e);
+                tracing::error!("sync_all failed: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Trigger a sync of a specific account by email.
+    async fn sync_account(&self, email: &str) -> bool {
+        tracing::info!("D-Bus: sync_account requested for {}", email);
+        let account = {
+            let cache = self.cache.lock().await;
+            match cache.load_accounts() {
+                Ok(accounts) => accounts.into_iter().find(|a| a.email == email),
+                Err(e) => {
+                    tracing::error!("Failed to load accounts: {}", e);
+                    return false;
+                }
+            }
+        };
+
+        match account {
+            Some(account) => match self.sync_engine.sync_account(&account).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!("sync_account failed for {}: {}", email, e);
+                    false
+                }
+            },
+            None => {
+                tracing::error!("Account not found: {}", email);
                 false
             }
         }
@@ -113,9 +188,11 @@ async fn main() {
 
     let secrets = Secrets::new();
 
+    let sync_engine = sync::SyncEngine::new(cache.clone(), secrets.clone());
+
     tracing::info!("Pelliper daemon started, data dir: {:?}", data_dir);
 
-    let daemon = Daemon { cache, secrets };
+    let daemon = Daemon { cache: cache.clone(), secrets, sync_engine: sync_engine.clone() };
 
     // Register on D-Bus session bus
     let _conn = Builder::session()
@@ -129,6 +206,23 @@ async fn main() {
         .expect("Failed to start D-Bus server");
 
     tracing::info!("D-Bus server running as org.kde.pelliper.Daemon");
+
+    // Auto-sync on startup if accounts exist
+    {
+        let cache_guard = cache.lock().await;
+        if let Ok(count) = cache_guard.account_count() {
+            if count > 0 {
+                tracing::info!("Found {} account(s), starting initial sync", count);
+                let sync = sync_engine.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    if let Err(e) = sync.sync_all().await {
+                        tracing::error!("Startup sync failed: {}", e);
+                    }
+                });
+            }
+        }
+    }
 
     // Keep the daemon running
     std::future::pending::<()>().await;

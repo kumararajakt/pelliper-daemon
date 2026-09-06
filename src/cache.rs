@@ -156,6 +156,15 @@ impl Cache {
         Ok(self.conn.last_insert_rowid())
     }
 
+    pub fn account_count(&self) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM accounts",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     pub fn account_exists(&self, email: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM accounts WHERE email = ?1",
@@ -163,6 +172,67 @@ impl Cache {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    pub fn upsert_folder(&self, account_id: i64, path: &str, unread_count: i32) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO folders (account_id, path, unread_count) VALUES (?1, ?2, ?3)
+             ON CONFLICT(account_id, path) DO UPDATE SET unread_count = ?3",
+            rusqlite::params![account_id, path, unread_count],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_message(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        subject: &str,
+        sender: &str,
+        date: i64,
+        is_read: bool,
+        is_starred: bool,
+        has_attachments: bool,
+        preview: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO messages (account_id, folder_path, uid, subject, sender, date, is_read, is_starred, has_attachments, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET
+                subject = ?4, sender = ?5, date = ?6, is_read = ?7, is_starred = ?8, has_attachments = ?9, preview = ?10",
+            rusqlite::params![account_id, folder_path, uid, subject, sender, date, is_read as i32, is_starred as i32, has_attachments as i32, preview],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_stale_messages(&self, account_id: i64, folder_path: &str, valid_uids: &[i64]) -> Result<()> {
+        if valid_uids.is_empty() {
+            return Ok(());
+        }
+        let placeholders: Vec<String> = valid_uids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid NOT IN ({})",
+            placeholders.join(", ")
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(account_id),
+            Box::new(folder_path.to_string()),
+        ];
+        for uid in valid_uids {
+            params.push(Box::new(*uid));
+        }
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        self.conn.execute(&sql, param_refs.as_slice())?;
+        Ok(())
+    }
+
+    pub fn update_folder_unread(&self, account_id: i64, path: &str, unread: i32) -> Result<()> {
+        self.conn.execute(
+            "UPDATE folders SET unread_count = ?1 WHERE account_id = ?2 AND path = ?3",
+            rusqlite::params![unread, account_id, path],
+        )?;
+        Ok(())
     }
 }
 
