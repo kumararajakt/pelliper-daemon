@@ -5,6 +5,7 @@ mod mail;
 mod smtp;
 mod secrets;
 mod sync;
+mod oauth;
 
 use cache::{Cache, Account};
 use secrets::Secrets;
@@ -47,6 +48,7 @@ impl Daemon {
         smtp_port: i32,
         auth_type: &str,
         auth_token: &str,
+        refresh_token: &str,
     ) -> bool {
         tracing::info!("add_account: {} ({})", email, auth_type);
 
@@ -72,12 +74,6 @@ impl Daemon {
             tracing::warn!("IMAP connection test failed for {}, saving account anyway", email);
         }
 
-        // Store token in keyring
-        let key_name = format!("pelliper:{}", email);
-        if let Err(e) = self.secrets.store_password(&key_name, auth_token).await {
-            tracing::error!("Failed to store credential in keyring: {}", e);
-        }
-
         // Save account to database
         let account = Account {
             id: 0,
@@ -92,6 +88,8 @@ impl Daemon {
             smtp_port: Some(smtp_port as i64),
             smtp_security: Some("starttls".to_string()),
             username: Some(email.to_string()),
+            access_token: Some(auth_token.to_string()),
+            refresh_token: if refresh_token.is_empty() { None } else { Some(refresh_token.to_string()) },
             enabled: true,
         };
 
@@ -168,11 +166,54 @@ impl Daemon {
             }
         }
     }
+
+    /// Get folders for an account. Returns JSON array.
+    async fn get_folders(&self, account_id: i64) -> String {
+        let cache = self.cache.lock().await;
+        match cache.load_folders(account_id) {
+            Ok(folders) => serde_json::to_string(&folders).unwrap_or_else(|_| "[]".to_string()),
+            Err(e) => {
+                tracing::error!("Failed to load folders: {}", e);
+                "[]".to_string()
+            }
+        }
+    }
+
+    /// Get messages for a folder. Returns JSON array.
+    async fn get_messages(&self, account_id: i64, folder_path: &str, offset: i64, limit: i64) -> String {
+        let cache = self.cache.lock().await;
+        match cache.load_messages(account_id, folder_path, offset, limit) {
+            Ok(messages) => serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string()),
+            Err(e) => {
+                tracing::error!("Failed to load messages: {}", e);
+                "[]".to_string()
+            }
+        }
+    }
+
+    /// Get total message count for a folder.
+    async fn count_messages(&self, account_id: i64, folder_path: &str) -> i64 {
+        let cache = self.cache.lock().await;
+        cache.count_messages(account_id, folder_path).unwrap_or(0)
+    }
 }
 
 #[tokio::main]
 async fn main() {
     rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+
+    // Load .env file from data dir or current directory
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("pelliper");
+
+    let env_file = data_dir.join(".env");
+    if env_file.exists() {
+        tracing::info!("Loading env from {:?}", env_file);
+        dotenvy::from_path(&env_file).ok();
+    } else {
+        dotenvy::dotenv().ok();
+    }
 
     tracing_subscriber::fmt::init();
 

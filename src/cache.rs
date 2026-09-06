@@ -117,7 +117,7 @@ impl Cache {
 
     pub fn load_accounts(&self) -> Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, enabled FROM accounts",
+            "SELECT id, email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, access_token, refresh_token, enabled FROM accounts",
         )?;
 
         let accounts = stmt
@@ -135,7 +135,9 @@ impl Cache {
                     smtp_port: row.get(9)?,
                     smtp_security: row.get(10)?,
                     username: row.get(11)?,
-                    enabled: row.get(12)?,
+                    access_token: row.get(12)?,
+                    refresh_token: row.get(13)?,
+                    enabled: row.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -145,7 +147,7 @@ impl Cache {
 
     pub fn insert_account(&mut self, account: &Account) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO accounts (email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT OR REPLACE INTO accounts (email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, access_token, refresh_token, enabled) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 account.email,
                 account.display_name,
@@ -158,6 +160,8 @@ impl Cache {
                 account.smtp_port,
                 account.smtp_security,
                 account.username,
+                account.access_token,
+                account.refresh_token,
                 account.enabled,
             ],
         )?;
@@ -180,6 +184,14 @@ impl Cache {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    pub fn update_access_token(&mut self, account_id: i64, token: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET access_token = ?1 WHERE id = ?2",
+            rusqlite::params![token, account_id],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_folder(&self, account_id: i64, path: &str, unread_count: i32, noselect: bool) -> Result<()> {
@@ -258,5 +270,7 @@ pub struct Account {
     pub smtp_port: Option<i64>,
     pub smtp_security: Option<String>,
     pub username: Option<String>,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
     pub enabled: bool,
 }

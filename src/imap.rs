@@ -351,16 +351,24 @@ impl RawImapSession {
                 return Ok((trimmed, untagged));
             }
 
-            // IMAP literal: line ending with {<size>} — skip the literal data
+            // IMAP literal: line ending with {<size>} — read the literal data
+            // and append it to the line so parsers can extract header content.
             if let Some(brace_pos) = trimmed.rfind('{') {
                 if trimmed.ends_with('}') {
                     if let Ok(size) = trimmed[brace_pos+1..trimmed.len()-1].parse::<usize>() {
                         tracing::debug!("IMAP literal: {} bytes", size);
-                        // The literal data follows; read exactly `size` bytes + CRLF
-                        let mut literal_buf = vec![0u8; size + 2]; // +2 for trailing CRLF
+                        // Read exactly `size` bytes of literal data
+                        let mut literal_buf = vec![0u8; size];
                         self.reader.read_exact(&mut literal_buf).await?;
-                        // This literal line with its data goes into untagged
-                        untagged.push(trimmed);
+                        // Read the trailing CRLF after the literal
+                        let mut crlf = [0u8; 2];
+                        let _ = self.reader.read_exact(&mut crlf).await;
+                        // Append the literal data (as UTF-8) to the line
+                        let literal_text = String::from_utf8_lossy(&literal_buf);
+                        let mut full_line = trimmed;
+                        full_line.push_str("\r\n");
+                        full_line.push_str(&literal_text);
+                        untagged.push(full_line);
                         continue;
                     }
                 }
@@ -393,11 +401,10 @@ impl RawImapSession {
         Ok(folders)
     }
 
-    /// EXAMINE a folder and fetch the newest N message summaries.
+    /// EXAMINE a folder and fetch all message summaries.
     pub async fn fetch_message_summaries(
         &mut self,
         folder: &str,
-        max_count: usize,
     ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
         // EXAMINE (read-only SELECT)
         let tag = self.next_tag();
@@ -420,12 +427,11 @@ impl RawImapSession {
             return Ok(Vec::new());
         }
 
-        // Fetch UID + headers + flags for newest N messages
-        let first_uid = if exists > max_count { exists - max_count + 1 } else { 1 };
+        // Fetch UID + headers + flags for all messages
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH {}:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)",
-            tag, first_uid
+            "{} UID FETCH 1:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)",
+            tag
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
 
@@ -435,7 +441,9 @@ impl RawImapSession {
 
         let mut summaries = Vec::new();
         for line in &fetch_untagged {
+            tracing::debug!("FETCH untagged line (len={}): {}", line.len(), &line[..line.len().min(200)]);
             if let Some(msg) = parse_fetch_response(line) {
+                tracing::debug!("Parsed message uid={} subject='{}' sender='{}'", msg.uid, msg.subject, msg.sender);
                 summaries.push(msg);
             }
         }
@@ -485,10 +493,10 @@ fn parse_list_response(line: &str) -> Option<(String, bool)> {
 }
 
 /// Parse a FETCH response line for UID, flags, and body.
+/// After read_response appends literal data, the line looks like:
+/// * <seq> FETCH (UID <uid> FLAGS (\Seen) BODY[HEADER.FIELDS ...] {<size>}\r\n<headers>
 fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
-    // Format: * <seq> FETCH (UID <uid> FLAGS (\Seen) BODY[HEADER.FIELDS ...] {<size>}\r\n<headers>)
     let rest = line.strip_prefix("* ")?;
-    let rest = rest.strip_suffix(')').unwrap_or(rest);
 
     // Extract UID — look for "UID" followed by a number
     let uid = {
@@ -499,9 +507,12 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
                 uid_val = token.parse().unwrap_or(0);
                 break;
             }
-            if token == "UID" {
+            if token == "UID" || token == "(UID" {
                 found_uid = true;
             }
+        }
+        if uid_val == 0 {
+            tracing::warn!("UID not found in FETCH line (first 300 chars): {}", &rest[..rest.len().min(300)]);
         }
         uid_val
     };
@@ -510,17 +521,26 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
     let is_read = rest.contains("\\Seen");
     let is_starred = rest.contains("\\Flagged");
 
-    // Extract body between {size}\r\n and the closing paren
+    // Find the literal size marker: BODY[...] {<size>}
+    // Must find the brace that closes the size marker, not any brace inside header content
     let body_start = rest.find("BODY[HEADER.FIELDS")?;
-    let size_marker = rest[body_start..].find('}')?;
-    let after_size = rest[body_start..][size_marker+1..].trim_start();
-    // Skip the \r\n after the literal size
-    let header_text = if after_size.starts_with("\r\n") {
-        after_size[2..].to_string()
+    // Find "{" after the BODY[...] section — search from after the closing bracket
+    let bracket_end = rest[body_start..].find(']')?;
+    let search_from = body_start + bracket_end + 1;
+    let brace_start = rest[search_from..].find('{')?;
+    let brace_pos = search_from + brace_start;
+    let brace_end = rest[brace_pos..].find('}')?;
+    let after_brace = brace_pos + brace_end + 1;
+
+    // After {size}\r\n comes the literal header text
+    let header_text = if after_brace < rest.len() {
+        rest[after_brace..].trim().to_string()
     } else {
-        after_size.to_string()
+        String::new()
     };
-    let header_text = header_text.trim_end().to_string();
+
+    // Strip trailing closing paren that might be appended
+    let header_text = header_text.trim_end_matches(')').trim().to_string();
 
     let subject = parse_header(&header_text, "Subject");
     let sender = parse_header(&header_text, "From");
@@ -594,11 +614,10 @@ pub async fn list_folders(
     Ok(folders)
 }
 
-/// Fetch the newest N message summaries from a folder via async-imap.
+/// Fetch all message summaries from a folder via async-imap.
 pub async fn fetch_message_summaries(
     session: &mut async_imap::Session<CompatTls>,
     folder: &str,
-    max_count: usize,
 ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
     // SELECT the folder (read-only)
     let mailbox = timeout(IMAP_TIMEOUT, session.examine(folder)).await??;
@@ -608,17 +627,10 @@ pub async fn fetch_message_summaries(
         return Ok(Vec::new());
     }
 
-    // Calculate UID range for the newest N messages
-    let first_uid = if exists as usize > max_count {
-        exists as u32 - max_count as u32 + 1
-    } else {
-        1
-    };
-    let fetch_range = format!("{}:*", first_uid);
-
+    // Fetch all messages
     let messages_stream = timeout(
         IMAP_TIMEOUT,
-        session.uid_fetch(&fetch_range, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)"),
+        session.uid_fetch("1:*", "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)"),
     )
     .await??;
     let messages: Vec<_> = messages_stream.try_collect().await?;
@@ -661,13 +673,26 @@ pub async fn logout_session(session: &mut async_imap::Session<CompatTls>) {
 }
 
 /// Parse a single header value from raw RFC822 headers.
+/// Handles folded headers (continuation lines starting with whitespace).
 fn parse_header(headers: &str, name: &str) -> String {
+    let mut result = String::new();
+    let mut found = false;
+    let prefix = format!("{}:", name);
     for line in headers.lines() {
-        if let Some(value) = line.strip_prefix(&format!("{}:", name)) {
-            return value.trim().to_string();
+        if !found {
+            if let Some(value) = line.strip_prefix(&prefix) {
+                result = value.trim().to_string();
+                found = true;
+            }
+        } else if line.starts_with(' ') || line.starts_with('\t') {
+            // RFC 822 continuation line — append with a space
+            result.push(' ');
+            result.push_str(line.trim());
+        } else {
+            break;
         }
     }
-    String::new()
+    result
 }
 
 /// Parse an RFC822 date string into a Unix timestamp (best-effort).
