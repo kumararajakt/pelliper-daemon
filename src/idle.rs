@@ -2,6 +2,7 @@ use crate::cache::Cache;
 use crate::imap::{self, RawImapSession};
 use crate::oauth;
 use crate::secrets::Secrets;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -20,55 +21,75 @@ pub enum IdleCommand {
         account_id: i64,
         folder_path: String,
     },
-    /// Stop IDLE and shut down.
-    Stop,
 }
 
-/// Manages a long-lived IMAP IDLE connection for real-time push updates.
+/// Routes IdleCommands to per-account IDLE tasks.
+pub struct IdleRouter {
+    senders: std::sync::Mutex<HashMap<i64, mpsc::Sender<IdleCommand>>>,
+}
+
+impl IdleRouter {
+    pub fn new() -> Self {
+        Self {
+            senders: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a new account's command sender.
+    pub fn register(&self, account_id: i64, sender: mpsc::Sender<IdleCommand>) {
+        self.senders.lock().unwrap().insert(account_id, sender);
+    }
+
+    /// Remove an account's sender (e.g., when account is deleted).
+    pub fn unregister(&self, account_id: i64) {
+        self.senders.lock().unwrap().remove(&account_id);
+    }
+
+    /// Route a SetFolder command to the correct account.
+    pub async fn set_folder(&self, account_id: i64, folder_path: &str) {
+        let sender = self.senders.lock().unwrap().get(&account_id).cloned();
+        if let Some(sender) = sender {
+            let _ = sender
+                .send(IdleCommand::SetFolder {
+                    account_id,
+                    folder_path: folder_path.to_string(),
+                })
+                .await;
+        } else {
+            tracing::warn!(
+                "IdleRouter: no sender registered for account {}",
+                account_id
+            );
+        }
+    }
+}
+
+/// Manages a long-lived IMAP IDLE connection for one account.
 ///
-/// One IdleManager runs per account. It holds a dedicated IMAP connection
-/// that stays in IDLE on the currently viewed folder. When the server
-/// sends EXISTS/EXPUNGE/FLAGS notifications, it re-fetches summaries and
-/// updates the cache. The UI models auto-refresh via QFileSystemWatcher.
-pub struct IdleManager {
+/// Runs as a spawned tokio task. Listens for IdleCommands on its channel
+/// and stays in IDLE on the most recently viewed folder.
+struct IdleWorker {
+    account_id: i64,
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,
     cmd_rx: mpsc::Receiver<IdleCommand>,
-    cmd_tx: mpsc::Sender<IdleCommand>,
     notify_tx: mpsc::Sender<IdleNotification>,
 }
 
-impl IdleManager {
-    pub fn new(
-        cache: Arc<Mutex<Cache>>,
-        secrets: Secrets,
-        notify_tx: mpsc::Sender<IdleNotification>,
-    ) -> (Self, mpsc::Sender<IdleCommand>) {
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
-        let manager = Self {
-            cache,
-            secrets,
-            cmd_rx,
-            cmd_tx: cmd_tx.clone(),
-            notify_tx,
-        };
-        (manager, cmd_tx)
-    }
-
-    /// Run the IDLE loop for an account. Connects, authenticates, and
-    /// stays in IDLE on the most recently viewed folder.
-    pub async fn run(&mut self, account_id: i64) {
-        let account = match self.load_account(account_id).await {
+impl IdleWorker {
+    async fn run(mut self) {
+        let account = match self.load_account().await {
             Some(a) => a,
             None => {
-                tracing::error!("IdleManager: account {} not found", account_id);
+                tracing::error!("IdleWorker: account {} not found", self.account_id);
                 return;
             }
         };
 
-        let initial_folder = self.get_initial_folder(account_id).await;
+        let initial_folder = self.get_initial_folder().await;
         tracing::info!(
-            "IdleManager: starting for {} (initial folder: {:?})",
+            "IdleWorker[{}]: starting for {} (initial folder: {:?})",
+            self.account_id,
             account.email,
             initial_folder
         );
@@ -80,20 +101,19 @@ impl IdleManager {
             // Check for commands (non-blocking)
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
-                    IdleCommand::SetFolder { account_id: aid, folder_path } if aid == account_id => {
-                        tracing::info!("IdleManager: switching to folder {}", folder_path);
-                        // Drop current session to force reconnect with new folder
+                    IdleCommand::SetFolder {
+                        account_id: aid,
+                        folder_path,
+                    } if aid == self.account_id => {
+                        tracing::info!(
+                            "IdleWorker[{}]: switching to folder {}",
+                            self.account_id,
+                            folder_path
+                        );
                         session = None;
                         current_folder = Some(folder_path);
                     }
-                    IdleCommand::SetFolder { .. } => {}
-                    IdleCommand::Stop => {
-                        tracing::info!("IdleManager: stopping");
-                        if let Some(mut s) = session {
-                            s.logout().await;
-                        }
-                        return;
-                    }
+                    _ => {}
                 }
             }
 
@@ -102,7 +122,12 @@ impl IdleManager {
                 match self.connect(&account).await {
                     Ok(s) => session = Some(s),
                     Err(e) => {
-                        tracing::error!("IdleManager: connect failed for {}: {}", account.email, e);
+                        tracing::error!(
+                            "IdleWorker[{}]: connect failed for {}: {}",
+                            self.account_id,
+                            account.email,
+                            e
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                         continue;
                     }
@@ -120,7 +145,12 @@ impl IdleManager {
 
             let sess = session.as_mut().unwrap();
             if let Err(e) = sess.select_folder(&folder).await {
-                tracing::error!("IdleManager: SELECT {} failed: {}", folder, e);
+                tracing::error!(
+                    "IdleWorker[{}]: SELECT {} failed: {}",
+                    self.account_id,
+                    folder,
+                    e
+                );
                 session = None;
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
@@ -128,85 +158,104 @@ impl IdleManager {
 
             let tag_num = sess.current_tag();
             if let Err(e) = sess.idle_start().await {
-                tracing::error!("IdleManager: IDLE start failed: {}", e);
+                tracing::error!(
+                    "IdleWorker[{}]: IDLE start failed: {}",
+                    self.account_id,
+                    e
+                );
                 session = None;
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 continue;
             }
 
-            tracing::info!("IdleManager: IDLE on {} (tag T{})", folder, tag_num);
+            tracing::info!(
+                "IdleWorker[{}]: IDLE on {} (tag T{})",
+                self.account_id,
+                folder,
+                tag_num
+            );
 
-            // Read IDLE notifications with a timeout (29 minutes per RFC)
+            // Read IDLE notifications with 29-minute timeout (RFC)
             let idle_timeout = tokio::time::Duration::from_secs(29 * 60);
             let idle_tag = format!("T{}", tag_num);
 
             let result = tokio::time::timeout(idle_timeout, async {
                 loop {
-                    // Check for commands between reads
                     while let Ok(cmd) = self.cmd_rx.try_recv() {
                         match cmd {
-                            IdleCommand::SetFolder { account_id: aid, folder_path } if aid == account_id => {
+                            IdleCommand::SetFolder {
+                                account_id: aid,
+                                folder_path,
+                            } if aid == self.account_id => {
                                 return IdleEvent::FolderSwitch(folder_path);
                             }
-                            IdleCommand::SetFolder { .. } => {}
-                            IdleCommand::Stop => return IdleEvent::Stop,
+                            _ => {}
                         }
                     }
 
                     match sess.idle_read_line().await {
                         Ok(Some(line)) => {
-                            if line.is_empty() { continue; }
-                            // Parse IDLE notifications
+                            if line.is_empty() {
+                                continue;
+                            }
                             if let Some(event) = parse_idle_event(&line) {
                                 return event;
                             }
-                            // Non-notification lines (e.g., untagged FETCH) — keep reading
                         }
-                        Ok(None) => {
-                            // Server ended IDLE (BYE or timeout)
-                            return IdleEvent::Disconnected;
-                        }
+                        Ok(None) => return IdleEvent::Disconnected,
                         Err(e) => {
-                            tracing::error!("IdleManager: read error: {}", e);
+                            tracing::error!(
+                                "IdleWorker[{}]: read error: {}",
+                                self.account_id,
+                                e
+                            );
                             return IdleEvent::Disconnected;
                         }
                     }
                 }
-            }).await;
+            })
+            .await;
 
-            // Send DONE to exit IDLE
             let _ = sess.idle_done(&idle_tag).await;
 
             match result {
                 Ok(IdleEvent::FolderSwitch(folder)) => {
-                    tracing::info!("IdleManager: switching to {}", folder);
+                    tracing::info!(
+                        "IdleWorker[{}]: switching to {}",
+                        self.account_id,
+                        folder
+                    );
                     current_folder = Some(folder);
-                    // Reconnect to force clean SELECT
                     if let Some(mut s) = session.take() {
                         s.logout().await;
                     }
                 }
                 Ok(IdleEvent::MailboxChange) => {
-                    tracing::info!("IdleManager: mailbox changed on {}, re-syncing", folder);
-                    // Re-fetch summaries and update cache
-                    if let Err(e) = self.sync_folder(account_id, &folder, &account.email).await {
-                        tracing::error!("IdleManager: sync failed: {}", e);
+                    tracing::info!(
+                        "IdleWorker[{}]: mailbox changed on {}, re-syncing",
+                        self.account_id,
+                        folder
+                    );
+                    if let Err(e) = self.sync_folder(&folder, &account.email).await {
+                        tracing::error!(
+                            "IdleWorker[{}]: sync failed: {}",
+                            self.account_id,
+                            e
+                        );
                     }
-                    // Notify UI to refresh
-                    let _ = self.notify_tx.send(IdleNotification {
-                        account_id,
-                        folder_path: folder,
-                    }).await;
-                }
-                Ok(IdleEvent::Stop) => {
-                    tracing::info!("IdleManager: stopping");
-                    if let Some(mut s) = session {
-                        s.logout().await;
-                    }
-                    return;
+                    let _ = self
+                        .notify_tx
+                        .send(IdleNotification {
+                            account_id: self.account_id,
+                            folder_path: folder,
+                        })
+                        .await;
                 }
                 Ok(IdleEvent::Disconnected) | Err(_) => {
-                    tracing::warn!("IdleManager: disconnected or timed out, reconnecting");
+                    tracing::warn!(
+                        "IdleWorker[{}]: disconnected or timed out, reconnecting",
+                        self.account_id
+                    );
                     session = None;
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
@@ -214,14 +263,21 @@ impl IdleManager {
         }
     }
 
-    async fn load_account(&self, account_id: i64) -> Option<crate::cache::Account> {
+    async fn load_account(&self) -> Option<crate::cache::Account> {
         let cache = self.cache.lock().await;
-        cache.load_accounts().ok()?.into_iter().find(|a| a.id == account_id)
+        cache
+            .load_accounts()
+            .ok()?
+            .into_iter()
+            .find(|a| a.id == self.account_id)
     }
 
-    async fn get_initial_folder(&self, account_id: i64) -> Option<String> {
+    async fn get_initial_folder(&self) -> Option<String> {
         let cache = self.cache.lock().await;
-        cache.load_folders(account_id).ok()?.into_iter()
+        cache
+            .load_folders(self.account_id)
+            .ok()?
+            .into_iter()
             .find(|f| f.path == "INBOX" || f.path == "Inbox")
             .map(|f| f.path)
     }
@@ -236,16 +292,20 @@ impl IdleManager {
 
         if account.auth_type == "oauth" {
             let refresh_token = account.refresh_token.as_deref().ok_or("No refresh token")?;
-            let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
-                .unwrap_or_else(|_| "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com".to_string());
-            let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
+            let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
+                "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com"
+                    .to_string()
+            });
+            let client_secret =
+                std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
 
             let token = oauth::refresh_access_token(
                 "https://oauth2.googleapis.com/token",
                 &client_id,
                 &client_secret,
                 refresh_token,
-            ).await?;
+            )
+            .await?;
 
             imap::connect_session_oauth(host, port, email, &token.access_token).await
         } else {
@@ -257,12 +317,10 @@ impl IdleManager {
 
     async fn sync_folder(
         &self,
-        account_id: i64,
         folder_path: &str,
         _email: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Re-connect, fetch, update cache
-        let account = self.load_account(account_id).await.ok_or("Account not found")?;
+        let account = self.load_account().await.ok_or("Account not found")?;
         let mut session = self.connect(&account).await?;
         let summaries = session.fetch_message_summaries(folder_path).await?;
         session.logout().await;
@@ -273,18 +331,32 @@ impl IdleManager {
 
         for msg in &summaries {
             valid_uids.push(msg.uid);
-            if !msg.is_read { unread_count += 1; }
+            if !msg.is_read {
+                unread_count += 1;
+            }
             let _ = cache.upsert_message(
-                account_id, folder_path, msg.uid,
-                &msg.subject, &msg.sender, msg.date,
-                msg.is_read, msg.is_starred, msg.has_attachments, &msg.preview,
+                self.account_id,
+                folder_path,
+                msg.uid,
+                &msg.subject,
+                &msg.sender,
+                msg.date,
+                msg.is_read,
+                msg.is_starred,
+                msg.has_attachments,
+                &msg.preview,
             );
         }
 
-        let _ = cache.delete_stale_messages(account_id, folder_path, &valid_uids);
-        let _ = cache.update_folder_unread(account_id, folder_path, unread_count);
+        let _ = cache.delete_stale_messages(self.account_id, folder_path, &valid_uids);
+        let _ = cache.update_folder_unread(self.account_id, folder_path, unread_count);
 
-        tracing::info!("IdleManager: synced {} messages for {}", summaries.len(), folder_path);
+        tracing::info!(
+            "IdleWorker[{}]: synced {} messages for {}",
+            self.account_id,
+            summaries.len(),
+            folder_path
+        );
         Ok(())
     }
 }
@@ -292,28 +364,99 @@ impl IdleManager {
 enum IdleEvent {
     MailboxChange,
     FolderSwitch(String),
-    Stop,
     Disconnected,
 }
 
-/// Parse an IDLE untagged line into an event.
 fn parse_idle_event(line: &str) -> Option<IdleEvent> {
     let rest = line.strip_prefix("* ")?;
-    // * <n> EXISTS — new messages arrived
     if rest.contains("EXISTS") {
         return Some(IdleEvent::MailboxChange);
     }
-    // * <n> EXPUNGE — messages deleted
     if rest.contains("EXPUNGE") {
         return Some(IdleEvent::MailboxChange);
     }
-    // * FLAGS (...) — flag changes (read/unread)
     if rest.starts_with("FLAGS") {
         return Some(IdleEvent::MailboxChange);
     }
-    // * <n> FETCH (FLAGS ...) — individual flag change
     if rest.contains("FETCH") && rest.contains("FLAGS") {
         return Some(IdleEvent::MailboxChange);
     }
     None
+}
+
+/// Spawn IDLE workers for all enabled accounts.
+/// Returns a router that can send commands to individual workers.
+pub fn spawn_idle_workers(
+    cache: Arc<Mutex<Cache>>,
+    secrets: Secrets,
+    notify_tx: mpsc::Sender<IdleNotification>,
+) -> IdleRouter {
+    let router = IdleRouter::new();
+
+    // Load accounts synchronously (cache is behind a Mutex but we can try_lock)
+    let accounts = {
+        let cache_clone = cache.clone();
+        // We need to block briefly to get accounts — this is called once at startup
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let cache = cache_clone.lock().await;
+                cache.load_accounts().unwrap_or_default()
+            })
+        })
+    };
+
+    for account in &accounts {
+        if !account.enabled {
+            continue;
+        }
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        router.register(account.id, cmd_tx);
+
+        let cache = cache.clone();
+        let secrets = secrets.clone();
+        let notify_tx = notify_tx.clone();
+        let account_id = account.id;
+
+        tokio::spawn(async move {
+            // Delay to let initial sync finish
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+            let worker = IdleWorker {
+                account_id,
+                cache,
+                secrets,
+                cmd_rx,
+                notify_tx,
+            };
+            worker.run().await;
+        });
+    }
+
+    router
+}
+
+/// Spawn an IDLE worker for a single account (called when account is added at runtime).
+pub fn spawn_idle_worker_for_account(
+    router: &IdleRouter,
+    cache: Arc<Mutex<Cache>>,
+    secrets: Secrets,
+    notify_tx: mpsc::Sender<IdleNotification>,
+    account_id: i64,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel(16);
+    router.register(account_id, cmd_tx);
+
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        let worker = IdleWorker {
+            account_id,
+            cache,
+            secrets,
+            cmd_rx,
+            notify_tx,
+        };
+        worker.run().await;
+    });
 }

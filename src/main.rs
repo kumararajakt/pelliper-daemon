@@ -20,7 +20,8 @@ struct Daemon {
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,
     sync_engine: sync::SyncEngine,
-    idle_tx: mpsc::Sender<idle::IdleCommand>,
+    idle_router: std::sync::Arc<idle::IdleRouter>,
+    idle_notify_tx: mpsc::Sender<idle::IdleNotification>,
 }
 
 #[interface(name = "org.kde.pelliper.Daemon")]
@@ -119,15 +120,28 @@ impl Daemon {
             let sync = self.sync_engine.clone();
             let email_clone = email.to_string();
             tokio::spawn(async move {
-                // Small delay to let the D-Bus response go out first
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 tracing::info!("Starting initial sync for {}", email_clone);
-                // Reload account from DB and sync
-                // For now, sync_all will pick up the new account
                 if let Err(e) = sync.sync_all().await {
                     tracing::error!("Initial sync failed for {}: {}", email_clone, e);
                 }
             });
+
+            // Spawn IDLE worker for the new account
+            let cache_guard = self.cache.lock().await;
+            if let Ok(accounts) = cache_guard.load_accounts() {
+                if let Some(account) = accounts.iter().find(|a| a.email == email) {
+                    let account_id = account.id;
+                    drop(cache_guard);
+                    idle::spawn_idle_worker_for_account(
+                        &self.idle_router,
+                        self.cache.clone(),
+                        self.secrets.clone(),
+                        self.idle_notify_tx.clone(),
+                        account_id,
+                    );
+                }
+            }
         }
 
         saved
@@ -138,14 +152,8 @@ impl Daemon {
     async fn remove_account(&self, account_id: i64) -> bool {
         tracing::info!("D-Bus: remove_account id={}", account_id);
 
-        // Notify IDLE manager to stop watching this account
-        let _ = self
-            .idle_tx
-            .send(idle::IdleCommand::SetFolder {
-                account_id,
-                folder_path: String::new(),
-            })
-            .await;
+        // Clear the IDLE folder for this account — worker will detect account is gone
+        self.idle_router.set_folder(account_id, "").await;
 
         let cache = self.cache.lock().await;
         match cache.remove_account(account_id) {
@@ -245,13 +253,7 @@ impl Daemon {
             account_id,
             folder_path
         );
-        let _ = self
-            .idle_tx
-            .send(idle::IdleCommand::SetFolder {
-                account_id,
-                folder_path: folder_path.to_string(),
-            })
-            .await;
+        self.idle_router.set_folder(account_id, folder_path).await;
     }
 
     /// Load the body of a message. Returns HTML.
@@ -423,10 +425,11 @@ async fn main() {
 
     let sync_engine = sync::SyncEngine::new(cache.clone(), secrets.clone());
 
-    // Create IDLE manager — one persistent connection per account
+    // Spawn IDLE workers for all enabled accounts
     let (idle_notify_tx, mut idle_notify_rx) = mpsc::channel::<idle::IdleNotification>(16);
-    let (mut idle_manager, idle_tx) =
-        idle::IdleManager::new(cache.clone(), secrets.clone(), idle_notify_tx);
+    let idle_router = std::sync::Arc::new(
+        idle::spawn_idle_workers(cache.clone(), secrets.clone(), idle_notify_tx.clone()),
+    );
 
     tracing::info!("Pelliper daemon started, data dir: {:?}", data_dir);
 
@@ -434,7 +437,8 @@ async fn main() {
         cache: cache.clone(),
         secrets,
         sync_engine: sync_engine.clone(),
-        idle_tx: idle_tx.clone(),
+        idle_router: idle_router.clone(),
+        idle_notify_tx: idle_notify_tx.clone(),
     };
 
     // Register on D-Bus session bus
@@ -463,22 +467,11 @@ async fn main() {
                         tracing::error!("Startup sync failed: {}", e);
                     }
                 });
-
-                // Spawn IDLE manager for the first enabled account
-                let accounts = cache_guard.load_accounts().unwrap_or_default();
-                if let Some(first) = accounts.into_iter().find(|a| a.enabled) {
-                    let account_id = first.id;
-                    tokio::spawn(async move {
-                        // Small delay to let initial sync finish
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                        idle_manager.run(account_id).await;
-                    });
-                }
             }
         }
     }
 
-    // Spawn a task that reloads IDLE on folder changes from the UI
+    // Handle IDLE notifications (cache already updated by workers)
     tokio::spawn(async move {
         while let Some(notification) = idle_notify_rx.recv().await {
             tracing::info!(
@@ -486,9 +479,6 @@ async fn main() {
                 notification.account_id,
                 notification.folder_path
             );
-            // The cache was already updated by the IdleManager.
-            // QFileSystemWatcher on the SQLite file will trigger model reloads in the UI.
-            // Nothing more needed here.
         }
     });
 
