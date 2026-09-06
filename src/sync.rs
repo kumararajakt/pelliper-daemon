@@ -2,6 +2,9 @@ use crate::cache::{Cache, Account};
 use crate::secrets::Secrets;
 use crate::oauth;
 
+const FIRST_PAGE_SIZE: usize = 200;
+const BACKFILL_CHUNK: usize = 1000;
+
 #[derive(Clone)]
 pub struct SyncEngine {
     cache: std::sync::Arc<tokio::sync::Mutex<Cache>>,
@@ -38,7 +41,6 @@ impl SyncEngine {
         let port = account.imap_port.unwrap_or(993) as u16;
         let email = &account.email;
 
-        // Get credentials from keyring
         let key_name = format!("pelliper:{}", email);
         let credential = match self.secrets.get_password(&key_name).await {
             Ok(c) => c,
@@ -55,7 +57,6 @@ impl SyncEngine {
         }
     }
 
-    /// Sync using OAuth via RawImapSession. Refresh token stored in DB.
     async fn sync_account_oauth(
         &self,
         account: &Account,
@@ -98,7 +99,6 @@ impl SyncEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut session = crate::imap::connect_session_oauth(host, port, email, access_token).await?;
 
-        // List folders
         let folders = session.list_folders().await?;
         tracing::info!("Found {} folders for {} (oauth)", folders.len(), email);
 
@@ -111,13 +111,12 @@ impl SyncEngine {
             }
         }
 
-        // Fetch messages for each folder (skip noselect virtual folders)
         for folder in &folders {
             if folder.noselect {
                 tracing::debug!("Skipping noselect folder: {}", folder.path);
                 continue;
             }
-            if let Err(e) = self.sync_folder_messages_raw(account, &folder.path, &mut session).await {
+            if let Err(e) = self.sync_folder_windowed_raw(account, &folder.path, &mut session).await {
                 tracing::error!("Failed to sync folder {} for {}: {}", folder.path, email, e);
             }
         }
@@ -127,7 +126,6 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Sync using password via async-imap Session.
     async fn sync_account_password(
         &self,
         account: &Account,
@@ -138,7 +136,6 @@ impl SyncEngine {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut session = crate::imap::connect_session_password(host, port, email, password).await?;
 
-        // List folders
         let folders = crate::imap::list_folders(&mut session).await?;
         tracing::info!("Found {} folders for {} (password)", folders.len(), email);
 
@@ -151,13 +148,12 @@ impl SyncEngine {
             }
         }
 
-        // Fetch messages for each folder (skip noselect virtual folders)
         for folder in &folders {
             if folder.noselect {
                 tracing::debug!("Skipping noselect folder: {}", folder.path);
                 continue;
             }
-            if let Err(e) = self.sync_folder_messages_imap(account, &folder.path, &mut session).await {
+            if let Err(e) = self.sync_folder_windowed_imap(account, &folder.path, &mut session).await {
                 tracing::error!("Failed to sync folder {} for {}: {}", folder.path, email, e);
             }
         }
@@ -167,76 +163,184 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// Sync messages for a folder using the raw OAuth session.
-    async fn sync_folder_messages_raw(
+    // -----------------------------------------------------------------------
+    // Two-phase windowed sync (raw IMAP session)
+    // -----------------------------------------------------------------------
+
+    async fn sync_folder_windowed_raw(
         &self,
         account: &Account,
         folder_path: &str,
         session: &mut crate::imap::RawImapSession,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let summaries = session.fetch_message_summaries(folder_path).await?;
-        self.process_summaries(account, folder_path, &summaries).await
+        // Phase 1: Fetch recent messages for instant display
+        let recent = session.fetch_recent_summaries(folder_path, FIRST_PAGE_SIZE).await?;
+
+        {
+            let cache = self.cache.lock().await;
+            for msg in &recent {
+                let _ = cache.upsert_message(
+                    account.id, folder_path, msg.uid,
+                    &msg.subject, &msg.sender, msg.date,
+                    msg.is_read, msg.is_starred, msg.has_attachments, &msg.preview,
+                );
+            }
+            let unread = recent.iter().filter(|m| !m.is_read).count() as i32;
+            let _ = cache.update_folder_unread(account.id, folder_path, unread);
+        }
+
+        tracing::info!(
+            "Folder {}: {} recent messages cached (phase 1)",
+            folder_path, recent.len()
+        );
+
+        // Phase 2: Backfill remaining messages in chunks
+        let all_uids = session.fetch_all_uids(folder_path).await?;
+        let cached_uids: Vec<i64> = {
+            let cache = self.cache.lock().await;
+            cache.load_cached_uids(account.id, folder_path)?
+        };
+        let cached_set: std::collections::HashSet<i64> = cached_uids.into_iter().collect();
+        let missing: Vec<i64> = all_uids.iter().copied()
+            .filter(|uid| !cached_set.contains(uid))
+            .collect();
+
+        if missing.is_empty() {
+            tracing::info!("Folder {}: already fully cached", folder_path);
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Folder {}: {} total, {} cached, {} missing — backfilling",
+            folder_path, all_uids.len(), cached_set.len(), missing.len()
+        );
+
+        for chunk in missing.chunks(BACKFILL_CHUNK) {
+            let uid_set: Vec<String> = chunk.iter().map(|u| u.to_string()).collect();
+            let uid_set_str = uid_set.join(",");
+
+            match session.fetch_summaries_by_uids(&uid_set_str).await {
+                Ok(summaries) => {
+                    let cache = self.cache.lock().await;
+                    for msg in &summaries {
+                        let _ = cache.upsert_message(
+                            account.id, folder_path, msg.uid,
+                            &msg.subject, &msg.sender, msg.date,
+                            msg.is_read, msg.is_starred, msg.has_attachments, &msg.preview,
+                        );
+                    }
+                    tracing::debug!(
+                        "Folder {}: backfilled chunk of {} messages",
+                        folder_path, summaries.len()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Folder {}: backfill chunk failed: {}", folder_path, e);
+                }
+            }
+        }
+
+        // Reconcile: delete stale messages no longer on server
+        {
+            let cache = self.cache.lock().await;
+            let _ = cache.delete_stale_messages(account.id, folder_path, &all_uids);
+
+            // Recount unread after full sync
+            let unread = cache.count_unread(account.id, folder_path)?;
+            let _ = cache.update_folder_unread(account.id, folder_path, unread);
+        }
+
+        tracing::info!("Folder {}: backfill complete", folder_path);
+        Ok(())
     }
 
-    /// Sync messages for a folder using async-imap Session.
-    async fn sync_folder_messages_imap(
+    // -----------------------------------------------------------------------
+    // Two-phase windowed sync (async-imap session)
+    // -----------------------------------------------------------------------
+
+    async fn sync_folder_windowed_imap(
         &self,
         account: &Account,
         folder_path: &str,
         session: &mut async_imap::Session<crate::imap::CompatTls>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let summaries = crate::imap::fetch_message_summaries(session, folder_path).await?;
-        self.process_summaries(account, folder_path, &summaries).await
-    }
+        // Phase 1: Fetch recent messages for instant display
+        let recent = crate::imap::fetch_recent_summaries(session, folder_path, FIRST_PAGE_SIZE).await?;
 
-    /// Process message summaries: upsert into cache, delete stale, update unread.
-    async fn process_summaries(
-        &self,
-        account: &Account,
-        folder_path: &str,
-        summaries: &[crate::imap::ImapMessageSummary],
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut cache = self.cache.lock().await;
-        let mut valid_uids = Vec::new();
-        let mut unread_count = 0;
-
-        for msg in summaries {
-            valid_uids.push(msg.uid);
-            if !msg.is_read {
-                unread_count += 1;
+        {
+            let cache = self.cache.lock().await;
+            for msg in &recent {
+                let _ = cache.upsert_message(
+                    account.id, folder_path, msg.uid,
+                    &msg.subject, &msg.sender, msg.date,
+                    msg.is_read, msg.is_starred, msg.has_attachments, &msg.preview,
+                );
             }
-
-            if let Err(e) = cache.upsert_message(
-                account.id,
-                folder_path,
-                msg.uid,
-                &msg.subject,
-                &msg.sender,
-                msg.date,
-                msg.is_read,
-                msg.is_starred,
-                msg.has_attachments,
-                &msg.preview,
-            ) {
-                tracing::error!("Failed to upsert message uid={}: {}", msg.uid, e);
-            }
-        }
-
-        if let Err(e) = cache.delete_stale_messages(account.id, folder_path, &valid_uids) {
-            tracing::error!("Failed to delete stale messages: {}", e);
-        }
-
-        if let Err(e) = cache.update_folder_unread(account.id, folder_path, unread_count) {
-            tracing::error!("Failed to update unread count: {}", e);
+            let unread = recent.iter().filter(|m| !m.is_read).count() as i32;
+            let _ = cache.update_folder_unread(account.id, folder_path, unread);
         }
 
         tracing::info!(
-            "Folder {}: {} messages, {} unread",
-            folder_path,
-            summaries.len(),
-            unread_count
+            "Folder {}: {} recent messages cached (phase 1)",
+            folder_path, recent.len()
         );
 
+        // Phase 2: Backfill remaining messages in chunks
+        let all_uids = crate::imap::fetch_all_uids(session, folder_path).await?;
+        let cached_uids: Vec<i64> = {
+            let cache = self.cache.lock().await;
+            cache.load_cached_uids(account.id, folder_path)?
+        };
+        let cached_set: std::collections::HashSet<i64> = cached_uids.into_iter().collect();
+        let missing: Vec<i64> = all_uids.iter().copied()
+            .filter(|uid| !cached_set.contains(uid))
+            .collect();
+
+        if missing.is_empty() {
+            tracing::info!("Folder {}: already fully cached", folder_path);
+            return Ok(());
+        }
+
+        tracing::info!(
+            "Folder {}: {} total, {} cached, {} missing — backfilling",
+            folder_path, all_uids.len(), cached_set.len(), missing.len()
+        );
+
+        for chunk in missing.chunks(BACKFILL_CHUNK) {
+            let uid_set: Vec<String> = chunk.iter().map(|u| u.to_string()).collect();
+            let uid_set_str = uid_set.join(",");
+
+            match crate::imap::fetch_summaries_by_uids(session, &uid_set_str).await {
+                Ok(summaries) => {
+                    let cache = self.cache.lock().await;
+                    for msg in &summaries {
+                        let _ = cache.upsert_message(
+                            account.id, folder_path, msg.uid,
+                            &msg.subject, &msg.sender, msg.date,
+                            msg.is_read, msg.is_starred, msg.has_attachments, &msg.preview,
+                        );
+                    }
+                    tracing::debug!(
+                        "Folder {}: backfilled chunk of {} messages",
+                        folder_path, summaries.len()
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Folder {}: backfill chunk failed: {}", folder_path, e);
+                }
+            }
+        }
+
+        // Reconcile: delete stale messages no longer on server
+        {
+            let cache = self.cache.lock().await;
+            let _ = cache.delete_stale_messages(account.id, folder_path, &all_uids);
+
+            let unread = cache.count_unread(account.id, folder_path)?;
+            let _ = cache.update_folder_unread(account.id, folder_path, unread);
+        }
+
+        tracing::info!("Folder {}: backfill complete", folder_path);
         Ok(())
     }
 }

@@ -333,6 +333,29 @@ impl Cache {
         Ok(count)
     }
 
+    /// Load all cached UIDs for a folder (for backfill comparison).
+    pub fn load_cached_uids(&self, account_id: i64, folder_path: &str) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+        )?;
+        let uids = stmt
+            .query_map(rusqlite::params![account_id, folder_path], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(uids)
+    }
+
+    /// Count unread messages for a folder (from DB, not IMAP).
+    pub fn count_unread(&self, account_id: i64, folder_path: &str) -> Result<i32> {
+        let count: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND is_read = 0",
+            rusqlite::params![account_id, folder_path],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Load cached body HTML for a message. Returns None if not cached.
     pub fn load_body(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<Option<String>> {
         let result = self.conn.query_row(

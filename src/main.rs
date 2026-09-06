@@ -55,7 +55,7 @@ impl Daemon {
 
         // Check if account already exists
         {
-            let mut cache = self.cache.lock().await;
+            let cache = self.cache.lock().await;
             if let Ok(exists) = cache.account_exists(email) {
                 if exists {
                     tracing::warn!("Account already exists: {}", email);
@@ -137,7 +137,7 @@ impl Daemon {
             folder_path: String::new(),
         }).await;
 
-        let mut cache = self.cache.lock().await;
+        let cache = self.cache.lock().await;
         match cache.remove_account(account_id) {
             Ok(()) => {
                 tracing::info!("Account {} removed", account_id);

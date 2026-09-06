@@ -401,6 +401,124 @@ impl RawImapSession {
         Ok(folders)
     }
 
+    /// EXAMINE a folder and return the total message count.
+    pub async fn examine_folder(
+        &mut self,
+        folder: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!("{} EXAMINE {}", tag, quote_imap_path(folder))).await?;
+        let (tagged, examine_untagged) = self.read_response(&tag).await?;
+
+        if !tagged.contains("OK") {
+            return Err(format!("EXAMINE failed: {}", tagged).into());
+        }
+
+        let exists = examine_untagged.iter()
+            .filter_map(|l| l.strip_prefix("* "))
+            .filter_map(|s| s.strip_suffix(" EXISTS"))
+            .filter_map(|s| s.parse::<usize>().ok())
+            .next()
+            .unwrap_or(0);
+
+        Ok(exists)
+    }
+
+    /// Fetch the most recent `limit` message summaries (newest first).
+    pub async fn fetch_recent_summaries(
+        &mut self,
+        folder: &str,
+        limit: usize,
+    ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
+        let total = self.examine_folder(folder).await?;
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Fetch from highest UID down, grab `limit` messages
+        let tag = self.next_tag();
+        self.send_command(&format!(
+            "{} UID FETCH {}:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)",
+            tag, total
+        )).await?;
+        let (tagged, fetch_untagged) = self.read_response(&tag).await?;
+
+        if !tagged.contains("OK") {
+            return Err(format!("FETCH recent failed: {}", tagged).into());
+        }
+
+        let mut summaries = Vec::new();
+        for line in &fetch_untagged {
+            if let Some(msg) = parse_fetch_response(line) {
+                summaries.push(msg);
+            }
+        }
+
+        // Sort newest first and take only `limit`
+        summaries.sort_by(|a, b| b.date.cmp(&a.date));
+        summaries.truncate(limit);
+
+        tracing::info!("Fetched {} recent messages from {}", summaries.len(), folder);
+        Ok(summaries)
+    }
+
+    /// Fetch all cached UIDs for a folder (lightweight: UID only).
+    pub async fn fetch_all_uids(
+        &mut self,
+        folder: &str,
+    ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        let total = self.examine_folder(folder).await?;
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+
+        let tag = self.next_tag();
+        self.send_command(&format!(
+            "{} UID FETCH 1:* (UID)",
+            tag
+        )).await?;
+        let (tagged, fetch_untagged) = self.read_response(&tag).await?;
+
+        if !tagged.contains("OK") {
+            return Err(format!("FETCH UIDs failed: {}", tagged).into());
+        }
+
+        let mut uids = Vec::new();
+        for line in &fetch_untagged {
+            if let Some(uid) = parse_uid_only(line) {
+                uids.push(uid);
+            }
+        }
+
+        Ok(uids)
+    }
+
+    /// Fetch specific message summaries by UID set string.
+    pub async fn fetch_summaries_by_uids(
+        &mut self,
+        uid_set: &str,
+    ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!(
+            "{} UID FETCH {} (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)",
+            tag, uid_set
+        )).await?;
+        let (tagged, fetch_untagged) = self.read_response(&tag).await?;
+
+        if !tagged.contains("OK") {
+            return Err(format!("FETCH by UIDs failed: {}", tagged).into());
+        }
+
+        let mut summaries = Vec::new();
+        for line in &fetch_untagged {
+            if let Some(msg) = parse_fetch_response(line) {
+                summaries.push(msg);
+            }
+        }
+
+        Ok(summaries)
+    }
+
     /// EXAMINE a folder and fetch all message summaries.
     pub async fn fetch_message_summaries(
         &mut self,
@@ -530,12 +648,12 @@ impl RawImapSession {
         self.tag
     }
 
-    /// Fetch the full body of a message by UID.
+    /// Fetch the full body of a message by UID (PEEK — does not set \Seen).
     /// Returns the raw RFC822 message bytes.
     pub async fn fetch_body(&mut self, uid: i64) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH {} (BODY[])",
+            "{} UID FETCH {} (BODY.PEEK[])",
             tag, uid
         )).await?;
 
@@ -718,6 +836,21 @@ fn quote_imap_path(path: &str) -> String {
     }
 }
 
+/// Parse a FETCH response for UID only (no header parsing).
+fn parse_uid_only(line: &str) -> Option<i64> {
+    let rest = line.strip_prefix("* ")?;
+    let mut found_uid = false;
+    for token in rest.split_whitespace() {
+        if found_uid {
+            return token.parse().ok();
+        }
+        if token == "UID" || token == "(UID" {
+            found_uid = true;
+        }
+    }
+    None
+}
+
 /// Connect and log in with password, returning an async-imap Session.
 pub async fn connect_session_password(
     host: &str,
@@ -860,6 +993,132 @@ pub async fn fetch_message_summaries(
     }
 
     tracing::info!("Fetched {} message summaries from {}", summaries.len(), folder);
+    Ok(summaries)
+}
+
+/// Fetch the most recent `limit` message summaries from a folder (async-imap).
+pub async fn fetch_recent_summaries(
+    session: &mut async_imap::Session<CompatTls>,
+    folder: &str,
+    limit: usize,
+) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
+    let mailbox = timeout(IMAP_TIMEOUT, session.examine(folder)).await??;
+    let exists = mailbox.exists as usize;
+
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Fetch from highest UID down
+    let from_uid = exists;
+    let range = format!("{}:*", from_uid);
+    let messages_stream = timeout(
+        IMAP_TIMEOUT,
+        session.uid_fetch(&range, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)"),
+    )
+    .await??;
+    let messages: Vec<_> = messages_stream.try_collect().await?;
+
+    let mut summaries = Vec::new();
+    for message in &messages {
+        let uid = message.uid.unwrap_or(0) as i64;
+        let flags: Vec<_> = message.flags().collect();
+        let is_read = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Seen));
+        let is_starred = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Flagged));
+
+        let header_bytes = message.body().unwrap_or(b"");
+        let header_str = String::from_utf8_lossy(header_bytes);
+
+        let subject = parse_header(&header_str, "Subject");
+        let sender = parse_header(&header_str, "From");
+        let date_str = parse_header(&header_str, "Date");
+        let date = parse_date(&date_str);
+
+        summaries.push(ImapMessageSummary {
+            uid,
+            subject,
+            sender,
+            date,
+            is_read,
+            is_starred,
+            has_attachments: false,
+            preview: String::new(),
+        });
+    }
+
+    // Sort newest first and take only `limit`
+    summaries.sort_by(|a, b| b.date.cmp(&a.date));
+    summaries.truncate(limit);
+
+    tracing::info!("Fetched {} recent messages from {}", summaries.len(), folder);
+    Ok(summaries)
+}
+
+/// Fetch all UIDs from a folder (async-imap).
+pub async fn fetch_all_uids(
+    session: &mut async_imap::Session<CompatTls>,
+    folder: &str,
+) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+    let mailbox = timeout(IMAP_TIMEOUT, session.examine(folder)).await??;
+    let exists = mailbox.exists as usize;
+
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+
+    let messages_stream = timeout(
+        IMAP_TIMEOUT,
+        session.uid_fetch("1:*", "(UID)"),
+    )
+    .await??;
+    let messages: Vec<_> = messages_stream.try_collect().await?;
+
+    let uids: Vec<i64> = messages.iter()
+        .filter_map(|m| m.uid.map(|u| u as i64))
+        .collect();
+
+    Ok(uids)
+}
+
+/// Fetch specific message summaries by UID set string (async-imap).
+pub async fn fetch_summaries_by_uids(
+    session: &mut async_imap::Session<CompatTls>,
+    uid_set: &str,
+) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
+    let messages_stream = timeout(
+        IMAP_TIMEOUT,
+        session.uid_fetch(uid_set, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)] FLAGS)"),
+    )
+    .await??;
+    let messages: Vec<_> = messages_stream.try_collect().await?;
+
+    let mut summaries = Vec::new();
+    for message in &messages {
+        let uid = message.uid.unwrap_or(0) as i64;
+        let flags: Vec<_> = message.flags().collect();
+        let is_read = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Seen));
+        let is_starred = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Flagged));
+
+        let header_bytes = message.body().unwrap_or(b"");
+        let header_str = String::from_utf8_lossy(header_bytes);
+
+        let subject = parse_header(&header_str, "Subject");
+        let sender = parse_header(&header_str, "From");
+        let date_str = parse_header(&header_str, "Date");
+        let date = parse_date(&date_str);
+
+        summaries.push(ImapMessageSummary {
+            uid,
+            subject,
+            sender,
+            date,
+            is_read,
+            is_starred,
+            has_attachments: false,
+            preview: String::new(),
+        });
+    }
+
     Ok(summaries)
 }
 
