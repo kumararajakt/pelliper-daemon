@@ -549,6 +549,25 @@ impl Cache {
         }
     }
 
+    /// Load the threading headers needed to reply: (message_id, references).
+    pub fn message_refs(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let result = self.conn.query_row(
+            "SELECT message_id, references_ FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+            rusqlite::params![account_id, folder_path, uid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        );
+        match result {
+            Ok(orm) => Ok(Some(orm)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Save body HTML to cache.
     pub fn save_body(&self, account_id: i64, folder_path: &str, uid: i64, html: &str) -> Result<()> {
         self.conn.execute(

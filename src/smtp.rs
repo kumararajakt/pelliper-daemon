@@ -8,6 +8,10 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 ///
 /// `auth`: for OAuth accounts the XOAUTH2 access token (fresh — caller has
 /// already refreshed it); for password accounts the account's password.
+///
+/// `in_reply_to` / `references` are optional threading headers; the values are
+/// used verbatim (the original message-id / references chain from the cache,
+/// already including angle brackets and separated by spaces).
 pub async fn send_email(
     account: &Account,
     to: &str,
@@ -15,6 +19,8 @@ pub async fn send_email(
     subject: &str,
     body: &str,
     auth: &str,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let from: Mailbox = account
         .email
@@ -24,6 +30,13 @@ pub async fn send_email(
     let mut builder = Message::builder()
         .from(from)
         .subject(subject.trim().to_string());
+
+    if let Some(mid) = in_reply_to.filter(|s| !s.is_empty()) {
+        builder = builder.in_reply_to(mid.to_string());
+    }
+    if let Some(refs) = references.filter(|s| !s.is_empty()) {
+        builder = builder.references(refs.to_string());
+    }
 
     for recipient in to.split([',', ';']) {
         let addr: Mailbox = recipient

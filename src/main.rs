@@ -392,6 +392,8 @@ impl Daemon {
         cc: &str,
         subject: &str,
         body: &str,
+        reply_folder_path: &str,
+        reply_uid: i64,
     ) -> String {
         let account = {
             let cache = self.cache.lock().await;
@@ -410,6 +412,30 @@ impl Daemon {
             None => return "Account not found".to_string(),
         };
 
+        // Resolve threading headers when replying: In-Reply-To set to the
+        // original message-id, References = original chain + this message-id.
+        let (mut in_reply_to, mut references) = (None, None);
+        if reply_uid > 0 {
+            let refs_opt = {
+                let cache = self.cache.lock().await;
+                cache
+                    .message_refs(account_id, reply_folder_path, reply_uid)
+                    .ok()
+                    .flatten()
+            };
+            if let Some((Some(mid), existing_refs)) = refs_opt {
+                let mut chain = existing_refs.unwrap_or_default();
+                if !chain.is_empty() {
+                    chain.push(' ');
+                }
+                chain.push_str(&mid);
+                in_reply_to = Some(mid);
+                references = Some(chain);
+            }
+        }
+        let in_reply_to = in_reply_to.as_deref();
+        let references = references.as_deref();
+
         // SMTP auth secret: keyring password (password auth) or a freshly
         // refreshed XOAUTH2 access token (OAuth).
         let result = if account.auth_type == "oauth" {
@@ -417,14 +443,14 @@ impl Daemon {
                 Ok(token) => token,
                 Err(e) => return format!("Failed to refresh access token: {}", e),
             };
-            smtp::send_email(&account, to, cc, subject, body, &token).await
+            smtp::send_email(&account, to, cc, subject, body, &token, in_reply_to, references).await
         } else {
             let key_name = format!("pelliper:{}", account.email);
             let password = match self.secrets.get_password(&key_name).await {
                 Ok(p) => p,
                 Err(e) => return format!("Failed to retrieve stored password: {}", e),
             };
-            smtp::send_email(&account, to, cc, subject, body, &password).await
+            smtp::send_email(&account, to, cc, subject, body, &password, in_reply_to, references).await
         };
 
         match result {
