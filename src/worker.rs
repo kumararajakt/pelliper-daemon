@@ -19,9 +19,13 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-/// First page of messages fetched instantly when a folder is opened or
-/// re-synced by IDLE — keeps the UI snappy.
+/// First page of messages fetched instantly when a folder is opened for the
+/// first time (cold cache) — seeds the UI's message list.
 const FIRST_PAGE_SIZE: usize = 200;
+
+/// Page size for re-opens: the cache already has most messages, so a smaller
+/// fetch of the newest messages (plus merge via upsert) is enough.
+const REOPEN_PAGE_SIZE: usize = 50;
 
 /// How many messages to fetch per backfill round-trip. Bigger = fewer
 /// round-trips; smaller = more responsive to interleaved user requests.
@@ -381,8 +385,12 @@ impl Worker {
         Ok(())
     }
 
-    /// Fetch the first page (most recent `FIRST_PAGE_SIZE`) of a folder, cache
-    /// the results, and queue background work.  Returns the summaries.
+    /// Fetch the most recent page of a folder's messages, cache the results,
+    /// and queue background work for the remainder.  The page size adapts to
+    /// the cache: `FIRST_PAGE_SIZE` on first open (cold folder), a smaller
+    /// `REOPEN_PAGE_SIZE` when messages are already cached (refresh).  Because
+    /// messages are upserted, re-fetching a page merges new/updated mail while
+    /// leaving older cached messages intact.  Returns the summaries.
     async fn sync_folder_first_page(
         &mut self,
         folder_path: &str,
@@ -391,8 +399,16 @@ impl Worker {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let session = self.session.as_mut().ok_or("no session")?;
 
+        // First open (no cached messages in this folder) gets a bigger page;
+        // re-opens get a lighter refresh.
+        let cached = {
+            let cache = self.cache.lock().await;
+            cache.count_messages(self.account.id, folder_path).unwrap_or(0)
+        };
+        let page_size = if cached == 0 { FIRST_PAGE_SIZE } else { REOPEN_PAGE_SIZE };
+
         let summaries = session
-            .fetch_recent_summaries(folder_path, FIRST_PAGE_SIZE)
+            .fetch_recent_summaries(folder_path, page_size)
             .await?;
 
         {
@@ -413,7 +429,9 @@ impl Worker {
                     &msg.references,
                 );
             }
-            let unread = summaries.iter().filter(|m| !m.is_read).count() as i32;
+            // Use the whole-cache unread count, not just this page, so re-opens
+            // and IDLE re-syncs don't undercount older unread mail.
+            let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
             let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         }
 
@@ -422,10 +440,11 @@ impl Worker {
         self.queue_backfill_for_folder(folder_path).await;
 
         tracing::info!(
-            "Worker[{}]: synced {} recent messages for {}",
+            "Worker[{}]: synced {} recent messages for {} (page size {})",
             self.account.id,
             summaries.len(),
-            folder_path
+            folder_path,
+            page_size
         );
 
         Ok(summaries)
