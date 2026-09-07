@@ -57,6 +57,30 @@ impl Daemon {
         let handle = spawn_worker(account, self.cache.clone(), self.secrets.clone());
         self.workers.lock().unwrap().insert(account.id, handle);
     }
+
+    /// Refresh an OAuth access token for an account (Gmail).
+    async fn refresh_access_token(
+        &self,
+        account: &Account,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let refresh_token = account
+            .refresh_token
+            .as_deref()
+            .ok_or("No refresh token stored for account")?;
+        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
+            "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com"
+                .to_string()
+        });
+        let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
+        let token = crate::oauth::refresh_access_token(
+            "https://oauth2.googleapis.com/token",
+            &client_id,
+            &client_secret,
+            refresh_token,
+        )
+        .await?;
+        Ok(token.access_token)
+    }
 }
 
 #[interface(name = "org.kde.pelliper.Daemon")]
@@ -318,6 +342,67 @@ impl Daemon {
         }
 
         "<p>No worker available for account</p>".to_string()
+    }
+
+    /// Send an email via the account's SMTP relay. Returns an error string on
+    /// failure (empty string on success).
+    async fn send_email(
+        &self,
+        account_id: i64,
+        to: &str,
+        cc: &str,
+        subject: &str,
+        body: &str,
+    ) -> String {
+        let account = {
+            let cache = self.cache.lock().await;
+            match cache.load_accounts() {
+                Ok(accounts) => accounts.into_iter().find(|a| a.id == account_id),
+                Err(e) => {
+                    let msg = format!("Failed to load accounts: {}", e);
+                    tracing::error!("{}", msg);
+                    return msg;
+                }
+            }
+        };
+
+        let account = match account {
+            Some(a) => a,
+            None => return "Account not found".to_string(),
+        };
+
+        // SMTP auth secret: keyring password (password auth) or a freshly
+        // refreshed XOAUTH2 access token (OAuth).
+        let result = if account.auth_type == "oauth" {
+            let token = match self.refresh_access_token(&account).await {
+                Ok(token) => token,
+                Err(e) => return format!("Failed to refresh access token: {}", e),
+            };
+            smtp::send_email(&account, to, cc, subject, body, &token).await
+        } else {
+            let key_name = format!("pelliper:{}", account.email);
+            let password = match self.secrets.get_password(&key_name).await {
+                Ok(p) => p,
+                Err(e) => return format!("Failed to retrieve stored password: {}", e),
+            };
+            smtp::send_email(&account, to, cc, subject, body, &password).await
+        };
+
+        match result {
+            Ok(()) => {
+                tracing::info!(
+                    "Sent email from {} to {}",
+                    account.email,
+                    to
+                );
+                String::new()
+            }
+            Err(e) => {
+                let msg = format!("SMTP send failed: {}", e);
+                tracing::error!("{}", msg);
+                msg
+            }
+        }
     }
 }
 
