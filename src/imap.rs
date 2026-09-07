@@ -485,7 +485,7 @@ impl RawImapSession {
         // Fetch from highest UID down, grab `limit` messages
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH {}:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
+            "{} UID FETCH {}:* (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
             tag, total
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
@@ -547,7 +547,7 @@ impl RawImapSession {
     ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH {} (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
+            "{} UID FETCH {} (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
             tag, uid_set
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
@@ -595,7 +595,7 @@ impl RawImapSession {
         // Fetch UID + headers + flags for all messages
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH 1:* (UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
+            "{} UID FETCH 1:* (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
             tag
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
@@ -931,6 +931,9 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
     let is_read = rest.contains("\\Seen");
     let is_starred = rest.contains("\\Flagged");
 
+    // Detect attachments from BODYSTRUCTURE (if present in the response)
+    let has_attachments = detect_attachments_raw(rest);
+
     // Find the literal size marker: BODY[...] {<size>}
     // Must find the brace that closes the size marker, not any brace inside header content
     let body_start = rest.find("BODY[HEADER.FIELDS")?;
@@ -974,11 +977,48 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
         date,
         is_read,
         is_starred,
-        has_attachments: false,
+        has_attachments,
         preview: String::new(),
         message_id,
         references,
     })
+}
+
+/// Heuristically detect attachments from a raw BODYSTRUCTURE section in a
+/// FETCH response line. Looks for non-inline, non-text content types like
+/// application/*, image/*, video/*, audio/*, or attachments with filenames.
+fn detect_attachments_raw(line: &str) -> bool {
+    // BODYSTRUCTURE is a parenthesized list. Find it and scan a window.
+    let Some(start) = line.find("BODYSTRUCTURE (") else {
+        return false;
+    };
+    let window: String = line[start + "BODYSTRUCTURE (".len()..]
+        .chars()
+        .take(4096)
+        .collect();
+
+    // Skip the outermost multipart wrapper: check for attachment indicators.
+    // Split on " (" to isolate parts and look for content types.
+    let lower = window.to_lowercase();
+
+    // Direct filename/name params indicate an attachment (e.g. "image/png" ... "name" "foo.png")
+    if window.contains("\"name\"") || window.contains("\"filename\"") {
+        return true;
+    }
+
+    // attachment disposition (as opposed to inline)
+    if lower.contains("attachment") && !window.contains("\"inline\"") {
+        return true;
+    }
+
+    // Non-text single part content types like application/*, image/*, video/*, audio/*
+    for token in ["application/", "image/", "video/", "audio/", "font/", "model/", "x-" ] {
+        if lower.contains(token) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn quote_imap_path(path: &str) -> String {
@@ -1132,46 +1172,28 @@ pub async fn fetch_message_summaries(
         return Ok(Vec::new());
     }
 
-    // Fetch all messages
+    // Fetch all messages using structured ENVELOPE/BODYSTRUCTURE
     let messages_stream = timeout(
         IMAP_TIMEOUT,
-        session.uid_fetch("1:*", "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)"),
+        session.uid_fetch(
+            "1:*",
+            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
+        ),
     )
     .await??;
     let messages: Vec<_> = messages_stream.try_collect().await?;
 
     let mut summaries = Vec::new();
     for message in &messages {
-        let uid = message.uid.unwrap_or(0) as i64;
-        let flags: Vec<_> = message.flags().collect();
-        let is_read = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Seen));
-        let is_starred = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Flagged));
-
-        // Parse headers from the body
-        let header_bytes = message.body().unwrap_or(b"");
-        let header_str = String::from_utf8_lossy(header_bytes);
-
-        let subject = parse_header(&header_str, "Subject");
-        let sender = parse_header(&header_str, "From");
-        let date_str = parse_header(&header_str, "Date");
-        let date = parse_date(&date_str);
-        let message_id = parse_header(&header_str, "Message-ID");
-        let references = parse_header(&header_str, "References");
-        let in_reply_to = parse_header(&header_str, "In-Reply-To");
-        let references = if references.is_empty() { in_reply_to } else { references };
-
-        summaries.push(ImapMessageSummary {
-            uid,
-            subject,
-            sender,
-            date,
-            is_read,
-            is_starred,
-            has_attachments: false,
-            preview: String::new(),
-            message_id,
-            references,
-        });
+        let body_bytes = message.body().unwrap_or(b"");
+        let (references, _in_reply_to) = extract_reference_headers(body_bytes);
+        let has_attachments = message
+            .bodystructure()
+            .map(has_attachments_from_bodystructure)
+            .unwrap_or(false);
+        if let Some(summary) = fetch_to_summary(message, has_attachments, &references) {
+            summaries.push(summary);
+        }
     }
 
     tracing::info!("Fetched {} message summaries from {}", summaries.len(), folder);
@@ -1191,47 +1213,31 @@ pub async fn fetch_recent_summaries(
         return Ok(Vec::new());
     }
 
-    // Fetch from highest UID down
+    // Fetch from highest UID down. Uses structured ENVELOPE/BODYSTRUCTURE for
+    // fast parsing plus the References header (ENVELOPE omits References).
     let from_uid = exists;
     let range = format!("{}:*", from_uid);
     let messages_stream = timeout(
         IMAP_TIMEOUT,
-        session.uid_fetch(&range, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)"),
+        session.uid_fetch(
+            &range,
+            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
+        ),
     )
     .await??;
     let messages: Vec<_> = messages_stream.try_collect().await?;
 
     let mut summaries = Vec::new();
     for message in &messages {
-        let uid = message.uid.unwrap_or(0) as i64;
-        let flags: Vec<_> = message.flags().collect();
-        let is_read = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Seen));
-        let is_starred = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Flagged));
-
-        let header_bytes = message.body().unwrap_or(b"");
-        let header_str = String::from_utf8_lossy(header_bytes);
-
-        let subject = parse_header(&header_str, "Subject");
-        let sender = parse_header(&header_str, "From");
-        let date_str = parse_header(&header_str, "Date");
-        let date = parse_date(&date_str);
-        let message_id = parse_header(&header_str, "Message-ID");
-        let references = parse_header(&header_str, "References");
-        let in_reply_to = parse_header(&header_str, "In-Reply-To");
-        let references = if references.is_empty() { in_reply_to } else { references };
-
-        summaries.push(ImapMessageSummary {
-            uid,
-            subject,
-            sender,
-            date,
-            is_read,
-            is_starred,
-            has_attachments: false,
-            preview: String::new(),
-            message_id,
-            references,
-        });
+        let body_bytes = message.body().unwrap_or(b"");
+        let (references, _in_reply_to) = extract_reference_headers(body_bytes);
+        let has_attachments = message
+            .bodystructure()
+            .map(has_attachments_from_bodystructure)
+            .unwrap_or(false);
+        if let Some(summary) = fetch_to_summary(message, has_attachments, &references) {
+            summaries.push(summary);
+        }
     }
 
     // Sort newest first and take only `limit`
@@ -1268,49 +1274,204 @@ pub async fn fetch_all_uids(
     Ok(uids)
 }
 
-/// Fetch specific message summaries by UID set string (async-imap).
-pub async fn fetch_summaries_by_uids(
-    session: &mut async_imap::Session<CompatTls>,
-    uid_set: &str,
-) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
-    let messages_stream = timeout(
-        IMAP_TIMEOUT,
-        session.uid_fetch(uid_set, "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)"),
-    )
-    .await??;
-    let messages: Vec<_> = messages_stream.try_collect().await?;
+/// Convert an async-imap `Fetch` into an `ImapMessageSummary` using the
+/// structured ENVELOPE + BODYSTRUCTURE data, falling back to the raw
+/// header parse if the envelope is unavailable.
+fn fetch_to_summary(
+    message: &async_imap::types::Fetch,
+    has_attachments: bool,
+    references_value: &str,
+) -> Option<ImapMessageSummary> {
+    let uid = message.uid.unwrap_or(0) as i64;
+    if uid == 0 {
+        return None;
+    }
 
-    let mut summaries = Vec::new();
-    for message in &messages {
-        let uid = message.uid.unwrap_or(0) as i64;
-        let flags: Vec<_> = message.flags().collect();
-        let is_read = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Seen));
-        let is_starred = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Flagged));
+    let flags: Vec<_> = message.flags().collect();
+    let is_read = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Seen));
+    let is_starred = flags.iter().any(|f| matches!(f, async_imap::types::Flag::Flagged));
 
-        let header_bytes = message.body().unwrap_or(b"");
-        let header_str = String::from_utf8_lossy(header_bytes);
+    // Preferred: structured ENVELOPE
+    if let Some(env) = message.envelope() {
+        let subject = env
+            .subject
+            .as_ref()
+            .map(|s| decode_rfc2047(&String::from_utf8_lossy(s)))
+            .unwrap_or_default();
+        let sender = env
+            .from
+            .as_ref()
+            .and_then(|from| from.first())
+            .map(|addr| format_address(addr))
+            .unwrap_or_default();
+        let date = env
+            .date
+            .as_ref()
+            .map(|d| parse_date(&String::from_utf8_lossy(d)))
+            .unwrap_or(0);
+        let message_id = env
+            .message_id
+            .as_ref()
+            .map(|m| String::from_utf8_lossy(m).trim().to_string())
+            .unwrap_or_default();
+        let in_reply_to = env
+            .in_reply_to
+            .as_ref()
+            .map(|r| String::from_utf8_lossy(r).trim().to_string())
+            .unwrap_or_default();
+        let references = if references_value.is_empty() {
+            in_reply_to.clone()
+        } else {
+            references_value.to_string()
+        };
 
-        let subject = parse_header(&header_str, "Subject");
-        let sender = parse_header(&header_str, "From");
-        let date_str = parse_header(&header_str, "Date");
-        let date = parse_date(&date_str);
-        let message_id = parse_header(&header_str, "Message-ID");
-        let references = parse_header(&header_str, "References");
-        let in_reply_to = parse_header(&header_str, "In-Reply-To");
-        let references = if references.is_empty() { in_reply_to } else { references };
-
-        summaries.push(ImapMessageSummary {
+        return Some(ImapMessageSummary {
             uid,
             subject,
             sender,
             date,
             is_read,
             is_starred,
-            has_attachments: false,
+            has_attachments,
             preview: String::new(),
             message_id,
             references,
         });
+    }
+
+    // Fallback: raw header parse
+    let header_bytes = message.body().unwrap_or(b"");
+    let header_str = String::from_utf8_lossy(header_bytes);
+    let subject = parse_header(&header_str, "Subject");
+    let sender = parse_header(&header_str, "From");
+    let date_str = parse_header(&header_str, "Date");
+    let date = parse_date(&date_str);
+    let message_id = parse_header(&header_str, "Message-ID");
+    let references = parse_header(&header_str, "References");
+    let in_reply_to = parse_header(&header_str, "In-Reply-To");
+    let references = if references.is_empty() { in_reply_to } else { references };
+
+    Some(ImapMessageSummary {
+        uid,
+        subject,
+        sender,
+        date,
+        is_read,
+        is_starred,
+        has_attachments,
+        preview: String::new(),
+        message_id,
+        references,
+    })
+}
+
+/// Format an async-imap address like "Name <mail@example.com>" (or just the email).
+fn format_address(addr: &async_imap::imap_proto::types::Address) -> String {
+    let name = addr
+        .name
+        .as_ref()
+        .map(|n| decode_rfc2047(&String::from_utf8_lossy(n)))
+        .unwrap_or_default();
+    let mailbox = addr.mailbox.as_ref().map(|m| String::from_utf8_lossy(m)).unwrap_or_default();
+    let host = addr.host.as_ref().map(|h| String::from_utf8_lossy(h)).unwrap_or_default();
+
+    if !mailbox.is_empty() && !host.is_empty() {
+        let email = format!("{}@{}", mailbox, host);
+        if !name.is_empty() && !name.contains('@') {
+            format!("{} <{}>", name, email)
+        } else {
+            email
+        }
+    } else if !name.is_empty() {
+        name
+    } else {
+        String::new()
+    }
+}
+
+/// Walk the BODYSTRUCTURE tree and determine if any part is a real attachment
+/// (not inline, not text/plain, text/html, text/calendar, or multipart/*).
+fn has_attachments_from_bodystructure(bs: &async_imap::imap_proto::types::BodyStructure) -> bool {
+    use async_imap::imap_proto::types::BodyStructure;
+    match bs {
+        BodyStructure::Multipart { bodies, .. } => {
+            bodies.iter().any(has_attachments_from_bodystructure)
+        }
+        BodyStructure::Message { common, .. } => {
+            let is_inline = common
+                .disposition
+                .as_ref()
+                .map(|d| d.ty.to_lowercase() == "inline")
+                .unwrap_or(false);
+            !is_inline
+        }
+        BodyStructure::Basic { common, .. } => {
+            let is_inline = common
+                .disposition
+                .as_ref()
+                .map(|d| d.ty.to_lowercase() == "inline")
+                .unwrap_or(false);
+            if is_inline {
+                return false;
+            }
+            // Basic covers application/*, image/*, etc — these are attachments
+            // unless disposition is inline.
+            !matches!(common.ty.ty.to_lowercase().as_str(), "text")
+        }
+        BodyStructure::Text { common, .. } => {
+            // text/plain is the message body; text/html / text/calendar are
+            // attachments only when not inline.
+            let is_inline = common
+                .disposition
+                .as_ref()
+                .map(|d| d.ty.to_lowercase() == "inline")
+                .unwrap_or(false);
+            let sub = common.ty.subtype.to_lowercase();
+            if is_inline {
+                false
+            } else {
+                !matches!(sub.as_str(), "plain")
+            }
+        }
+    }
+}
+
+/// Extract the References and In-Reply-To values from a raw header block.
+fn extract_reference_headers(header_bytes: &[u8]) -> (String, String) {
+    let header_str = String::from_utf8_lossy(header_bytes);
+    let references = parse_header(&header_str, "References");
+    let in_reply_to = parse_header(&header_str, "In-Reply-To");
+    (references, in_reply_to)
+}
+
+/// Fetch specific message summaries by UID set string (async-imap).
+/// Uses structured ENVELOPE/BODYSTRUCTURE for fast parsing, with the
+/// References header fetched alongside (ENVELOPE omits References).
+pub async fn fetch_summaries_by_uids(
+    session: &mut async_imap::Session<CompatTls>,
+    uid_set: &str,
+) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
+    let messages_stream = timeout(
+        IMAP_TIMEOUT,
+        session.uid_fetch(
+            uid_set,
+            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
+        ),
+    )
+    .await??;
+    let messages: Vec<_> = messages_stream.try_collect().await?;
+
+    let mut summaries = Vec::new();
+    for message in &messages {
+        let body_bytes = message.body().unwrap_or(b"");
+        let (references, _in_reply_to) = extract_reference_headers(body_bytes);
+        let has_attachments = message
+            .bodystructure()
+            .map(has_attachments_from_bodystructure)
+            .unwrap_or(false);
+        if let Some(summary) = fetch_to_summary(message, has_attachments, &references) {
+            summaries.push(summary);
+        }
     }
 
     Ok(summaries)
