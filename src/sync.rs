@@ -43,6 +43,46 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// Startup sync that only connects to the network when the account has no
+    /// cached folders yet. If the cache already has folders+messages, the UI
+    /// renders from cache immediately and the IDLE worker handles fresh updates.
+    pub async fn sync_account_lazy(
+        &self,
+        account: &Account,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        {
+            let cache = self.cache.lock().await;
+            if cache.has_cached_messages(account.id)? {
+                tracing::info!(
+                    "Account {} already has cached messages — skipping network sync (lazy)",
+                    account.email
+                );
+                return Ok(());
+            }
+        }
+        self.sync_account(account).await
+    }
+
+    /// Lazy variant of sync_all for startup: connects only for accounts with an
+    /// empty cache, so the UI can render immediately from cache otherwise.
+    pub async fn sync_all_lazy(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let accounts = {
+            let cache = self.cache.lock().await;
+            cache.load_accounts()?
+        };
+
+        for account in &accounts {
+            if account.enabled {
+                if let Err(e) = self.sync_account_lazy(account).await {
+                    tracing::error!("Failed to lazy sync account {}: {}", account.email, e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Sync a single account with retry on failure.
     pub async fn sync_account(
         &self,

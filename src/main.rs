@@ -454,17 +454,19 @@ async fn main() {
 
     tracing::info!("D-Bus server running as org.kde.pelliper.Daemon");
 
-    // Auto-sync on startup if accounts exist
+    // Auto-sync on startup if accounts exist. Uses lazy sync: accounts with an
+    // existing cache render from cache immediately; only empty-cache accounts
+    // connect to the network to bootstrap. IDLE workers handle fresh mail.
     {
         let cache_guard = cache.lock().await;
         if let Ok(count) = cache_guard.account_count() {
             if count > 0 {
-                tracing::info!("Found {} account(s), starting initial sync", count);
+                tracing::info!("Found {} account(s), starting lazy initial sync", count);
                 let sync = sync_engine.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    if let Err(e) = sync.sync_all().await {
-                        tracing::error!("Startup sync failed: {}", e);
+                    if let Err(e) = sync.sync_all_lazy().await {
+                        tracing::error!("Startup lazy sync failed: {}", e);
                     }
                 });
             }
