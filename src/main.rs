@@ -308,6 +308,45 @@ impl Daemon {
         }
     }
 
+    /// Mark a message read/unread.
+    async fn set_message_read(&self, account_id: i64, folder_path: &str, uid: i64, read: bool) {
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::SetFlags {
+                folder_path: folder_path.to_string(),
+                uid,
+                is_read: Some(read),
+                is_starred: None,
+            });
+        }
+    }
+
+    /// Star/unstar a message.
+    async fn set_message_starred(&self, account_id: i64, folder_path: &str, uid: i64, starred: bool) {
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::SetFlags {
+                folder_path: folder_path.to_string(),
+                uid,
+                is_read: None,
+                is_starred: Some(starred),
+            });
+        }
+    }
+
+    /// Move a message to a folder, or to Trash when `dest_folder` is empty.
+    async fn move_message(&self, account_id: i64, folder_path: &str, uid: i64, dest_folder: &str) {
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::MoveMessage {
+                folder_path: folder_path.to_string(),
+                uid,
+                dest_folder: if dest_folder.is_empty() {
+                    None
+                } else {
+                    Some(dest_folder.to_string())
+                },
+            });
+        }
+    }
+
     /// Load the body of a message. Returns HTML.
     /// Serves from cache when available; otherwise the worker fetches + caches
     /// and a second call returns the cached body.

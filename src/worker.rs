@@ -55,6 +55,19 @@ pub enum WorkerRequest {
     SetIdleFolder {
         folder_path: String,
     },
+    /// Change read/starred flags on one message (None leaves a flag unchanged).
+    SetFlags {
+        folder_path: String,
+        uid: i64,
+        is_read: Option<bool>,
+        is_starred: Option<bool>,
+    },
+    /// Move a message to another folder (None = move to the account's Trash).
+    MoveMessage {
+        folder_path: String,
+        uid: i64,
+        dest_folder: Option<String>,
+    },
     /// Graceful shutdown.
     Shutdown,
 }
@@ -248,6 +261,21 @@ impl Worker {
             WorkerRequest::SetIdleFolder { folder_path } => {
                 self.on_folder_switch(folder_path).await;
             }
+            WorkerRequest::SetFlags {
+                folder_path,
+                uid,
+                is_read,
+                is_starred,
+            } => {
+                self.handle_set_flags(&folder_path, uid, is_read, is_starred).await;
+            }
+            WorkerRequest::MoveMessage {
+                folder_path,
+                uid,
+                dest_folder,
+            } => {
+                self.handle_move_message(&folder_path, uid, dest_folder).await;
+            }
             WorkerRequest::Shutdown => {
                 self.shutdown = true;
                 if let Some(mut s) = self.session.take() {
@@ -314,6 +342,157 @@ impl Worker {
                     );
                 }
             }
+        }
+    }
+
+    /// Apply read/starred flag changes to a message (STORE + local cache),
+    /// then refresh the folder's unread count.
+    async fn handle_set_flags(
+        &mut self,
+        folder_path: &str,
+        uid: i64,
+        is_read: Option<bool>,
+        is_starred: Option<bool>,
+    ) {
+        let mut add: Vec<&str> = Vec::new();
+        let mut remove: Vec<&str> = Vec::new();
+        if let Some(read) = is_read {
+            if read { add.push("\\Seen"); } else { remove.push("\\Seen"); }
+        }
+        if let Some(starred) = is_starred {
+            if starred { add.push("\\Flagged"); } else { remove.push("\\Flagged"); }
+        }
+
+        if self.ensure_session().await.is_err() {
+            return;
+        }
+        let session = self.session.as_mut().ok_or(());
+        match session {
+            Ok(s) => {
+                match s.select_folder(folder_path).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            "Worker[{}]: select {} for flags failed: {}",
+                            self.account.id, folder_path, e
+                        );
+                        return;
+                    }
+                }
+                if let Err(e) = s.store_flags(uid, &add, &remove).await {
+                    tracing::error!(
+                        "Worker[{}]: store flags on {} uid {} failed: {}",
+                        self.account.id, folder_path, uid, e
+                    );
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+
+        {
+            let cache = self.cache.lock().await;
+            let _ = cache.update_message_flags(self.account.id, folder_path, uid, is_read, is_starred);
+            let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+        }
+    }
+
+    /// Move a message to a destination folder (or Trash when None). Uses
+    /// UID MOVE where available, falling back to COPY + \Deleted + EXPUNGE.
+    async fn handle_move_message(
+        &mut self,
+        folder_path: &str,
+        uid: i64,
+        dest_folder: Option<String>,
+    ) {
+        if self.ensure_session().await.is_err() {
+            return;
+        }
+
+        let dest = match dest_folder {
+            Some(d) if !d.is_empty() => d,
+            _ => {
+                let session = self.session.as_mut();
+                match session {
+                    Some(s) => match s.find_folder_by_kind(crate::imap::FolderKind::Trash).await {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            tracing::warn!(
+                                "Worker[{}]: no Trash folder found for move",
+                                self.account.id
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::error!("Worker[{}]: trash lookup failed: {}", self.account.id, e);
+                            return;
+                        }
+                    },
+                    None => return,
+                }
+            }
+        };
+
+        {
+            let session = self.session.as_mut();
+            match session {
+                Some(s) => {
+                    if let Err(e) = s.select_folder(folder_path).await {
+                        tracing::error!(
+                            "Worker[{}]: select {} for move failed: {}",
+                            self.account.id, folder_path, e
+                        );
+                        return;
+                    }
+                    match s.uid_move(uid, &dest).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(
+                                "Worker[{}]: UID MOVE unsupported, using COPY + EXPUNGE",
+                                self.account.id
+                            );
+                            if let Err(e) = s.uid_copy(uid, &dest).await {
+                                tracing::error!("Worker[{}]: COPY {} -> {} failed: {}",
+                                    self.account.id, uid, dest, e);
+                                return;
+                            }
+                            if let Err(e) = s.store_flags(uid, &["\\Deleted"], &[]).await {
+                                tracing::error!("Worker[{}]: set \\Deleted on {} failed: {}",
+                                    self.account.id, uid, e);
+                                return;
+                            }
+                            if let Err(e) = s.expunge().await {
+                                tracing::error!("Worker[{}]: expunge failed: {}", self.account.id, e);
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Worker[{}]: UID MOVE {} -> {} failed: {}",
+                                self.account.id, uid, dest, e
+                            );
+                            return;
+                        }
+                    }
+                }
+                None => return,
+            }
+        }
+
+        {
+            let cache = self.cache.lock().await;
+            let _ = cache.move_message(self.account.id, folder_path, uid, &dest);
+            let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+        }
+
+        // Make sure the destination shows the moved message.
+        if let Err(e) = self.sync_folder_first_page(&dest).await {
+            tracing::error!(
+                "Worker[{}]: refresh {} after move failed: {}",
+                self.account.id, dest, e
+            );
         }
     }
 

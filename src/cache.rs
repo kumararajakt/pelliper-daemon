@@ -303,6 +303,73 @@ impl Cache {
         Ok(())
     }
 
+    /// Update the read/starred flags of one message in place.
+    pub fn update_message_flags(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        is_read: Option<bool>,
+        is_starred: Option<bool>,
+    ) -> Result<()> {
+        if let Some(read) = is_read {
+            self.conn.execute(
+                "UPDATE messages SET is_read = ?1
+                 WHERE account_id = ?2 AND folder_path = ?3 AND uid = ?4",
+                rusqlite::params![read as i32, account_id, folder_path, uid],
+            )?;
+        }
+        if let Some(starred) = is_starred {
+            self.conn.execute(
+                "UPDATE messages SET is_starred = ?1
+                 WHERE account_id = ?2 AND folder_path = ?3 AND uid = ?4",
+                rusqlite::params![starred as i32, account_id, folder_path, uid],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Move a message (and its cached body) from one folder to another.
+    pub fn move_message(
+        &self,
+        account_id: i64,
+        from_folder: &str,
+        uid: i64,
+        to_folder: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO messages
+                (account_id, folder_path, uid, subject, sender, date, in_reply_to,
+                 message_id, references_, has_attachments, is_read, is_starred, preview)
+             SELECT account_id, ?2, uid, subject, sender, date, in_reply_to,
+                    message_id, references_, has_attachments, is_read, is_starred, preview
+             FROM messages
+             WHERE account_id = ?1 AND folder_path = ?3 AND uid = ?4",
+            rusqlite::params![account_id, to_folder, from_folder, uid],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO bodies (account_id, folder_path, uid, html)
+             SELECT account_id, ?2, uid, html
+             FROM bodies
+             WHERE account_id = ?1 AND folder_path = ?3 AND uid = ?4",
+            rusqlite::params![account_id, to_folder, from_folder, uid],
+        )?;
+        self.conn.execute(
+            "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+            rusqlite::params![account_id, from_folder, uid],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a message row (and its cascade-deleted body).
+    pub fn delete_message(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+            rusqlite::params![account_id, folder_path, uid],
+        )?;
+        Ok(())
+    }
+
     pub fn load_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, unread_count, noselect FROM folders WHERE account_id = ?1 ORDER BY path",

@@ -864,16 +864,95 @@ impl RawImapSession {
 
     /// Mark a message as seen (read).
     pub async fn mark_seen(&mut self, uid: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.store_flags(uid, &["\\Seen"], &[]).await
+    }
+
+    /// Add and/or remove flags on one message. Pass empty slices for unchanged flags.
+    pub async fn store_flags(
+        &mut self,
+        uid: i64,
+        add: &[&str],
+        remove: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !add.is_empty() {
+            self.store_flag_op(uid, "+FLAGS", add).await?;
+        }
+        if !remove.is_empty() {
+            self.store_flag_op(uid, "-FLAGS", remove).await?;
+        }
+        Ok(())
+    }
+
+    async fn store_flag_op(
+        &mut self,
+        uid: i64,
+        op: &str,
+        flags: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let list = flags.join(" ");
         let tag = self.next_tag();
-        self.send_command(&format!(
-            "{} UID STORE {} +FLAGS (\\Seen)",
-            tag, uid
-        )).await?;
+        self.send_command(&format!("{} UID STORE {} {} ({})", tag, uid, op, list)).await?;
         let (tagged, _) = self.read_response(&tag).await?;
         if !tagged.contains("OK") {
             return Err(format!("STORE failed: {}", tagged).into());
         }
         Ok(())
+    }
+
+    /// Copy a message to another folder (keeps the source).
+    pub async fn uid_copy(
+        &mut self,
+        uid: i64,
+        dest: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!("{} UID COPY {} {}", tag, uid, quote_imap_path(dest))).await?;
+        let (tagged, _) = self.read_response(&tag).await?;
+        if !tagged.contains("OK") {
+            return Err(format!("COPY failed: {}", tagged).into());
+        }
+        Ok(())
+    }
+
+    /// Move a message between folders using UID MOVE (RFC 6851).
+    /// Returns `true` if the server performed the move, `false` if the MOVE
+    /// extension is unavailable (caller should fall back to COPY + \Deleted).
+    pub async fn uid_move(
+        &mut self,
+        uid: i64,
+        dest: &str,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!("{} UID MOVE {} {}", tag, uid, quote_imap_path(dest))).await?;
+        let (tagged, _) = self.read_response(&tag).await?;
+        if tagged.contains("OK") {
+            return Ok(true);
+        }
+        // Server rejects MOVE (e.g. "Unsupported command") -> fall back.
+        Ok(false)
+    }
+
+    /// Permanently remove messages flagged \Deleted from the current folder.
+    pub async fn expunge(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!("{} EXPUNGE", tag)).await?;
+        let (tagged, _) = self.read_response(&tag).await?;
+        if !tagged.contains("OK") {
+            return Err(format!("EXPUNGE failed: {}", tagged).into());
+        }
+        Ok(())
+    }
+
+    /// Find the first selectable folder matching a semantic kind (e.g. Trash).
+    pub async fn find_folder_by_kind(
+        &mut self,
+        wanted: FolderKind,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let folders = self.list_folders().await?;
+        Ok(folders
+            .into_iter()
+            .find(|f| f.kind == wanted && !f.noselect)
+            .map(|f| f.path))
     }
 }
 
