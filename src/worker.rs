@@ -120,6 +120,10 @@ pub struct Worker {
     pending: Option<WorkerRequest>,
     /// Set by Shutdown; the event loop exits once set.
     shutdown: bool,
+    /// Cached OAuth access token (in-memory only, never persisted).
+    cached_access_token: Option<String>,
+    /// Unix timestamp when cached_access_token expires (0 = unknown).
+    token_expires_at: i64,
 }
 
 impl Worker {
@@ -141,6 +145,8 @@ impl Worker {
             backfill_queue: VecDeque::new(),
             pending: None,
             shutdown: false,
+            cached_access_token: None,
+            token_expires_at: 0,
         }
     }
 
@@ -303,9 +309,14 @@ impl Worker {
                     cache.update_has_attachment(self.account.id, folder_path, uid, has_attachments);
                 html
             }
-            Err(_e) => {
-                // Retry once with a fresh connection.
-                self.session = None;
+            Err(e) => {
+                // On auth error, invalidate token so reconnect gets a fresh one
+                if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" {
+                    tracing::warn!("Worker[{}]: auth error in load_body, refreshing token", self.account.id);
+                    self.invalidate_token();
+                } else {
+                    self.session = None;
+                }
                 match self.fetch_single_body(folder_path, uid).await {
                     Ok((html, has_attachments)) => {
                         let cache = self.cache.lock().await;
@@ -366,28 +377,18 @@ impl Worker {
         if self.ensure_session().await.is_err() {
             return;
         }
-        let session = self.session.as_mut().ok_or(());
-        match session {
-            Ok(s) => {
-                match s.select_folder(folder_path).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            "Worker[{}]: select {} for flags failed: {}",
-                            self.account.id, folder_path, e
-                        );
-                        return;
-                    }
-                }
-                if let Err(e) = s.store_flags(uid, &add, &remove).await {
-                    tracing::error!(
-                        "Worker[{}]: store flags on {} uid {} failed: {}",
-                        self.account.id, folder_path, uid, e
-                    );
+        // Try the operation; on auth error, invalidate token and retry once
+        let result = self.do_set_flags(folder_path, uid, &add, &remove).await;
+        if result.is_err() {
+            let e = result.unwrap_err();
+            if Self::is_auth_error(&e) && self.account.auth_type == "oauth" {
+                tracing::warn!("Worker[{}]: auth error in set_flags, refreshing token", self.account.id);
+                self.invalidate_token();
+                if self.ensure_session().await.is_err() {
                     return;
                 }
+                let _ = self.do_set_flags(folder_path, uid, &add, &remove).await;
             }
-            Err(_) => return,
         }
 
         {
@@ -396,6 +397,20 @@ impl Worker {
             let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
             let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         }
+    }
+
+    /// Internal helper: select folder and store flags (may fail with auth error).
+    async fn do_set_flags(
+        &mut self,
+        folder_path: &str,
+        uid: i64,
+        add: &[&str],
+        remove: &[&str],
+    ) -> Result<(), String> {
+        let session = self.session.as_mut().ok_or_else(|| "no session".to_string())?;
+        session.select_folder(folder_path).await.map_err(|e| e.to_string())?;
+        session.store_flags(uid, add, remove).await.map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Move a message to a destination folder (or Trash when None). Uses
@@ -434,49 +449,15 @@ impl Worker {
             }
         };
 
-        {
-            let session = self.session.as_mut();
-            match session {
-                Some(s) => {
-                    if let Err(e) = s.select_folder(folder_path).await {
-                        tracing::error!(
-                            "Worker[{}]: select {} for move failed: {}",
-                            self.account.id, folder_path, e
-                        );
-                        return;
-                    }
-                    match s.uid_move(uid, &dest).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::info!(
-                                "Worker[{}]: UID MOVE unsupported, using COPY + EXPUNGE",
-                                self.account.id
-                            );
-                            if let Err(e) = s.uid_copy(uid, &dest).await {
-                                tracing::error!("Worker[{}]: COPY {} -> {} failed: {}",
-                                    self.account.id, uid, dest, e);
-                                return;
-                            }
-                            if let Err(e) = s.store_flags(uid, &["\\Deleted"], &[]).await {
-                                tracing::error!("Worker[{}]: set \\Deleted on {} failed: {}",
-                                    self.account.id, uid, e);
-                                return;
-                            }
-                            if let Err(e) = s.expunge().await {
-                                tracing::error!("Worker[{}]: expunge failed: {}", self.account.id, e);
-                                return;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Worker[{}]: UID MOVE {} -> {} failed: {}",
-                                self.account.id, uid, dest, e
-                            );
-                            return;
-                        }
-                    }
+        // Try the move; on auth error, invalidate token and retry once
+        let move_result = self.do_move(folder_path, uid, &dest).await;
+        if let Err(ref e) = move_result {
+            if Self::is_auth_error(e) && self.account.auth_type == "oauth" {
+                tracing::warn!("Worker[{}]: auth error in move, refreshing token", self.account.id);
+                self.invalidate_token();
+                if self.ensure_session().await.is_ok() {
+                    let _ = self.do_move(folder_path, uid, &dest).await;
                 }
-                None => return,
             }
         }
 
@@ -493,6 +474,26 @@ impl Worker {
                 "Worker[{}]: refresh {} after move failed: {}",
                 self.account.id, dest, e
             );
+        }
+        return;
+    }
+
+    async fn do_move(&mut self, folder_path: &str, uid: i64, dest: &str) -> Result<(), String> {
+        let session = self.session.as_mut().ok_or_else(|| "no session".to_string())?;
+        session.select_folder(folder_path).await.map_err(|e| e.to_string())?;
+        match session.uid_move(uid, dest).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tracing::info!(
+                    "Worker[{}]: UID MOVE unsupported, using COPY + EXPUNGE",
+                    self.account.id
+                );
+                session.uid_copy(uid, dest).await.map_err(|e| e.to_string())?;
+                session.store_flags(uid, &["\\Deleted"], &[]).await.map_err(|e| e.to_string())?;
+                session.expunge().await.map_err(|e| e.to_string())?;
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -522,36 +523,79 @@ impl Worker {
         Ok(())
     }
 
+    /// Get a valid OAuth access token, refreshing if expired or about to expire.
+    /// Refreshes 5 minutes before expiry to avoid race conditions.
+    async fn get_valid_access_token(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let now = chrono::Utc::now().timestamp();
+        // Refresh 5 minutes (300s) before expiry
+        let buffer = 300;
+
+        if let Some(ref token) = self.cached_access_token {
+            if self.token_expires_at > 0 && now < self.token_expires_at - buffer {
+                return Ok(token.clone());
+            }
+        }
+
+        // Token is missing or about to expire — refresh it
+        let refresh_token = self
+            .account
+            .refresh_token
+            .as_deref()
+            .ok_or("No refresh token")?;
+        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
+            "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com"
+                .to_string()
+        });
+        let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
+        let token = crate::oauth::refresh_access_token(
+            "https://oauth2.googleapis.com/token",
+            &client_id,
+            &client_secret,
+            refresh_token,
+        )
+        .await?;
+
+        // Save new refresh token if Google issued one (rotation)
+        if let Some(ref new_rt) = token.refresh_token {
+            if new_rt != refresh_token {
+                tracing::info!("Worker[{}]: Google issued new refresh token, saving", self.account.id);
+                let mut cache = self.cache.lock().await;
+                if let Err(e) = cache.update_refresh_token(self.account.id, new_rt) {
+                    tracing::error!("Worker[{}]: failed to save new refresh token: {}", self.account.id, e);
+                } else {
+                    // Update the in-memory account so future refreshes use the new token
+                    self.account.refresh_token = Some(new_rt.clone());
+                }
+            }
+        }
+
+        let access_token = token.access_token.clone();
+        self.cached_access_token = Some(access_token.clone());
+        self.token_expires_at = token.expires_at();
+
+        tracing::debug!(
+            "Worker[{}]: refreshed access token (expires in {}s)",
+            self.account.id,
+            self.token_expires_at - now
+        );
+
+        Ok(access_token)
+    }
+
     async fn connect_session(
-        &self,
+        &mut self,
     ) -> Result<RawImapSession, Box<dyn std::error::Error + Send + Sync>> {
-        let host = self.account.imap_host.as_deref().unwrap_or("localhost");
+        let host = self.account.imap_host.clone().unwrap_or_else(|| "localhost".to_string());
         let port = self.account.imap_port.unwrap_or(993) as u16;
-        let email = &self.account.email;
+        let email = self.account.email.clone();
 
         if self.account.auth_type == "oauth" {
-            let refresh_token = self
-                .account
-                .refresh_token
-                .as_deref()
-                .ok_or("No refresh token")?;
-            let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
-                "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com"
-                    .to_string()
-            });
-            let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
-            let token = crate::oauth::refresh_access_token(
-                "https://oauth2.googleapis.com/token",
-                &client_id,
-                &client_secret,
-                refresh_token,
-            )
-            .await?;
-            imap::connect_session_oauth(host, port, email, &token.access_token).await
+            let access_token = self.get_valid_access_token().await?;
+            imap::connect_session_oauth(&host, port, &email, &access_token).await
         } else {
             let key_name = format!("pelliper:{}", email);
             let password = self.secrets.get_password(&key_name).await?;
-            imap::connect_session_password_raw(host, port, email, &password).await
+            imap::connect_session_password_raw(&host, port, &email, &password).await
         }
     }
 
@@ -562,6 +606,23 @@ impl Worker {
         }
         self.connect().await.map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Check if an error string indicates an authentication failure.
+    fn is_auth_error(e: &str) -> bool {
+        let lower = e.to_lowercase();
+        lower.contains("auth")
+            && (lower.contains("fail") || lower.contains("invalid") || lower.contains("expired") || lower.contains("rejected"))
+            || lower.contains("no longer valid")
+            || lower.contains("invalid credentials")
+    }
+
+    /// Invalidate the cached token and drop the session so the next
+    /// operation triggers a fresh connect with a new token.
+    fn invalidate_token(&mut self) {
+        self.cached_access_token = None;
+        self.token_expires_at = 0;
+        self.session = None;
     }
 
     /// Fetch the most recent page of a folder's messages, cache the results,
@@ -588,7 +649,19 @@ impl Worker {
 
         let summaries = session
             .fetch_recent_summaries(folder_path, page_size)
-            .await?;
+            .await;
+
+        let summaries = match summaries {
+            Ok(s) => s,
+            Err(e) if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" => {
+                tracing::warn!("Worker[{}]: auth error in sync_folder_first_page, refreshing token", self.account.id);
+                self.invalidate_token();
+                self.connect().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                let session = self.session.as_mut().ok_or("no session after reconnect")?;
+                session.fetch_recent_summaries(folder_path, page_size).await?
+            }
+            Err(e) => return Err(e),
+        };
 
         {
             let cache = self.cache.lock().await;

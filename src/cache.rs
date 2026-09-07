@@ -596,6 +596,15 @@ impl Cache {
         )?;
         Ok(count > 0)
     }
+
+    /// Update the refresh token for an account (when Google rotates it).
+    pub fn update_refresh_token(&self, account_id: i64, new_refresh_token: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET refresh_token = ?1 WHERE id = ?2",
+            rusqlite::params![new_refresh_token, account_id],
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
