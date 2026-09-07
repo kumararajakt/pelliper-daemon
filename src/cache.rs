@@ -150,6 +150,78 @@ impl Cache {
         Ok(())
     }
 
+    /// Create the full-text search index (FTS5) and keep it in sync with the
+    /// messages/bodies tables via triggers. Backfills existing rows on first run.
+    pub fn fts_init(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                subject, sender, preview, message_id, body,
+                account_id UNINDEXED, folder_path UNINDEXED, uid UNINDEXED
+            );
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id,
+                                         account_id, folder_path, uid)
+                VALUES (new.rowid, new.subject, new.sender, new.preview, new.message_id,
+                        new.account_id, new.folder_path, new.uid);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.rowid;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.rowid;
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id,
+                                         account_id, folder_path, uid)
+                VALUES (new.rowid, new.subject, new.sender, new.preview, new.message_id,
+                        new.account_id, new.folder_path, new.uid);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS bodies_fts_ai AFTER INSERT ON bodies BEGIN
+                INSERT INTO messages_fts(body, rowid)
+                VALUES (new.html, (SELECT rowid FROM messages
+                        WHERE account_id = new.account_id
+                          AND folder_path = new.folder_path
+                          AND uid = new.uid));
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS bodies_fts_ad AFTER DELETE ON bodies BEGIN
+                UPDATE messages_fts
+                SET body = NULL
+                WHERE rowid = (SELECT rowid FROM messages
+                        WHERE account_id = old.account_id
+                          AND folder_path = old.folder_path
+                          AND uid = old.uid);
+            END;
+            ",
+        )?;
+
+        let count: i64 = self.conn.query_row("SELECT count(*) FROM messages_fts", [], |r| r.get(0))?;
+        if count == 0 {
+            self.conn.execute_batch(
+                "
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id,
+                                         account_id, folder_path, uid)
+                SELECT rowid, subject, sender, preview, message_id, account_id, folder_path, uid
+                FROM messages;
+
+                UPDATE messages_fts
+                SET body = (
+                    SELECT b.html FROM bodies b
+                    JOIN messages m ON m.rowid = messages_fts.rowid
+                    WHERE b.account_id = m.account_id
+                      AND b.folder_path = m.folder_path
+                      AND b.uid = m.uid
+                );
+                ",
+            )?;
+        }
+
+        Ok(())
+    }
+
     pub fn load_accounts(&self) -> Result<Vec<Account>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, refresh_token, enabled FROM accounts",

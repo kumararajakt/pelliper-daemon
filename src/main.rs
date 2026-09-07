@@ -474,6 +474,7 @@ async fn main() {
 
     let cache = Cache::open(&data_dir).expect("Failed to open cache");
     cache.create_tables().expect("Failed to create tables");
+    cache.fts_init().expect("Failed to init search index");
     let cache = Arc::new(Mutex::new(cache));
 
     let secrets = Secrets::new();
