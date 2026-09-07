@@ -35,6 +35,12 @@ const BACKFILL_CHUNK: usize = 1_000;
 /// them is instant.  Older messages load on demand.
 const PREFETCH_BODY_LIMIT: usize = 50;
 
+/// Fallback re-sync interval used when the worker is NOT actively IDLE-watching
+/// a folder (no folder selected yet, no session, or after a disconnect). IMAP
+/// IDLE pushes mailbox changes, but servers are not reliable about it — poll
+/// every couple of minutes so new mail is still picked up.
+const RESYNC_INTERVAL_SECS: u64 = 120;
+
 // ---------------------------------------------------------------------------
 // Request / response types
 // ---------------------------------------------------------------------------
@@ -237,10 +243,22 @@ impl Worker {
                 }
             }
 
-            // ---- Nothing higher-priority: block for the next request.
-            match self.rx.recv().await {
-                Some(req) => self.pending = Some(req),
-                None => break, // channel closed — shut down
+            // ---- Nothing higher-priority: block for the next request, but
+            //      wake up periodically to re-sync. IDLE push is the happy
+            //      path; servers can miss notifications, and when we cannot
+            //      IDLE at all (no folder selected / no session) this timer
+            //      is the only thing that keeps the mailbox fresh.
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(RESYNC_INTERVAL_SECS),
+                self.rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(req)) => self.pending = Some(req),
+                Ok(None) => break, // channel closed — shut down
+                Err(_elapsed) => {
+                    self.do_periodic_resync().await;
+                }
             }
         }
 
@@ -719,6 +737,31 @@ impl Worker {
                     folder_path,
                     e
                 );
+                self.session = None;
+            }
+        }
+    }
+
+    /// Periodic poll fired when the worker is not actively IDLE-watching a
+    /// folder (no folder selected yet, or no live session). Tries to
+    /// (re)establish the session and refresh the active folder — falling back
+    /// to INBOX so per-account new mail is still picked up without IDLE push.
+    async fn do_periodic_resync(&mut self) {
+        let id = self.account.id;
+        if self.session.is_none() {
+            if let Err(e) = self.ensure_session().await {
+                tracing::warn!("Worker[{}]: periodic reconnect failed: {}", id, e);
+                return;
+            }
+        }
+        let folder = self
+            .current_folder
+            .clone()
+            .unwrap_or_else(|| "INBOX".to_string());
+        match self.sync_folder_first_page(&folder).await {
+            Ok(_summaries) => {}
+            Err(e) => {
+                tracing::warn!("Worker[{}]: periodic resync of {} failed: {}", id, folder, e);
                 self.session = None;
             }
         }
