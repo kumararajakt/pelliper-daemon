@@ -5,11 +5,17 @@ use tokio_rustls::{client::TlsStream, TlsConnector};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use futures::TryStreamExt;
 use std::sync::Arc;
+use async_imap::imap_proto::types::SectionPath;
+use base64::Engine;
 
 pub type CompatTls = tokio_util::compat::Compat<TlsStream<TcpStream>>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IMAP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Inline preview: bytes fetched per message (first part) and chars kept.
+const PREVIEW_FETCH_BYTES: usize = 2048;
+const PREVIEW_CHARS: usize = 240;
 
 pub async fn test_connection_oauth(
     host: &str,
@@ -378,8 +384,15 @@ impl RawImapSession {
     /// Read lines until we get a tagged response matching `tag`.
     /// Returns (tagged_line, untagged_lines).
     /// Handles IMAP literals: {<size>}\r\n<data>\r\n
+    ///
+    /// A FETCH response may contain multiple body sections, each sent as its
+    /// own literal; the server emits one physical line per section ending in
+    /// `{<size>}`, continues the next section on a following line, and closes
+    /// the response with the final tag. We coalesce those continuation lines
+    /// into a single untagged entry so parsers see one complete response.
     async fn read_response(&mut self, tag: &str) -> Result<(String, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
         let mut untagged = Vec::new();
+        let mut current: Option<String> = None;
         let mut line = String::new();
         loop {
             line.clear();
@@ -394,36 +407,50 @@ impl RawImapSession {
                 continue;
             }
 
-            // Tagged response — check if it starts with our tag
+            // Tagged response — finalize any pending entry and return
             if trimmed.starts_with(tag) {
+                if let Some(entry) = current.take() {
+                    untagged.push(entry);
+                }
                 return Ok((trimmed, untagged));
             }
 
-            // IMAP literal: line ending with {<size>} — read the literal data
-            // and append it to the line so parsers can extract header content.
-            if let Some(brace_pos) = trimmed.rfind('{') {
-                if trimmed.ends_with('}') {
-                    if let Ok(size) = trimmed[brace_pos+1..trimmed.len()-1].parse::<usize>() {
-                        tracing::debug!("IMAP literal: {} bytes", size);
-                        // Read exactly `size` bytes of literal data
-                        let mut literal_buf = vec![0u8; size];
-                        self.reader.read_exact(&mut literal_buf).await?;
-                        // Read the trailing CRLF after the literal
-                        let mut crlf = [0u8; 2];
-                        let _ = self.reader.read_exact(&mut crlf).await;
-                        // Append the literal data (as UTF-8) to the line
-                        let literal_text = String::from_utf8_lossy(&literal_buf);
-                        let mut full_line = trimmed;
-                        full_line.push_str("\r\n");
-                        full_line.push_str(&literal_text);
-                        untagged.push(full_line);
-                        continue;
+            // Untagged lines starting with '*' begin a new response.
+            if trimmed.starts_with('*') {
+                if let Some(entry) = current.take() {
+                    untagged.push(entry);
+                }
+                current = Some(trimmed);
+            } else if let Some(entry) = current.as_mut() {
+                // Continuation of a multiline response (e.g. a FETCH body
+                // section following a literal) — append to the current entry.
+                entry.push_str(&trimmed);
+            } else {
+                untagged.push(trimmed);
+                continue;
+            }
+
+            // IMAP literal: accumulated entry ending with {<size>} — read the
+            // literal data and append it so parsers can extract content.
+            if let Some(entry) = current.as_mut() {
+                if let Some(brace_pos) = entry.rfind('{') {
+                    if entry.ends_with('}') {
+                        if let Ok(size) = entry[brace_pos+1..entry.len()-1].parse::<usize>() {
+                            tracing::debug!("IMAP literal: {} bytes", size);
+                            // Read exactly `size` bytes of literal data
+                            let mut literal_buf = vec![0u8; size];
+                            self.reader.read_exact(&mut literal_buf).await?;
+                            // Read the trailing CRLF after the literal
+                            let mut crlf = [0u8; 2];
+                            let _ = self.reader.read_exact(&mut crlf).await;
+                            // Append the literal data (as UTF-8) to the entry
+                            let literal_text = String::from_utf8_lossy(&literal_buf);
+                            entry.push_str("\r\n");
+                            entry.push_str(&literal_text);
+                        }
                     }
                 }
             }
-
-            // Regular untagged line
-            untagged.push(trimmed);
         }
     }
 
@@ -485,8 +512,8 @@ impl RawImapSession {
         // Fetch from highest UID down, grab `limit` messages
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH {}:* (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
-            tag, total
+            "{} UID FETCH {}:* (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[1]<0.{}> BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
+            tag, total, PREVIEW_FETCH_BYTES
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
 
@@ -547,8 +574,8 @@ impl RawImapSession {
     ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH {} (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
-            tag, uid_set
+            "{} UID FETCH {} (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[1]<0.{}> BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
+            tag, uid_set, PREVIEW_FETCH_BYTES
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
 
@@ -592,11 +619,11 @@ impl RawImapSession {
             return Ok(Vec::new());
         }
 
-        // Fetch UID + headers + flags for all messages
+        // Fetch UID + headers + flags + preview for all messages
         let tag = self.next_tag();
         self.send_command(&format!(
-            "{} UID FETCH 1:* (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
-            tag
+            "{} UID FETCH 1:* (UID ENVELOPE BODYSTRUCTURE BODY.PEEK[1]<0.{}> BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)] FLAGS)",
+            tag, PREVIEW_FETCH_BYTES
         )).await?;
         let (tagged, fetch_untagged) = self.read_response(&tag).await?;
 
@@ -904,7 +931,7 @@ fn parse_list_response(line: &str) -> Option<(String, bool, FolderKind)> {
 
 /// Parse a FETCH response line for UID, flags, and body.
 /// After read_response appends literal data, the line looks like:
-/// * <seq> FETCH (UID <uid> FLAGS (\Seen) BODY[HEADER.FIELDS ...] {<size>}\r\n<headers>
+/// * <seq> FETCH (UID <uid> FLAGS (\Seen) ... BODY[1]<0> {<size>}\r\n<preview> BODY[HEADER.FIELDS ...] {<size>}\r\n<headers>
 fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
     let rest = line.strip_prefix("* ")?;
 
@@ -934,26 +961,14 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
     // Detect attachments from BODYSTRUCTURE (if present in the response)
     let has_attachments = detect_attachments_raw(rest);
 
-    // Find the literal size marker: BODY[...] {<size>}
-    // Must find the brace that closes the size marker, not any brace inside header content
-    let body_start = rest.find("BODY[HEADER.FIELDS")?;
-    // Find "{" after the BODY[...] section — search from after the closing bracket
-    let bracket_end = rest[body_start..].find(']')?;
-    let search_from = body_start + bracket_end + 1;
-    let brace_start = rest[search_from..].find('{')?;
-    let brace_pos = search_from + brace_start;
-    let brace_end = rest[brace_pos..].find('}')?;
-    let after_brace = brace_pos + brace_end + 1;
+    // Inline preview from the BODY[1] partial (may be absent on some servers)
+    let preview = extract_section_data(rest, "BODY[1]<")
+        .map(|bytes| preview_from_unknown(&bytes))
+        .unwrap_or_default();
 
-    // After {size}\r\n comes the literal header text
-    let header_text = if after_brace < rest.len() {
-        rest[after_brace..].trim().to_string()
-    } else {
-        String::new()
-    };
-
-    // Strip trailing closing paren that might be appended
-    let header_text = header_text.trim_end_matches(')').trim().to_string();
+    // Header block from the BODY[HEADER.FIELDS ...] literal
+    let header_bytes = extract_section_data(rest, "BODY[HEADER.FIELDS (").unwrap_or_default();
+    let header_text = String::from_utf8_lossy(&header_bytes);
 
     let subject = parse_header(&header_text, "Subject");
     let sender = parse_header(&header_text, "From");
@@ -978,10 +993,26 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
         is_read,
         is_starred,
         has_attachments,
-        preview: String::new(),
+        preview,
         message_id,
         references,
     })
+}
+
+/// Extract the literal data following a `BODY[...]` marker in a coalesced
+/// FETCH response. The marker must be exact enough to not collide with data:
+/// preview sections appear as `BODY[1]<0> {<size>}`, header fields as
+/// `BODY[HEADER.FIELDS (...)]`. Returns the literal bytes.
+fn extract_section_data(line: &str, marker: &str) -> Option<Vec<u8>> {
+    let start = line.find(marker)?;
+    let rest = &line[start + marker.len()..];
+    let brace = rest.find('{')?;
+    let close = rest[brace..].find('}')?;
+    let brace_pos = brace + close;
+    let size: usize = rest[brace + 1..brace_pos].parse().ok()?;
+    let after = rest[brace_pos + 1..].strip_prefix("\r\n")?;
+    let n = size.min(after.len());
+    Some(after.as_bytes()[..n].to_vec())
 }
 
 /// Heuristically detect attachments from a raw BODYSTRUCTURE section in a
@@ -1177,7 +1208,7 @@ pub async fn fetch_message_summaries(
         IMAP_TIMEOUT,
         session.uid_fetch(
             "1:*",
-            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
+            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[1]<0.2048> BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
         ),
     )
     .await??;
@@ -1185,13 +1216,16 @@ pub async fn fetch_message_summaries(
 
     let mut summaries = Vec::new();
     for message in &messages {
-        let body_bytes = message.body().unwrap_or(b"");
-        let (references, _in_reply_to) = extract_reference_headers(body_bytes);
+        let (references, _in_reply_to) = extract_reference_headers(message.header().unwrap_or(b""));
         let has_attachments = message
             .bodystructure()
             .map(has_attachments_from_bodystructure)
             .unwrap_or(false);
-        if let Some(summary) = fetch_to_summary(message, has_attachments, &references) {
+        let preview = message
+            .section(&SectionPath::Part(vec![1], None))
+            .map(|bytes| preview_from_encoded(bytes, first_part_encoding(message.bodystructure())))
+            .unwrap_or_default();
+        if let Some(summary) = fetch_to_summary(message, has_attachments, &references, preview) {
             summaries.push(summary);
         }
     }
@@ -1221,7 +1255,7 @@ pub async fn fetch_recent_summaries(
         IMAP_TIMEOUT,
         session.uid_fetch(
             &range,
-            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
+            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[1]<0.2048> BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
         ),
     )
     .await??;
@@ -1229,13 +1263,16 @@ pub async fn fetch_recent_summaries(
 
     let mut summaries = Vec::new();
     for message in &messages {
-        let body_bytes = message.body().unwrap_or(b"");
-        let (references, _in_reply_to) = extract_reference_headers(body_bytes);
+        let (references, _in_reply_to) = extract_reference_headers(message.header().unwrap_or(b""));
         let has_attachments = message
             .bodystructure()
             .map(has_attachments_from_bodystructure)
             .unwrap_or(false);
-        if let Some(summary) = fetch_to_summary(message, has_attachments, &references) {
+        let preview = message
+            .section(&SectionPath::Part(vec![1], None))
+            .map(|bytes| preview_from_encoded(bytes, first_part_encoding(message.bodystructure())))
+            .unwrap_or_default();
+        if let Some(summary) = fetch_to_summary(message, has_attachments, &references, preview) {
             summaries.push(summary);
         }
     }
@@ -1281,6 +1318,7 @@ fn fetch_to_summary(
     message: &async_imap::types::Fetch,
     has_attachments: bool,
     references_value: &str,
+    preview: String,
 ) -> Option<ImapMessageSummary> {
     let uid = message.uid.unwrap_or(0) as i64;
     if uid == 0 {
@@ -1333,7 +1371,7 @@ fn fetch_to_summary(
             is_read,
             is_starred,
             has_attachments,
-            preview: String::new(),
+            preview,
             message_id,
             references,
         });
@@ -1359,7 +1397,7 @@ fn fetch_to_summary(
         is_read,
         is_starred,
         has_attachments,
-        preview: String::new(),
+        preview,
         message_id,
         references,
     })
@@ -1444,6 +1482,130 @@ fn extract_reference_headers(header_bytes: &[u8]) -> (String, String) {
     (references, in_reply_to)
 }
 
+/// How the first text part of a message is transferred over the wire.
+enum PreviewEncoding {
+    Base64,
+    QuotedPrintable,
+    /// SevenBit/EightBit/Binary or unknown — decode as-is.
+    Text,
+}
+
+/// Determine the transfer encoding of part 1 (the first body part) from a
+/// BODYSTRUCTURE, so the preview can be decoded correctly.
+fn first_part_encoding(bs: Option<&async_imap::imap_proto::types::BodyStructure>) -> PreviewEncoding {
+    use async_imap::imap_proto::types::{BodyStructure, ContentEncoding};
+    match bs {
+        Some(BodyStructure::Multipart { bodies, .. }) => {
+            // Part 1 of the top-level multipart is the first body part.
+            bodies.first().map(|b| first_part_encoding(Some(b))).unwrap_or(PreviewEncoding::Text)
+        }
+        Some(BodyStructure::Basic { other, .. }) | Some(BodyStructure::Text { other, .. }) => {
+            match &other.transfer_encoding {
+                ContentEncoding::Base64 => PreviewEncoding::Base64,
+                ContentEncoding::QuotedPrintable => PreviewEncoding::QuotedPrintable,
+                _ => PreviewEncoding::Text,
+            }
+        }
+        _ => PreviewEncoding::Text,
+    }
+}
+
+/// Build an inline preview from raw fetched bytes and a known transfer
+/// encoding (async-imap path — BODYSTRUCTURE is available).
+fn preview_from_encoded(bytes: &[u8], encoding: PreviewEncoding) -> String {
+    let decoded: Vec<u8> = match encoding {
+        PreviewEncoding::Base64 => base64::engine::general_purpose::STANDARD
+            .decode(bytes)
+            .unwrap_or_else(|_| bytes.to_vec()),
+        PreviewEncoding::QuotedPrintable => decode_quoted_printable(bytes),
+        PreviewEncoding::Text => bytes.to_vec(),
+    };
+    clean_preview(&decoded)
+}
+
+/// Build an inline preview from raw fetched bytes when the transfer encoding
+/// is unknown (raw session path). Heuristic: base64 if it looks like base64,
+/// otherwise apply quoted-printable decoding (a no-op for plain ASCII).
+fn preview_from_unknown(bytes: &[u8]) -> String {
+    let cleaned: Vec<u8> = bytes
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    if cleaned.len() % 4 == 0
+        && cleaned.len() >= 16
+        && cleaned.iter().all(|b| {
+            b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=' || *b == b'-' || *b == b'_'
+        })
+    {
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&cleaned) {
+            return clean_preview(&decoded);
+        }
+    }
+    clean_preview(&decode_quoted_printable(bytes))
+}
+
+/// Normalize preview bytes into clean display text: strip HTML tags, collapse
+/// whitespace, and truncate to PREVIEW_CHARS characters.
+fn clean_preview(raw: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(raw).to_string();
+    if text.contains('<') && text.contains('>') {
+        text = strip_html_tags(&text);
+    }
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(PREVIEW_CHARS)
+        .collect()
+}
+
+/// Remove HTML tags (text between '<' and '>'), keeping the text in between.
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if in_tag => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Decode quoted-printable: `=XX` hex escapes and soft line breaks (`=\r\n`).
+/// Safe for plain text (unrecognized `=` is kept as-is).
+fn decode_quoted_printable(bytes: &[u8]) -> Vec<u8> {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'=' && i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
 /// Fetch specific message summaries by UID set string (async-imap).
 /// Uses structured ENVELOPE/BODYSTRUCTURE for fast parsing, with the
 /// References header fetched alongside (ENVELOPE omits References).
@@ -1455,7 +1617,7 @@ pub async fn fetch_summaries_by_uids(
         IMAP_TIMEOUT,
         session.uid_fetch(
             uid_set,
-            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
+            "(UID ENVELOPE BODYSTRUCTURE FLAGS BODY.PEEK[1]<0.2048> BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])",
         ),
     )
     .await??;
@@ -1463,13 +1625,16 @@ pub async fn fetch_summaries_by_uids(
 
     let mut summaries = Vec::new();
     for message in &messages {
-        let body_bytes = message.body().unwrap_or(b"");
-        let (references, _in_reply_to) = extract_reference_headers(body_bytes);
+        let (references, _in_reply_to) = extract_reference_headers(message.header().unwrap_or(b""));
         let has_attachments = message
             .bodystructure()
             .map(has_attachments_from_bodystructure)
             .unwrap_or(false);
-        if let Some(summary) = fetch_to_summary(message, has_attachments, &references) {
+        let preview = message
+            .section(&SectionPath::Part(vec![1], None))
+            .map(|bytes| preview_from_encoded(bytes, first_part_encoding(message.bodystructure())))
+            .unwrap_or_default();
+        if let Some(summary) = fetch_to_summary(message, has_attachments, &references, preview) {
             summaries.push(summary);
         }
     }
