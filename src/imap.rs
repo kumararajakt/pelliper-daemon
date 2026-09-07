@@ -974,12 +974,18 @@ fn parse_fetch_response(line: &str) -> Option<ImapMessageSummary> {
     let sender = parse_header(&header_text, "From");
     let date_str = parse_header(&header_text, "Date");
     let date = parse_date(&date_str);
-    let message_id = parse_header(&header_text, "Message-ID");
-    let references = parse_header(&header_text, "References");
-    let in_reply_to = parse_header(&header_text, "In-Reply-To");
+    // Normalize Message-IDs (strip angle brackets / comments) so threading
+    // links match regardless of raw vs ENVELOPE source.
+    let message_id = normalize_message_id(&parse_header(&header_text, "Message-ID"));
+    let references_raw = parse_header(&header_text, "References");
+    let in_reply_to = normalize_references(&parse_header(&header_text, "In-Reply-To"));
 
     // Use In-Reply-To as fallback for References if empty
-    let references = if references.is_empty() { in_reply_to } else { references };
+    let references = if references_raw.is_empty() {
+        in_reply_to
+    } else {
+        normalize_references(&references_raw)
+    };
 
     if subject.is_empty() && sender.is_empty() && uid != 0 {
         tracing::debug!("Empty headers for uid={}, header_text (first 200): {:?}", uid, &header_text[..header_text.len().min(200)]);
@@ -1350,17 +1356,17 @@ fn fetch_to_summary(
         let message_id = env
             .message_id
             .as_ref()
-            .map(|m| String::from_utf8_lossy(m).trim().to_string())
+            .map(|m| normalize_message_id(&String::from_utf8_lossy(m)))
             .unwrap_or_default();
         let in_reply_to = env
             .in_reply_to
             .as_ref()
-            .map(|r| String::from_utf8_lossy(r).trim().to_string())
+            .map(|r| normalize_references(&String::from_utf8_lossy(r)))
             .unwrap_or_default();
         let references = if references_value.is_empty() {
             in_reply_to.clone()
         } else {
-            references_value.to_string()
+            normalize_references(references_value)
         };
 
         return Some(ImapMessageSummary {
@@ -1384,10 +1390,14 @@ fn fetch_to_summary(
     let sender = parse_header(&header_str, "From");
     let date_str = parse_header(&header_str, "Date");
     let date = parse_date(&date_str);
-    let message_id = parse_header(&header_str, "Message-ID");
-    let references = parse_header(&header_str, "References");
-    let in_reply_to = parse_header(&header_str, "In-Reply-To");
-    let references = if references.is_empty() { in_reply_to } else { references };
+    let message_id = normalize_message_id(&parse_header(&header_str, "Message-ID"));
+    let references_raw = parse_header(&header_str, "References");
+    let in_reply_to = normalize_references(&parse_header(&header_str, "In-Reply-To"));
+    let references = if references_raw.is_empty() {
+        in_reply_to
+    } else {
+        normalize_references(&references_raw)
+    };
 
     Some(ImapMessageSummary {
         uid,
@@ -1670,6 +1680,73 @@ fn parse_header(headers: &str, name: &str) -> String {
     result
 }
 
+/// Strip RFC 5322 comments from a header value.  Comments are balanced
+/// `(...)` groups; the comment text itself is discarded.
+fn strip_rfc_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for ch in s.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Extract all Message-IDs from a raw header value (References, In-Reply-To,
+/// or Message-ID), returning their canonical form: angle brackets removed,
+/// whitespace trimmed, RFC 5322 comments skipped.  Entities without `@` are
+/// only kept when angle-bracketed (strict ID form).
+fn extract_message_ids(raw: &str) -> Vec<String> {
+    let text = strip_rfc_comments(raw);
+    let mut ids = Vec::new();
+
+    // Angle-bracketed ids, handled first so comments can't confuse them.
+    let mut rest = text.trim();
+    while let Some(open) = rest.find('<') {
+        let tail = &rest[open + 1..];
+        match tail.find('>') {
+            Some(close) => {
+                let id = tail[..close].trim();
+                if !id.is_empty() {
+                    ids.push(id.to_string());
+                }
+                rest = tail[close + 1..].trim();
+            }
+            None => break,
+        }
+    }
+
+    // Remaining bare tokens that mention '@' (non-bracketed ids).
+    for tok in rest.split_whitespace() {
+        let tok = tok
+            .trim_matches(|c| c == ',' || c == ';' || c == '<' || c == '>');
+        if tok.contains('@') && !tok.is_empty() && !ids.iter().any(|i| i == tok) {
+            ids.push(tok.to_string());
+        }
+    }
+
+    // Dedup preserving first occurrence.
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+    ids
+}
+
+/// Canonical form of a single Message-ID header value (or "") — the first
+/// id token, without angle brackets or comments.
+fn normalize_message_id(raw: &str) -> String {
+    extract_message_ids(raw).into_iter().next().unwrap_or_default()
+}
+
+/// Canonical form of a References / In-Reply-To header value: the extracted
+/// Message-IDs, space-separated.  Empty string when no ids are present.
+fn normalize_references(raw: &str) -> String {
+    extract_message_ids(raw).join(" ")
+}
+
 /// Decode RFC 2047 encoded words: =?charset?encoding?text?=
 fn decode_rfc2047(input: &str) -> String {
     use rfc2047_decoder::{Decoder, RecoverStrategy};
@@ -1782,4 +1859,51 @@ fn html_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_message_id_strips_brackets_and_comments() {
+        assert_eq!(normalize_message_id("<a@b.com>"), "a@b.com");
+        assert_eq!(normalize_message_id("a@b.com"), "a@b.com");
+        // RFC 5322 comment trailing the id
+        assert_eq!(normalize_message_id("<a@b.com> (Comment)"), "a@b.com");
+        // Comment first, then the id
+        assert_eq!(normalize_message_id("(C) <a@b.com>"), "a@b.com");
+        // Nested comments must not disrupt extraction
+        assert_eq!(normalize_message_id("<a@b.com> (x (y))"), "a@b.com");
+        assert_eq!(normalize_message_id(""), "");
+        assert_eq!(normalize_message_id("   "), "");
+    }
+
+    #[test]
+    fn normalize_references_joins_and_dedups() {
+        assert_eq!(
+            normalize_references("<a@b.com> <c@d.com>"),
+            "a@b.com c@d.com"
+        );
+        // Trailing comment is dropped
+        assert_eq!(
+            normalize_references("<a@b.com> <c@d.com> (thread topic)"),
+            "a@b.com c@d.com"
+        );
+        // Bare ids without angle brackets are kept
+        assert_eq!(normalize_references("a@b.com c@d.com"), "a@b.com c@d.com");
+        // Duplicates are removed
+        assert_eq!(normalize_references("<a@b.com> <a@b.com>"), "a@b.com");
+        assert_eq!(normalize_references(""), "");
+    }
+
+    #[test]
+    fn threading_matches_after_normalization() {
+        // A raw-path message stored `message_id` with brackets; the parent's
+        // References (ENVELOPE source) had none. After normalization both are
+        // the same bare id, so threadmodel.cpp's linkage finds the parent.
+        let child_message_id = normalize_message_id("<reply@host>");
+        let parent_refs = normalize_references("reply@host");
+        assert_eq!(child_message_id, parent_refs);
+    }
 }
