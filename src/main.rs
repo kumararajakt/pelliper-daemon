@@ -1,27 +1,62 @@
 mod cache;
 mod discover;
-mod idle;
 mod imap;
 mod mail;
 mod oauth;
 mod secrets;
 mod smtp;
-mod sync;
+mod worker;
 
 use cache::{Account, Cache};
 use secrets::Secrets;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 use zbus::connection::Builder;
 use zbus::interface;
+
+/// Spawn a background worker for one account and return its handle.
+/// Handles are stored in a map so the D-Bus layer can route requests.
+fn spawn_worker(
+    account: &Account,
+    cache: Arc<Mutex<Cache>>,
+    secrets: Secrets,
+) -> worker::WorkerHandle {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let cache_clone = cache.clone();
+    let secrets_clone = secrets.clone();
+    let account_clone = account.clone();
+
+    tokio::spawn(async move {
+        let w = worker::Worker::new(account_clone, cache_clone, secrets_clone, rx);
+        w.run().await;
+    });
+
+    worker::WorkerHandle::new(tx)
+}
 
 struct Daemon {
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,
-    sync_engine: sync::SyncEngine,
-    idle_router: std::sync::Arc<idle::IdleRouter>,
-    idle_notify_tx: mpsc::Sender<idle::IdleNotification>,
+    workers: Arc<std::sync::Mutex<HashMap<i64, worker::WorkerHandle>>>,
+}
+
+impl Daemon {
+    fn get_worker(&self, account_id: i64) -> Option<worker::WorkerHandle> {
+        self.workers.lock().unwrap().get(&account_id).cloned()
+    }
+
+    /// Ensure a worker exists for the given account (used for newly-added
+    /// accounts at runtime).
+    fn ensure_worker(&self, account: &Account) {
+        let existing = self.workers.lock().unwrap().contains_key(&account.id);
+        if existing {
+            return;
+        }
+        let handle = spawn_worker(account, self.cache.clone(), self.secrets.clone());
+        self.workers.lock().unwrap().insert(account.id, handle);
+    }
 }
 
 #[interface(name = "org.kde.pelliper.Daemon")]
@@ -101,50 +136,36 @@ impl Daemon {
             enabled: true,
         };
 
-        let saved = {
+        let saved_id = {
             let mut cache = self.cache.lock().await;
             match cache.insert_account(&account) {
                 Ok(id) => {
                     tracing::info!("Account saved with id {}: {}", id, email);
-                    true
+                    Some(id)
                 }
                 Err(e) => {
                     tracing::error!("Failed to save account {}: {}", email, e);
-                    false
+                    None
                 }
             }
         };
 
-        // Trigger initial sync in the background
-        if saved {
-            let sync = self.sync_engine.clone();
-            let email_clone = email.to_string();
-            tokio::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                tracing::info!("Starting initial sync for {}", email_clone);
-                if let Err(e) = sync.sync_all().await {
-                    tracing::error!("Initial sync failed for {}: {}", email_clone, e);
-                }
-            });
-
-            // Spawn IDLE worker for the new account
-            let cache_guard = self.cache.lock().await;
-            if let Ok(accounts) = cache_guard.load_accounts() {
-                if let Some(account) = accounts.iter().find(|a| a.email == email) {
-                    let account_id = account.id;
-                    drop(cache_guard);
-                    idle::spawn_idle_worker_for_account(
-                        &self.idle_router,
-                        self.cache.clone(),
-                        self.secrets.clone(),
-                        self.idle_notify_tx.clone(),
-                        account_id,
-                    );
-                }
+        if let Some(id) = saved_id {
+            let saved_account = {
+                let cache = self.cache.lock().await;
+                cache
+                    .load_accounts()
+                    .ok()
+                    .and_then(|accounts| accounts.into_iter().find(|a| a.id == id))
+            };
+            if let Some(a) = saved_account {
+                // Start a background worker for the new account. It bootstraps
+                // (cold cache) and handles sync + IDLE.
+                self.ensure_worker(&a);
             }
         }
 
-        saved
+        saved_id.is_some()
     }
 
     /// Remove an account and all its data (folders, messages, bodies, attachments).
@@ -152,8 +173,10 @@ impl Daemon {
     async fn remove_account(&self, account_id: i64) -> bool {
         tracing::info!("D-Bus: remove_account id={}", account_id);
 
-        // Clear the IDLE folder for this account — worker will detect account is gone
-        self.idle_router.set_folder(account_id, "").await;
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::Shutdown);
+        }
+        self.workers.lock().unwrap().remove(&account_id);
 
         let cache = self.cache.lock().await;
         match cache.remove_account(account_id) {
@@ -168,16 +191,15 @@ impl Daemon {
         }
     }
 
-    /// Trigger a full sync of all enabled accounts.
+    /// Trigger a full sync of all enabled accounts (route to each worker).
     async fn sync_all(&self) -> bool {
         tracing::info!("D-Bus: sync_all requested");
-        match self.sync_engine.sync_all().await {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::error!("sync_all failed: {}", e);
-                false
-            }
+        let workers: Vec<worker::WorkerHandle> =
+            self.workers.lock().unwrap().values().cloned().collect();
+        for handle in workers {
+            handle.send(worker::WorkerRequest::SyncAll);
         }
+        true
     }
 
     /// Trigger a sync of a specific account by email.
@@ -195,13 +217,15 @@ impl Daemon {
         };
 
         match account {
-            Some(account) => match self.sync_engine.sync_account(&account).await {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::error!("sync_account failed for {}: {}", email, e);
+            Some(account) => {
+                self.ensure_worker(&account);
+                if let Some(handle) = self.get_worker(account.id) {
+                    handle.send(worker::WorkerRequest::SyncAll);
+                    true
+                } else {
                     false
                 }
-            },
+            }
             None => {
                 tracing::error!("Account not found: {}", email);
                 false
@@ -245,20 +269,24 @@ impl Daemon {
         cache.count_messages(account_id, folder_path).unwrap_or(0)
     }
 
-    /// Tell the IDLE manager to watch a specific folder for real-time updates.
-    /// Called by the UI whenever the user switches folders.
+    /// Tell the account's worker to watch a specific folder for real-time
+    /// updates (IDLE) and sync its first page.
     async fn set_idle_folder(&self, account_id: i64, folder_path: &str) {
         tracing::info!(
             "D-Bus: set_idle_folder account={} folder={}",
             account_id,
             folder_path
         );
-        self.idle_router.set_folder(account_id, folder_path).await;
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::SetIdleFolder {
+                folder_path: folder_path.to_string(),
+            });
+        }
     }
 
     /// Load the body of a message. Returns HTML.
-    /// Fetches from IMAP if not cached, then caches for next time.
-    /// Retries once with a fresh connection on failure.
+    /// Serves from cache when available; otherwise the worker fetches + caches
+    /// and a second call returns the cached body.
     async fn load_body(&self, account_id: i64, folder_path: &str, uid: i64) -> String {
         // Check cache first
         {
@@ -276,117 +304,20 @@ impl Daemon {
             uid
         );
 
-        let account = {
-            let cache = self.cache.lock().await;
-            match cache.load_accounts() {
-                Ok(accounts) => accounts.into_iter().find(|a| a.id == account_id),
-                Err(e) => {
-                    tracing::error!("Failed to load accounts: {}", e);
-                    return format!("<p>Error loading account: {}</p>", e);
-                }
-            }
-        };
-
-        let account = match account {
-            Some(a) => a,
-            None => return "<p>Account not found</p>".to_string(),
-        };
-
-        // Attempt 1
-        match self.try_load_body(&account, folder_path, uid).await {
-            Ok((html, has_attachments)) => {
-                self.cache_body(account_id, folder_path, uid, &html, has_attachments)
-                    .await;
+        // Delegate to the worker; await its response.
+        if let Some(handle) = self.get_worker(account_id) {
+            let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+            handle.send(worker::WorkerRequest::LoadBody {
+                folder_path: folder_path.to_string(),
+                uid,
+                reply: reply_tx,
+            });
+            if let Some(html) = reply_rx.recv().await {
                 return html;
             }
-            Err(e) => {
-                tracing::warn!("Body fetch attempt 1 failed for uid={}: {}", uid, e);
-            }
         }
 
-        // Attempt 2: reconnect and retry once
-        tracing::info!("Retrying body fetch for uid={} with fresh connection", uid);
-        match self.try_load_body(&account, folder_path, uid).await {
-            Ok((html, has_attachments)) => {
-                self.cache_body(account_id, folder_path, uid, &html, has_attachments)
-                    .await;
-                html
-            }
-            Err(e) => {
-                tracing::error!("Body fetch attempt 2 failed for uid={}: {}", uid, e);
-                format!("<p>Failed to load message: {}</p>", e)
-            }
-        }
-    }
-}
-
-// Private helpers (not D-Bus methods)
-impl Daemon {
-    /// Single attempt to connect and fetch a message body.
-    async fn try_load_body(
-        &self,
-        account: &Account,
-        folder_path: &str,
-        uid: i64,
-    ) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
-        let host = account.imap_host.as_deref().unwrap_or("localhost");
-        let port = account.imap_port.unwrap_or(993) as u16;
-
-        let mut session = if account.auth_type == "oauth" {
-            let refresh_token = account
-                .refresh_token
-                .as_deref()
-                .ok_or("No refresh token configured")?;
-            let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
-                "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com"
-                    .to_string()
-            });
-            let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
-            let token = oauth::refresh_access_token(
-                "https://oauth2.googleapis.com/token",
-                &client_id,
-                &client_secret,
-                refresh_token,
-            )
-            .await?;
-            imap::connect_session_oauth(host, port, &account.email, &token.access_token).await?
-        } else {
-            let key_name = format!("pelliper:{}", account.email);
-            let password = self.secrets.get_password(&key_name).await?;
-            imap::connect_session_password_raw(host, port, &account.email, &password).await?
-        };
-
-        session.select_folder(folder_path).await?;
-        let raw_body = session.fetch_body(uid).await?;
-        session.logout().await;
-
-        let parsed = imap::parse_message_body(&raw_body);
-        let html = if parsed.html.is_empty() {
-            format!("<pre>{}</pre>", parsed.text)
-        } else {
-            parsed.html
-        };
-
-        Ok((html, parsed.has_attachments))
-    }
-
-    /// Cache body and update has_attachments flag.
-    async fn cache_body(
-        &self,
-        account_id: i64,
-        folder_path: &str,
-        uid: i64,
-        html: &str,
-        has_attachments: bool,
-    ) {
-        let cache = self.cache.lock().await;
-        if let Err(e) = cache.save_body(account_id, folder_path, uid, html) {
-            tracing::error!("Failed to cache body: {}", e);
-        }
-        if let Err(e) = cache.update_has_attachment(account_id, folder_path, uid, has_attachments) {
-            tracing::error!("Failed to update has_attachments: {}", e);
-        }
-        tracing::info!("Body loaded and cached for uid={}", uid);
+        "<p>No worker available for account</p>".to_string()
     }
 }
 
@@ -423,22 +354,33 @@ async fn main() {
 
     let secrets = Secrets::new();
 
-    let sync_engine = sync::SyncEngine::new(cache.clone(), secrets.clone());
-
-    // Spawn IDLE workers for all enabled accounts
-    let (idle_notify_tx, mut idle_notify_rx) = mpsc::channel::<idle::IdleNotification>(16);
-    let idle_router = std::sync::Arc::new(
-        idle::spawn_idle_workers(cache.clone(), secrets.clone(), idle_notify_tx.clone()),
-    );
-
-    tracing::info!("Pelliper daemon started, data dir: {:?}", data_dir);
+    // Spawn a background worker per enabled account. Each worker owns an IMAP
+    // session and runs the priority-ordered sync/backfill/prefetch/IDLE loop.
+    let workers: Arc<std::sync::Mutex<HashMap<i64, worker::WorkerHandle>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    {
+        let accounts = {
+            let cache_guard = cache.lock().await;
+            cache_guard.load_accounts().unwrap_or_default()
+        };
+        for account in &accounts {
+            if !account.enabled {
+                continue;
+            }
+            let handle = spawn_worker(account, cache.clone(), secrets.clone());
+            workers.lock().unwrap().insert(account.id, handle);
+        }
+        tracing::info!(
+            "Pelliper daemon started with {} worker(s), data dir: {:?}",
+            accounts.len(),
+            data_dir
+        );
+    }
 
     let daemon = Daemon {
         cache: cache.clone(),
         secrets,
-        sync_engine: sync_engine.clone(),
-        idle_router: idle_router.clone(),
-        idle_notify_tx: idle_notify_tx.clone(),
+        workers,
     };
 
     // Register on D-Bus session bus
@@ -453,36 +395,6 @@ async fn main() {
         .expect("Failed to start D-Bus server");
 
     tracing::info!("D-Bus server running as org.kde.pelliper.Daemon");
-
-    // Auto-sync on startup if accounts exist. Uses lazy sync: accounts with an
-    // existing cache render from cache immediately; only empty-cache accounts
-    // connect to the network to bootstrap. IDLE workers handle fresh mail.
-    {
-        let cache_guard = cache.lock().await;
-        if let Ok(count) = cache_guard.account_count() {
-            if count > 0 {
-                tracing::info!("Found {} account(s), starting lazy initial sync", count);
-                let sync = sync_engine.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    if let Err(e) = sync.sync_all_lazy().await {
-                        tracing::error!("Startup lazy sync failed: {}", e);
-                    }
-                });
-            }
-        }
-    }
-
-    // Handle IDLE notifications (cache already updated by workers)
-    tokio::spawn(async move {
-        while let Some(notification) = idle_notify_rx.recv().await {
-            tracing::info!(
-                "IDLE notification: account={} folder={}",
-                notification.account_id,
-                notification.folder_path
-            );
-        }
-    });
 
     // Keep the daemon running
     std::future::pending::<()>().await;
