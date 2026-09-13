@@ -877,6 +877,16 @@ impl Cache {
         })?;
         rows.collect::<Result<Vec<_>>>()
     }
+
+    /// Check if an email address is in the address book.
+    pub fn is_known_address(&self, email: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM addresses WHERE email = ?1",
+            rusqlite::params![email.to_lowercase()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
 }
 
 #[derive(Debug, Clone)]

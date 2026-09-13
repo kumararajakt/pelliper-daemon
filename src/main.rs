@@ -447,6 +447,12 @@ impl Daemon {
         }
     }
 
+    /// Check if an email address is a known sender (exists in address book).
+    async fn is_known_address(&self, email: &str) -> bool {
+        let cache = self.cache.lock().await;
+        cache.is_known_address(email).unwrap_or(false)
+    }
+
     /// Mark a message read/unread.
     async fn set_message_read(&self, account_id: i64, folder_path: &str, uid: i64, read: bool) {
         if let Some(handle) = self.get_worker(account_id) {
