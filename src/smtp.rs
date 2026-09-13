@@ -16,6 +16,8 @@ pub async fn send_email(
     account: &Account,
     to: &str,
     cc: &str,
+    bcc: Option<&str>,
+    reply_to: Option<&str>,
     subject: &str,
     body: &str,
     auth: &str,
@@ -37,6 +39,13 @@ pub async fn send_email(
     if let Some(refs) = references.filter(|s| !s.is_empty()) {
         builder = builder.references(refs.to_string());
     }
+    if let Some(r) = reply_to.filter(|s| !s.is_empty()) {
+        builder = builder.reply_to(
+            r.trim().parse().map_err(|e: lettre::address::AddressError| {
+                format!("Invalid Reply-To '{}': {}", r, e)
+            })?,
+        );
+    }
 
     for recipient in to.split([',', ';']) {
         let addr: Mailbox = recipient
@@ -52,6 +61,16 @@ pub async fn send_email(
             .parse()
             .map_err(|e: lettre::address::AddressError| format!("Invalid Cc '{}': {}", recipient, e))?;
         builder = builder.cc(addr);
+    }
+
+    if let Some(bcc) = bcc {
+        for recipient in bcc.split([',', ';']) {
+            let addr: Mailbox = recipient
+                .trim()
+                .parse()
+                .map_err(|e: lettre::address::AddressError| format!("Invalid Bcc '{}': {}", recipient, e))?;
+            builder = builder.bcc(addr);
+        }
     }
 
     // Prefer a plain-text part, but send HTML when the body looks like markup

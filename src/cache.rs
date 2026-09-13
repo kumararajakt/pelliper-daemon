@@ -35,6 +35,19 @@ pub struct AttachmentRecord {
     pub size: i64,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutboxItem {
+    pub id: i64,
+    pub account_id: i64,
+    pub to_addr: String,
+    pub cc_addr: Option<String>,
+    pub bcc_addr: Option<String>,
+    pub reply_to: Option<String>,
+    pub subject: String,
+    pub body: String,
+    pub attempts: i32,
+}
+
 impl Cache {
     pub fn open(data_dir: &PathBuf) -> Result<Self> {
         std::fs::create_dir_all(data_dir).ok();
@@ -713,6 +726,114 @@ impl Cache {
             rusqlite::params![new_refresh_token, account_id],
         )?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Outbox
+    // -----------------------------------------------------------------------
+
+    /// Store an unsent message so it can be retried when the daemon reconnects.
+    pub fn enqueue_outbox(
+        &self,
+        account_id: i64,
+        to_addr: &str,
+        cc_addr: &str,
+        bcc_addr: &str,
+        reply_to: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<i64> {
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO outbox (account_id, to_addr, cc_addr, bcc_addr, reply_to, subject, body, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                account_id,
+                to_addr,
+                cc_addr,
+                bcc_addr,
+                reply_to,
+                subject,
+                body,
+                created
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Load every unsent message (oldest first) for the background flusher.
+    pub fn load_pending_outbox(&self) -> Result<Vec<OutboxItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, account_id, to_addr, cc_addr, bcc_addr, reply_to, subject, body, attempts
+             FROM outbox ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(OutboxItem {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                to_addr: row.get(2)?,
+                cc_addr: row.get(3)?,
+                bcc_addr: row.get(4)?,
+                reply_to: row.get(5)?,
+                subject: row.get(6)?,
+                body: row.get(7)?,
+                attempts: row.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>>>()
+    }
+
+    /// Increment a queued message's retry counter, returning the new value.
+    pub fn increment_outbox_attempts(&self, id: i64) -> Result<i32> {
+        self.conn.execute(
+            "UPDATE outbox SET attempts = attempts + 1 WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        let attempts: i32 = self.conn.query_row(
+            "SELECT attempts FROM outbox WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )?;
+        Ok(attempts)
+    }
+
+    /// Remove a queued message once it's sent or permanently dropped.
+    pub fn delete_outbox(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
+        Ok(())
+    }
+
+    /// Load a single account by id (None if it no longer exists).
+    pub fn load_account(&self, account_id: i64) -> Result<Option<Account>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, refresh_token, enabled FROM accounts WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![account_id], |row| {
+            Ok(Account {
+                id: row.get(0)?,
+                email: row.get(1)?,
+                display_name: row.get(2)?,
+                provider: row.get(3)?,
+                auth_type: row.get(4)?,
+                imap_host: row.get(5)?,
+                imap_port: row.get(6)?,
+                imap_security: row.get(7)?,
+                smtp_host: row.get(8)?,
+                smtp_port: row.get(9)?,
+                smtp_security: row.get(10)?,
+                username: row.get(11)?,
+                refresh_token: row.get(12)?,
+                enabled: row.get(13)?,
+            })
+        })?;
+        match rows.next() {
+            Some(Ok(acc)) => Ok(Some(acc)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
     }
 }
 

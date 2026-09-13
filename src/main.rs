@@ -64,18 +64,30 @@ impl Daemon {
         );
         self.workers.lock().unwrap().insert(account.id, handle);
     }
+}
 
-    /// Refresh an OAuth access token for an account (Gmail).
-    async fn refresh_access_token(
-        &self,
-        account: &Account,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+/// Send an email via SMTP, resolving the account's auth secret first: a
+/// keyring password for password auth, a freshly refreshed XOAUTH2 access
+/// token for OAuth accounts.
+async fn send_with_auth(
+    secrets: &Secrets,
+    account: &Account,
+    to: &str,
+    cc: &str,
+    bcc: &str,
+    reply_to: &str,
+    subject: &str,
+    body: &str,
+    in_reply_to: Option<&str>,
+    references: Option<&str>,
+) -> Result<(), String> {
+    let auth: String = if account.auth_type == "oauth" {
         let refresh_token = account
             .refresh_token
             .as_deref()
-            .ok_or("No refresh token stored for account")?;
+            .ok_or_else(|| "No refresh token stored for account".to_string())?;
         let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
-            .map_err(|_| "PELLIPER_GOOGLE_CLIENT_ID not set (see ~/.local/share/pelliper/.env)")?;
+            .map_err(|_| "PELLIPER_GOOGLE_CLIENT_ID not set (see ~/.local/share/pelliper/.env)".to_string())?;
         let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
         let token = crate::oauth::refresh_access_token(
             "https://oauth2.googleapis.com/token",
@@ -83,8 +95,109 @@ impl Daemon {
             &client_secret,
             refresh_token,
         )
-        .await?;
-        Ok(token.access_token)
+        .await
+        .map_err(|e| format!("Failed to refresh access token: {}", e))?;
+        token.access_token
+    } else {
+        let key_name = format!("pelliper:{}", account.email);
+        secrets
+            .get_password(&key_name)
+            .await
+            .map_err(|e| format!("Failed to retrieve stored password: {}", e))?
+    };
+
+    crate::smtp::send_email(
+        account,
+        to,
+        cc,
+        Some(bcc),
+        Some(reply_to),
+        subject,
+        body,
+        &auth,
+        in_reply_to,
+        references,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// How often the background flusher polls the outbox for messages that failed
+/// to send. This is the "flush on reconnect" mechanism: any message that could
+/// not be delivered is retried on this cadence until it goes out or hits the
+/// attempt cap.
+const OUTBOX_FLUSH_INTERVAL_SECS: u64 = 30;
+
+/// Retry attempts before a stuck queued message is dropped permanently.
+const MAX_OUTBOX_ATTEMPTS: i32 = 10;
+
+/// Background task: periodically try to send every queued outbox message.
+/// Runs immediately at startup (so messages queued across daemon restarts are
+/// flushed on next launch), then on a fixed cadence.
+async fn outbox_flusher(cache: Arc<Mutex<Cache>>, secrets: Secrets) {
+    loop {
+        let items = cache.lock().await.load_pending_outbox().unwrap_or_default();
+        for item in items {
+            let account = {
+                let cache = cache.lock().await;
+                cache.load_account(item.account_id).ok().flatten()
+            };
+            let account = match account {
+                Some(a) => a,
+                None => {
+                    tracing::warn!(
+                        "outbox: account {} for item {} no longer exists, dropping",
+                        item.account_id,
+                        item.id
+                    );
+                    let _ = cache.lock().await.delete_outbox(item.id);
+                    continue;
+                }
+            };
+
+            match send_with_auth(
+                &secrets,
+                &account,
+                &item.to_addr,
+                item.cc_addr.as_deref().unwrap_or(""),
+                item.bcc_addr.as_deref().unwrap_or(""),
+                item.reply_to.as_deref().unwrap_or(""),
+                &item.subject,
+                &item.body,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!("outbox: flushed item {} to {}", item.id, item.to_addr);
+                    let _ = cache.lock().await.delete_outbox(item.id);
+                }
+                Err(e) => {
+                    let attempts = {
+                        let cache = cache.lock().await;
+                        cache.increment_outbox_attempts(item.id).unwrap_or(0)
+                    };
+                    if attempts >= MAX_OUTBOX_ATTEMPTS {
+                        tracing::error!(
+                            "outbox: item {} hit {} attempts, dropping: {}",
+                            item.id,
+                            MAX_OUTBOX_ATTEMPTS,
+                            e
+                        );
+                        let _ = cache.lock().await.delete_outbox(item.id);
+                    } else {
+                        tracing::warn!(
+                            "outbox: retry {} for item {} failed: {}",
+                            attempts,
+                            item.id,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(OUTBOX_FLUSH_INTERVAL_SECS)).await;
     }
 }
 
@@ -492,24 +605,20 @@ impl Daemon {
         let in_reply_to = in_reply_to.as_deref();
         let references = references.as_deref();
 
-        // SMTP auth secret: keyring password (password auth) or a freshly
-        // refreshed XOAUTH2 access token (OAuth).
-        let result = if account.auth_type == "oauth" {
-            let token = match self.refresh_access_token(&account).await {
-                Ok(token) => token,
-                Err(e) => return format!("Failed to refresh access token: {}", e),
-            };
-            smtp::send_email(&account, to, cc, subject, body, &token, in_reply_to, references).await
-        } else {
-            let key_name = format!("pelliper:{}", account.email);
-            let password = match self.secrets.get_password(&key_name).await {
-                Ok(p) => p,
-                Err(e) => return format!("Failed to retrieve stored password: {}", e),
-            };
-            smtp::send_email(&account, to, cc, subject, body, &password, in_reply_to, references).await
-        };
-
-        match result {
+        match send_with_auth(
+            &self.secrets,
+            &account,
+            to,
+            cc,
+            "",
+            "",
+            subject,
+            body,
+            in_reply_to,
+            references,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::info!(
                     "Sent email from {} to {}",
@@ -519,8 +628,18 @@ impl Daemon {
                 String::new()
             }
             Err(e) => {
-                let msg = format!("SMTP send failed: {}", e);
+                // Persist the message so the background flusher retries it once
+                // the connection recovers.
+                let msg = format!("SMTP send failed; queued for retry: {}", e);
                 tracing::error!("{}", msg);
+                {
+                    let cache = self.cache.lock().await;
+                    if let Err(qe) =
+                        cache.enqueue_outbox(account_id, to, cc, "", "", subject, body)
+                    {
+                        tracing::error!("Failed to queue message in outbox: {}", qe);
+                    }
+                }
                 msg
             }
         }
@@ -591,10 +710,14 @@ async fn main() {
 
     let daemon = Daemon {
         cache: cache.clone(),
-        secrets,
+        secrets: secrets.clone(),
         workers,
         attachments_dir: data_dir.join("attachments"),
     };
+
+    // Background outbox flusher: retries messages that failed to send until
+    // the connection recovers (also flushes anything queued before startup).
+    tokio::spawn(outbox_flusher(cache.clone(), secrets));
 
     // Register on D-Bus session bus
     let _conn = Builder::session()
