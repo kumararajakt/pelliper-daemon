@@ -429,6 +429,24 @@ impl Daemon {
         }
     }
 
+    /// Search the address book for autocomplete. Returns JSON array of
+    /// `{email, name}` objects.
+    async fn search_addresses(&self, query: &str) -> String {
+        let cache = self.cache.lock().await;
+        match cache.search_addresses(query, 10) {
+            Ok(results) => {
+                let items: Vec<serde_json::Value> = results
+                    .into_iter()
+                    .map(|(email, name)| {
+                        serde_json::json!({ "email": email, "name": name })
+                    })
+                    .collect();
+                serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+            }
+            Err(_) => "[]".to_string(),
+        }
+    }
+
     /// Mark a message read/unread.
     async fn set_message_read(&self, account_id: i64, folder_path: &str, uid: i64, read: bool) {
         if let Some(handle) = self.get_worker(account_id) {

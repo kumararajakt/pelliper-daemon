@@ -884,6 +884,10 @@ impl Worker {
                     &msg.message_id,
                     &msg.references,
                 );
+                // Record sender address for autocomplete.
+                if let Some((email, name)) = parse_address(&msg.sender) {
+                    let _ = cache.upsert_address(&email, &name);
+                }
             }
             // Use the whole-cache unread count, not just this page, so re-opens
             // and IDLE re-syncs don't undercount older unread mail.
@@ -1475,6 +1479,29 @@ fn attachment_fallback_name(content_type: &str, index: usize) -> String {
         }
     };
     format!("attachment_{}.{}", index, ext)
+}
+
+/// Parse an IMAP sender string like "John Doe <john@example.com>" into
+/// (email, display_name). Returns None if the string is empty or unparseable.
+fn parse_address(sender: &str) -> Option<(String, String)> {
+    let s = sender.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(start) = s.find('<') {
+        if let Some(end) = s.find('>') {
+            let email = s[start + 1..end].trim().to_string();
+            let name = s[..start].trim().trim_matches('"').to_string();
+            if !email.is_empty() {
+                return Some((email, name));
+            }
+        }
+    }
+    // Bare email address (no angle brackets).
+    if s.contains('@') && !s.contains(' ') {
+        return Some((s.to_string(), String::new()));
+    }
+    None
 }
 
 fn parse_idle_event(line: &str) -> Option<IdleResult> {

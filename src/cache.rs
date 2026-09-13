@@ -844,6 +844,39 @@ impl Cache {
             None => Ok(None),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Address book (autocomplete)
+    // -----------------------------------------------------------------------
+
+    /// Upsert a sender address (increment frequency on conflict).
+    pub fn upsert_address(&self, email: &str, display_name: &str) -> Result<()> {
+        if email.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO addresses (email, display_name, frequency) VALUES (?1, ?2, 1)
+             ON CONFLICT(email) DO UPDATE SET
+               display_name = CASE WHEN ?2 != '' THEN ?2 ELSE display_name END,
+               frequency = frequency + 1",
+            rusqlite::params![email.to_lowercase(), display_name],
+        )?;
+        Ok(())
+    }
+
+    /// Search addresses by prefix (email or display name), most used first.
+    pub fn search_addresses(&self, query: &str, limit: usize) -> Result<Vec<(String, String)>> {
+        let pattern = format!("%{}%", query.to_lowercase());
+        let mut stmt = self.conn.prepare(
+            "SELECT email, display_name FROM addresses
+             WHERE email LIKE ?1 OR display_name LIKE ?1
+             ORDER BY frequency DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>>>()
+    }
 }
 
 #[derive(Debug, Clone)]
