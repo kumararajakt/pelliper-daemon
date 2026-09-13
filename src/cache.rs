@@ -539,6 +539,34 @@ impl Cache {
         Ok(uids)
     }
 
+    /// UIDs of messages flagged as having attachments but with no attachment
+    /// files stored yet, newest first. Used by the attachment prefetch queue.
+    pub fn messages_missing_attachments(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.uid FROM messages m
+             WHERE m.account_id = ?1 AND m.folder_path = ?2 AND m.has_attachments = 1
+               AND NOT EXISTS (
+                   SELECT 1 FROM attachments a
+                   WHERE a.account_id = m.account_id
+                     AND a.folder_path = m.folder_path
+                     AND a.uid = m.uid
+               )
+             ORDER BY m.date DESC
+             LIMIT ?3",
+        )?;
+        let uids = stmt
+            .query_map(rusqlite::params![account_id, folder_path, limit as i64], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(uids)
+    }
+
     /// Count unread messages for a folder (from DB, not IMAP).
     pub fn count_unread(&self, account_id: i64, folder_path: &str) -> Result<i32> {
         let count: i32 = self.conn.query_row(

@@ -5,8 +5,9 @@
 //!
 //! 1. **User requests** — LoadMessages / LoadBody are served immediately.
 //! 2. **Body prefetch** — recent message bodies cached so opening is instant.
-//! 3. **Backfill** — remaining folder messages indexed in chunks.
-//! 4. **IDLE** — blocks for server push; re-syncs on mailbox change.
+//! 3. **Attachment prefetch** — attachments for older messages cached on disk.
+//! 4. **Backfill** — remaining folder messages indexed in chunks.
+//! 5. **IDLE** — blocks for server push; re-syncs on mailbox change.
 //!
 //! This replaces the separate SyncEngine + IdleRouter architecture with a
 //! single task per account that never lets background work starve the user.
@@ -35,6 +36,11 @@ const BACKFILL_CHUNK: usize = 1_000;
 /// Pre-download bodies for this many of the most recent messages so opening
 /// them is instant.  Older messages load on demand.
 const PREFETCH_BODY_LIMIT: usize = 50;
+
+/// Beyond the body-prefetch window, still download attachments for this many
+/// of the most recent messages flagged as having attachments, so viewing or
+/// saving them is instant. Older ones load on demand via LoadBody.
+const PREFETCH_ATTACHMENT_LIMIT: usize = 100;
 
 /// Fallback re-sync interval used when the worker is NOT actively IDLE-watching
 /// a folder (no folder selected yet, no session, or after a disconnect). IMAP
@@ -121,6 +127,8 @@ pub struct Worker {
 
     body_prefetch: VecDeque<(String, i64)>,
     body_prefetched: HashSet<(String, i64)>,
+    attachment_prefetch: VecDeque<(String, i64)>,
+    attachment_prefetched: HashSet<(String, i64)>,
     backfill_queue: VecDeque<BackfillJob>,
     /// A request deferred while we were inside an IDLE block, to be processed
     /// at the top of the priority loop.
@@ -153,6 +161,8 @@ impl Worker {
             current_folder: None,
             body_prefetch: VecDeque::new(),
             body_prefetched: HashSet::new(),
+            attachment_prefetch: VecDeque::new(),
+            attachment_prefetched: HashSet::new(),
             backfill_queue: VecDeque::new(),
             pending: None,
             shutdown: false,
@@ -209,7 +219,13 @@ impl Worker {
                 continue;
             }
 
-            // ---- Priority 2: backfill chunk (one chunk per iteration)
+            // ---- Priority 2: attachment prefetch (one per iteration)
+            if let Some((path, uid)) = self.attachment_prefetch.pop_front() {
+                self.run_one_attachment_prefetch(&path, uid).await;
+                continue;
+            }
+
+            // ---- Priority 3: backfill chunk (one chunk per iteration)
             if let Some(job) = self.backfill_queue.front_mut() {
                 let n = BACKFILL_CHUNK.min(job.remaining.len());
                 if n > 0 {
@@ -223,7 +239,7 @@ impl Worker {
                 }
             }
 
-            // ---- Priority 3: IDLE (blocks until push notification)
+            // ---- Priority 4: IDLE (blocks until push notification)
             if self.session.is_some() {
                 if let Some(folder) = self.current_folder.clone() {
                     match self.idle_wait(&folder).await {
@@ -711,6 +727,7 @@ impl Worker {
 
         // Queue background work for this folder.
         self.queue_body_prefetch(folder_path, &summaries).await;
+        self.queue_attachment_prefetch(folder_path).await;
         self.queue_backfill_for_folder(folder_path).await;
 
         tracing::info!(
@@ -781,6 +798,7 @@ impl Worker {
         );
         self.current_folder = Some(folder_path.clone());
         self.body_prefetch.clear();
+        self.attachment_prefetch.clear();
         self.backfill_queue.clear();
 
         match self.sync_folder_first_page(&folder_path).await {
@@ -974,6 +992,46 @@ impl Worker {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Background work: attachment prefetch
+    // -----------------------------------------------------------------------
+
+    /// Find messages flagged as having attachments that aren't stored on disk
+    /// yet and enqueue them for background download. The fetch reuses the body
+    /// fetch path (persist_parsed also writes attachment files), so messages
+    /// already queued for body prefetch are skipped to avoid double fetches.
+    async fn queue_attachment_prefetch(&mut self, folder_path: &str) {
+        let uids = {
+            let cache = self.cache.lock().await;
+            cache
+                .messages_missing_attachments(
+                    self.account.id,
+                    folder_path,
+                    PREFETCH_ATTACHMENT_LIMIT,
+                )
+                .unwrap_or_default()
+        };
+
+        for uid in uids {
+            let key = (folder_path.to_string(), uid);
+            if self.attachment_prefetched.contains(&key) {
+                continue;
+            }
+            if self.body_prefetch.iter().any(|k| k == &key) {
+                self.attachment_prefetched.insert(key);
+                continue;
+            }
+            self.attachment_prefetch.push_back(key.clone());
+            self.attachment_prefetched.insert(key);
+        }
+    }
+
+    /// Download one message's body + attachments. Same code path as body
+    /// prefetch; persist_parsed writes any attachment files found.
+    async fn run_one_attachment_prefetch(&mut self, folder_path: &str, uid: i64) {
+        self.run_one_body_prefetch(folder_path, uid).await;
     }
 
     // -----------------------------------------------------------------------
