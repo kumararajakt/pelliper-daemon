@@ -465,6 +465,44 @@ impl Daemon {
         }
     }
 
+    /// Delete a message: move to Trash if not already there, otherwise permanently delete.
+    async fn delete_message(&self, account_id: i64, folder_path: &str, uid: i64) {
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::DeleteMessage {
+                folder_path: folder_path.to_string(),
+                uid,
+            });
+        }
+    }
+
+    /// Create a new IMAP folder.
+    async fn create_folder(&self, account_id: i64, name: &str) {
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::CreateFolder {
+                name: name.to_string(),
+            });
+        }
+    }
+
+    /// Rename an IMAP folder.
+    async fn rename_folder(&self, account_id: i64, old_name: &str, new_name: &str) {
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::RenameFolder {
+                old_name: old_name.to_string(),
+                new_name: new_name.to_string(),
+            });
+        }
+    }
+
+    /// Delete an IMAP folder.
+    async fn delete_folder(&self, account_id: i64, name: &str) {
+        if let Some(handle) = self.get_worker(account_id) {
+            handle.send(worker::WorkerRequest::DeleteFolder {
+                name: name.to_string(),
+            });
+        }
+    }
+
     /// Load the body of a message. Returns HTML.
     /// Serves from cache when available; otherwise the worker fetches + caches
     /// and a second call returns the cached body.

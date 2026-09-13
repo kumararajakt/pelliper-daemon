@@ -469,6 +469,15 @@ impl Cache {
         Ok(())
     }
 
+    /// Remove a folder (and all its messages via CASCADE) from the cache.
+    pub fn delete_folder(&self, account_id: i64, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM folders WHERE account_id = ?1 AND path = ?2",
+            rusqlite::params![account_id, path],
+        )?;
+        Ok(())
+    }
+
     pub fn load_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, unread_count, noselect FROM folders WHERE account_id = ?1 ORDER BY path",

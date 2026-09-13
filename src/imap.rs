@@ -954,6 +954,57 @@ impl RawImapSession {
             .find(|f| f.kind == wanted && !f.noselect)
             .map(|f| f.path))
     }
+
+    /// Create a new IMAP folder.
+    pub async fn create_folder(
+        &mut self,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!("{} CREATE {}", tag, quote_imap_path(name)))
+            .await?;
+        let (tagged, _) = self.read_response(&tag).await?;
+        if !tagged.contains("OK") {
+            return Err(format!("CREATE failed: {}", tagged).into());
+        }
+        Ok(())
+    }
+
+    /// Rename an IMAP folder.
+    pub async fn rename_folder(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!(
+            "{} RENAME {} {}",
+            tag,
+            quote_imap_path(old_name),
+            quote_imap_path(new_name)
+        ))
+        .await?;
+        let (tagged, _) = self.read_response(&tag).await?;
+        if !tagged.contains("OK") {
+            return Err(format!("RENAME failed: {}", tagged).into());
+        }
+        Ok(())
+    }
+
+    /// Delete an IMAP folder.
+    pub async fn delete_folder(
+        &mut self,
+        name: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tag = self.next_tag();
+        self.send_command(&format!("{} DELETE {}", tag, quote_imap_path(name)))
+            .await?;
+        let (tagged, _) = self.read_response(&tag).await?;
+        if !tagged.contains("OK") {
+            return Err(format!("DELETE failed: {}", tagged).into());
+        }
+        Ok(())
+    }
 }
 
 /// Parse a LIST response line: * LIST (\flags) "delimiter" "name"

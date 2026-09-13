@@ -81,6 +81,24 @@ pub enum WorkerRequest {
         uid: i64,
         dest_folder: Option<String>,
     },
+    /// Delete a message: move to Trash if not already there, otherwise permanently delete.
+    DeleteMessage {
+        folder_path: String,
+        uid: i64,
+    },
+    /// Create a new IMAP folder.
+    CreateFolder {
+        name: String,
+    },
+    /// Rename an IMAP folder.
+    RenameFolder {
+        old_name: String,
+        new_name: String,
+    },
+    /// Delete an IMAP folder.
+    DeleteFolder {
+        name: String,
+    },
     /// Graceful shutdown.
     Shutdown,
 }
@@ -322,6 +340,18 @@ impl Worker {
             } => {
                 self.handle_move_message(&folder_path, uid, dest_folder).await;
             }
+            WorkerRequest::DeleteMessage { folder_path, uid } => {
+                self.handle_delete_message(&folder_path, uid).await;
+            }
+            WorkerRequest::CreateFolder { name } => {
+                self.handle_create_folder(&name).await;
+            }
+            WorkerRequest::RenameFolder { old_name, new_name } => {
+                self.handle_rename_folder(&old_name, &new_name).await;
+            }
+            WorkerRequest::DeleteFolder { name } => {
+                self.handle_delete_folder(&name).await;
+            }
             WorkerRequest::Shutdown => {
                 self.shutdown = true;
                 if let Some(mut s) = self.session.take() {
@@ -534,6 +564,142 @@ impl Worker {
                 Ok(())
             }
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Delete a message: if already in a Trash folder, permanently remove it
+    /// (flag \Deleted + EXPUNGE); otherwise move it to Trash as a soft delete.
+    async fn handle_delete_message(&mut self, folder_path: &str, uid: i64) {
+        if self.ensure_session().await.is_err() {
+            return;
+        }
+
+        let in_trash =
+            crate::imap::FolderKind::from_path(folder_path) == crate::imap::FolderKind::Trash;
+
+        if in_trash {
+            // Permanently delete: \Deleted + EXPUNGE
+            let session = self.session.as_mut();
+            if let Some(s) = session {
+                let _ = s.select_folder(folder_path).await;
+                let _ = s.store_flags(uid, &["\\Deleted"], &[]).await;
+                let _ = s.expunge().await;
+            }
+            let cache = self.cache.lock().await;
+            let _ = cache.delete_message(self.account.id, folder_path, uid);
+            let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+        } else {
+            // Soft delete: move to Trash
+            let session = self.session.as_mut();
+            let trash = match session {
+                Some(s) => match s.find_folder_by_kind(crate::imap::FolderKind::Trash).await {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        tracing::warn!(
+                            "Worker[{}]: no Trash folder found for delete",
+                            self.account.id
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("Worker[{}]: trash lookup failed: {}", self.account.id, e);
+                        return;
+                    }
+                },
+                None => return,
+            };
+            if self.do_move(folder_path, uid, &trash).await.is_ok() {
+                let cache = self.cache.lock().await;
+                let _ = cache.move_message(self.account.id, folder_path, uid, &trash);
+                let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+                let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+            }
+        }
+    }
+
+    async fn handle_create_folder(&mut self, name: &str) {
+        if self.ensure_session().await.is_err() {
+            return;
+        }
+        let session = match self.session.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if let Err(e) = session.create_folder(name).await {
+            tracing::error!("Worker[{}]: create folder failed: {}", self.account.id, e);
+            return;
+        }
+        // Refresh the folder list so the sidebar picks up the new folder.
+        match session.list_folders().await {
+            Ok(folders) => {
+                let cache = self.cache.lock().await;
+                for folder in folders {
+                    let _ = cache.upsert_folder(self.account.id, &folder.path, 0, folder.noselect);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Worker[{}]: list_folders failed: {}", self.account.id, e);
+            }
+        }
+    }
+
+    async fn handle_rename_folder(&mut self, old_name: &str, new_name: &str) {
+        if self.ensure_session().await.is_err() {
+            return;
+        }
+        let session = match self.session.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if let Err(e) = session.rename_folder(old_name, new_name).await {
+            tracing::error!("Worker[{}]: rename folder failed: {}", self.account.id, e);
+            return;
+        }
+        // Refresh the folder list.
+        match session.list_folders().await {
+            Ok(folders) => {
+                let cache = self.cache.lock().await;
+                for folder in folders {
+                    let _ = cache.upsert_folder(self.account.id, &folder.path, 0, folder.noselect);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Worker[{}]: list_folders failed: {}", self.account.id, e);
+            }
+        }
+    }
+
+    async fn handle_delete_folder(&mut self, name: &str) {
+        if self.ensure_session().await.is_err() {
+            return;
+        }
+        let session = match self.session.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+        if let Err(e) = session.delete_folder(name).await {
+            tracing::error!("Worker[{}]: delete folder failed: {}", self.account.id, e);
+            return;
+        }
+        // Remove from cache and refresh list.
+        {
+            let cache = self.cache.lock().await;
+            let _ = cache.delete_folder(self.account.id, name);
+        }
+        if let Some(s) = self.session.as_mut() {
+            match s.list_folders().await {
+                Ok(folders) => {
+                    let cache = self.cache.lock().await;
+                    for folder in folders {
+                        let _ =
+                            cache.upsert_folder(self.account.id, &folder.path, 0, folder.noselect);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Worker[{}]: list_folders failed: {}", self.account.id, e);
+                }
+            }
         }
     }
 
