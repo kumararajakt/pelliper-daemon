@@ -1,17 +1,16 @@
 use crate::cache::Account;
+use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
 use lettre::message::{Message, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
-/// Build and send an email through the account's SMTP relay.
-///
-/// `auth`: for OAuth accounts the XOAUTH2 access token (fresh — caller has
-/// already refreshed it); for password accounts the account's password.
-///
-/// `in_reply_to` / `references` are optional threading headers; the values are
-/// used verbatim (the original message-id / references chain from the cache,
-/// already including angle brackets and separated by spaces).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EmailAttachment {
+    pub path: String,
+    pub filename: String,
+}
+
 pub async fn send_email(
     account: &Account,
     to: &str,
@@ -23,6 +22,7 @@ pub async fn send_email(
     auth: &str,
     in_reply_to: Option<&str>,
     references: Option<&str>,
+    attachments: &[EmailAttachment],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let from: Mailbox = account
         .email
@@ -73,18 +73,38 @@ pub async fn send_email(
         }
     }
 
-    // Prefer a plain-text part, but send HTML when the body looks like markup
-    // (e.g. the message view's `<pre>` / HTML bodies).
-    let email = if body.trim_start().starts_with('<') {
-        builder.multipart(
-            MultiPart::alternative()
-                .singlepart(SinglePart::plain(body.to_string()))
-                .singlepart(SinglePart::html(body.to_string())),
-        )
+    let body_part = if body.trim_start().starts_with('<') {
+        MultiPart::alternative()
+            .singlepart(SinglePart::plain(body.to_string()))
+            .singlepart(SinglePart::html(body.to_string()))
     } else {
-        builder.body(body.to_string())
-    }
-    .map_err(|e| format!("Failed to build message: {}", e))?;
+        MultiPart::alternative()
+            .singlepart(SinglePart::plain(body.to_string()))
+            .singlepart(SinglePart::html(format!("<pre>{}</pre>", body)))
+    };
+
+    let email = if attachments.is_empty() {
+        builder
+            .multipart(body_part)
+            .map_err(|e| format!("Failed to build message: {}", e))?
+    } else {
+        let mut mixed = body_part;
+        for att in attachments {
+            let data = std::fs::read(&att.path)
+                .map_err(|e| format!("Failed to read attachment '{}': {}", att.filename, e))?;
+            let mime_type = mime_guess::from_path(&att.path)
+                .first_or_octet_stream();
+            let content_type = ContentType::parse(mime_type.essence_str())
+                .unwrap_or(ContentType::TEXT_PLAIN);
+            let mime_part = SinglePart::builder()
+                .header(content_type)
+                .body(data);
+            mixed = mixed.singlepart(mime_part);
+        }
+        builder
+            .multipart(mixed)
+            .map_err(|e| format!("Failed to build message: {}", e))?
+    };
 
     let host = account
         .smtp_host
@@ -92,8 +112,6 @@ pub async fn send_email(
         .ok_or("Account has no SMTP host configured")?;
     let port = account.smtp_port.unwrap_or(587) as u16;
 
-    // starttls_relay uses STARTTLS (port 587, the common default). If the
-    // account explicitly wants implicit TLS, switch to `relay` (port 465).
     let security = account.smtp_security.as_deref().unwrap_or("starttls");
     let builder = if security == "ssl" || security == "tls" {
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
@@ -107,9 +125,8 @@ pub async fn send_email(
         builder
             .credentials(Credentials::new(
                 account.email.clone(),
-                auth.to_string(), // access token used as the "secret"
+                auth.to_string(),
             ))
-            // Gmail requires the non-standard XOAUTH2 mechanism only.
             .authentication(vec![Mechanism::Xoauth2])
             .build()
     } else {

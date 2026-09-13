@@ -80,6 +80,7 @@ async fn send_with_auth(
     body: &str,
     in_reply_to: Option<&str>,
     references: Option<&str>,
+    attachments: &[smtp::EmailAttachment],
 ) -> Result<(), String> {
     let auth: String = if account.auth_type == "oauth" {
         let refresh_token = account
@@ -117,6 +118,7 @@ async fn send_with_auth(
         &auth,
         in_reply_to,
         references,
+        attachments,
     )
     .await
     .map_err(|e| e.to_string())
@@ -166,6 +168,7 @@ async fn outbox_flusher(cache: Arc<Mutex<Cache>>, secrets: Secrets) {
                 &item.body,
                 None,
                 None,
+                &[],
             )
             .await
             {
@@ -601,6 +604,7 @@ impl Daemon {
         body: &str,
         reply_folder_path: &str,
         reply_uid: i64,
+        attachment_paths: &str,
     ) -> String {
         let account = {
             let cache = self.cache.lock().await;
@@ -643,6 +647,13 @@ impl Daemon {
         let in_reply_to = in_reply_to.as_deref();
         let references = references.as_deref();
 
+        // Parse attachment paths from JSON array: ["path1","path2"]
+        let attachments: Vec<smtp::EmailAttachment> = if !attachment_paths.is_empty() {
+            serde_json::from_str(attachment_paths).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         match send_with_auth(
             &self.secrets,
             &account,
@@ -654,6 +665,7 @@ impl Daemon {
             body,
             in_reply_to,
             references,
+            &attachments,
         )
         .await
         {

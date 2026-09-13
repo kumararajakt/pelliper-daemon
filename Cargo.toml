@@ -36,3 +36,4 @@ base64 = "0.22"
 rfc2047-decoder = "1"
 tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
+mime_guess = "2"
