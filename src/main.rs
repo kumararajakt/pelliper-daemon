@@ -22,6 +22,7 @@ fn spawn_worker(
     account: &Account,
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,
+    attachments_dir: PathBuf,
 ) -> worker::WorkerHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let cache_clone = cache.clone();
@@ -29,7 +30,7 @@ fn spawn_worker(
     let account_clone = account.clone();
 
     tokio::spawn(async move {
-        let w = worker::Worker::new(account_clone, cache_clone, secrets_clone, rx);
+        let w = worker::Worker::new(account_clone, cache_clone, secrets_clone, rx, attachments_dir);
         w.run().await;
     });
 
@@ -40,6 +41,7 @@ struct Daemon {
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,
     workers: Arc<std::sync::Mutex<HashMap<i64, worker::WorkerHandle>>>,
+    attachments_dir: PathBuf,
 }
 
 impl Daemon {
@@ -54,7 +56,12 @@ impl Daemon {
         if existing {
             return;
         }
-        let handle = spawn_worker(account, self.cache.clone(), self.secrets.clone());
+        let handle = spawn_worker(
+            account,
+            self.cache.clone(),
+            self.secrets.clone(),
+            self.attachments_dir.clone(),
+        );
         self.workers.lock().unwrap().insert(account.id, handle);
     }
 
@@ -67,10 +74,8 @@ impl Daemon {
             .refresh_token
             .as_deref()
             .ok_or("No refresh token stored for account")?;
-        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
-            "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com"
-                .to_string()
-        });
+        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
+            .map_err(|_| "PELLIPER_GOOGLE_CLIENT_ID not set (see ~/.local/share/pelliper/.env)")?;
         let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
         let token = crate::oauth::refresh_access_token(
             "https://oauth2.googleapis.com/token",
@@ -383,6 +388,57 @@ impl Daemon {
         "<p>No worker available for account</p>".to_string()
     }
 
+    /// List downloaded attachments for a message.
+    ///
+    /// Serves from the attachments table; when nothing is stored yet but the
+    /// message was flagged as having attachments, asks the worker to fetch and
+    /// parse the body (which persists them) before re-reading the table.
+    /// Returns JSON array of `{name, file_path, content_type, size}`.
+    async fn list_attachments(&self, account_id: i64, folder_path: &str, uid: i64) -> String {
+        let has_attachments = {
+            let cache = self.cache.lock().await;
+            match cache.load_attachments(account_id, folder_path, uid) {
+                Ok(list) if !list.is_empty() => {
+                    return serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
+                }
+                Ok(_) => cache
+                    .message_has_attachments(account_id, folder_path, uid)
+                    .unwrap_or(false),
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to load attachments for account={} folder={} uid={}: {}",
+                        account_id,
+                        folder_path,
+                        uid,
+                        e
+                    );
+                    return "[]".to_string();
+                }
+            }
+        };
+
+        // No cached attachments: if the message claims to have them, the body
+        // (and thus the attachment list) hasn't been fetched yet — pull it now.
+        if has_attachments {
+            if let Some(handle) = self.get_worker(account_id) {
+                let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
+                handle.send(worker::WorkerRequest::LoadBody {
+                    folder_path: folder_path.to_string(),
+                    uid,
+                    reply: reply_tx,
+                });
+                let _ = reply_rx.recv().await;
+            }
+            let cache = self.cache.lock().await;
+            match cache.load_attachments(account_id, folder_path, uid) {
+                Ok(list) => serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string()),
+                Err(_) => "[]".to_string(),
+            }
+        } else {
+            "[]".to_string()
+        }
+    }
+
     /// Send an email via the account's SMTP relay. Returns an error string on
     /// failure (empty string on success).
     async fn send_email(
@@ -518,7 +574,12 @@ async fn main() {
             if !account.enabled {
                 continue;
             }
-            let handle = spawn_worker(account, cache.clone(), secrets.clone());
+            let handle = spawn_worker(
+                account,
+                cache.clone(),
+                secrets.clone(),
+                data_dir.join("attachments"),
+            );
             workers.lock().unwrap().insert(account.id, handle);
         }
         tracing::info!(
@@ -532,6 +593,7 @@ async fn main() {
         cache: cache.clone(),
         secrets,
         workers,
+        attachments_dir: data_dir.join("attachments"),
     };
 
     // Register on D-Bus session bus

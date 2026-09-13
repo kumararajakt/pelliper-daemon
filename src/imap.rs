@@ -1859,17 +1859,26 @@ fn parse_date(date_str: &str) -> i64 {
 // MIME body parsing (via mail-parser crate)
 // ---------------------------------------------------------------------------
 
+pub struct ParsedAttachment {
+    pub name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
 pub struct ParsedBody {
     pub html: String,
     pub text: String,
     pub has_attachments: bool,
+    pub attachments: Vec<ParsedAttachment>,
 }
 
-/// Parse a raw RFC822 message into HTML + plain text parts.
+/// Parse a raw RFC822 message into HTML + plain text parts, plus the list of
+/// real attachments (binary parts with a filename or an `attachment`
+/// disposition; inline `cid:` images are excluded).
 pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
-    use mail_parser::{MessageParser, PartType};
+    use mail_parser::{MimeHeaders, PartType};
 
-    let parsed = match MessageParser::default().parse(raw) {
+    let parsed = match mail_parser::MessageParser::default().parse(raw) {
         Some(p) => p,
         None => {
             let fallback = String::from_utf8_lossy(raw);
@@ -1877,9 +1886,33 @@ pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
                 html: format!("<pre>{}</pre>", html_escape(&fallback)),
                 text: fallback.to_string(),
                 has_attachments: false,
+                attachments: Vec::new(),
             };
         }
     };
+
+    let mut attachments = Vec::new();
+    for part in parsed.attachments() {
+        let name = part.attachment_name().unwrap_or("").trim().to_string();
+        let is_attachment = part
+            .content_disposition()
+            .map(|cd| cd.c_type.eq_ignore_ascii_case("attachment"))
+            .unwrap_or(false);
+        // Skip parts that are neither dispositioned as attachments nor named:
+        // typically embedded inline images (logo, emoji) referenced by cid:.
+        if !is_attachment && name.is_empty() {
+            continue;
+        }
+        let content_type = match part.content_type() {
+            Some(ct) => format!("{}/{}", ct.c_type, ct.c_subtype.as_deref().unwrap_or_default()),
+            None => "application/octet-stream".to_string(),
+        };
+        attachments.push(ParsedAttachment {
+            name,
+            content_type,
+            bytes: part.contents().to_vec(),
+        });
+    }
 
     // Collect HTML parts
     let mut html = String::new();
@@ -1905,8 +1938,9 @@ pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
         }
     }
 
-    // Check for attachments
-    let has_attachments = parsed.attachments().next().is_some();
+    // Check for attachments (matches the downloadable list above, so the
+    // paperclip indicator tracks the attachment panel).
+    let has_attachments = !attachments.is_empty();
 
     // If no HTML but we have text, wrap in <pre>
     if html.is_empty() && !text.is_empty() {
@@ -1928,7 +1962,7 @@ pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
         has_attachments
     );
 
-    ParsedBody { html, text, has_attachments }
+    ParsedBody { html, text, has_attachments, attachments }
 }
 
 fn html_escape(input: &str) -> String {

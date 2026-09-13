@@ -27,6 +27,14 @@ pub struct Message {
     pub preview: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttachmentRecord {
+    pub name: String,
+    pub file_path: String,
+    pub content_type: String,
+    pub size: i64,
+}
+
 impl Cache {
     pub fn open(data_dir: &PathBuf) -> Result<Self> {
         std::fs::create_dir_all(data_dir).ok();
@@ -144,6 +152,12 @@ impl Cache {
         );
         let _ = self.conn.execute(
             "ALTER TABLE messages ADD COLUMN references_ TEXT",
+            [],
+        );
+
+        // Migration: add size column to attachments (newer schema)
+        let _ = self.conn.execute(
+            "ALTER TABLE attachments ADD COLUMN size INTEGER DEFAULT 0",
             [],
         );
 
@@ -595,6 +609,73 @@ impl Cache {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// Replace the stored attachments for a message (delete + insert). Called
+    /// whenever a body is re-parsed, so attachment metadata stays in sync.
+    pub fn replace_attachments(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        attachments: &[AttachmentRecord],
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM attachments WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+            rusqlite::params![account_id, folder_path, uid],
+        )?;
+        for att in attachments {
+            self.conn.execute(
+                "INSERT INTO attachments (account_id, folder_path, uid, name, file_path, content_type, size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    account_id,
+                    folder_path,
+                    uid,
+                    att.name,
+                    att.file_path,
+                    att.content_type,
+                    att.size
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Load the attachment metadata for a message.
+    pub fn load_attachments(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+    ) -> Result<Vec<AttachmentRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, file_path, content_type, size FROM attachments
+             WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3
+             ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![account_id, folder_path, uid],
+            |row| {
+                Ok(AttachmentRecord {
+                    name: row.get(0)?,
+                    file_path: row.get(1)?,
+                    content_type: row.get(2)?,
+                    size: row.get(3)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>>>()
+    }
+
+    /// Whether the message's parsed body flagged it as having attachments.
+    pub fn message_has_attachments(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<bool> {
+        let has: i32 = self.conn.query_row(
+            "SELECT has_attachments FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+            rusqlite::params![account_id, folder_path, uid],
+            |row| row.get(0),
+        )?;
+        Ok(has != 0)
     }
 
     /// Update the refresh token for an account (when Google rotates it).

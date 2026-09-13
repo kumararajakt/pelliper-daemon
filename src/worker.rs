@@ -16,6 +16,7 @@ use crate::imap::{self, ImapMessageSummary, RawImapSession};
 use crate::secrets::Secrets;
 
 use std::collections::{HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -130,6 +131,9 @@ pub struct Worker {
     cached_access_token: Option<String>,
     /// Unix timestamp when cached_access_token expires (0 = unknown).
     token_expires_at: i64,
+    /// Directory where downloaded attachment files are stored (one folder per
+    /// message, files prefixed with the part index).
+    attachments_dir: PathBuf,
 }
 
 impl Worker {
@@ -138,6 +142,7 @@ impl Worker {
         cache: Arc<Mutex<Cache>>,
         secrets: Secrets,
         rx: mpsc::UnboundedReceiver<WorkerRequest>,
+        attachments_dir: PathBuf,
     ) -> Self {
         Self {
             account,
@@ -153,6 +158,7 @@ impl Worker {
             shutdown: false,
             cached_access_token: None,
             token_expires_at: 0,
+            attachments_dir,
         }
     }
 
@@ -560,10 +566,8 @@ impl Worker {
             .refresh_token
             .as_deref()
             .ok_or("No refresh token")?;
-        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").unwrap_or_else(|_| {
-            "780679832751-ckm5ak0vjhl6f7uj1h8b0lp63tnb7b3j.apps.googleusercontent.com"
-                .to_string()
-        });
+        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
+            .map_err(|_| "PELLIPER_GOOGLE_CLIENT_ID not set (see ~/.local/share/pelliper/.env)")?;
         let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
         let token = crate::oauth::refresh_access_token(
             "https://oauth2.googleapis.com/token",
@@ -577,7 +581,7 @@ impl Worker {
         if let Some(ref new_rt) = token.refresh_token {
             if new_rt != refresh_token {
                 tracing::info!("Worker[{}]: Google issued new refresh token, saving", self.account.id);
-                let mut cache = self.cache.lock().await;
+                let cache = self.cache.lock().await;
                 if let Err(e) = cache.update_refresh_token(self.account.id, new_rt) {
                     tracing::error!("Worker[{}]: failed to save new refresh token: {}", self.account.id, e);
                 } else {
@@ -816,10 +820,92 @@ impl Worker {
         let html = if parsed.html.is_empty() {
             format!("<pre>{}</pre>", parsed.text)
         } else {
-            parsed.html
+            parsed.html.clone()
         };
 
+        // Persist body + attachments so both are cached for offline/viewing.
+        self.persist_parsed(folder_path, uid, &html, &parsed).await;
+
         Ok((html, parsed.has_attachments))
+    }
+
+    /// Save the parsed body HTML and any attachment files for a message, then
+    /// refresh its `has_attachments` flag. Files land under
+    /// `attachments/<account>/<sanitized-folder>/<uid>/<index>_<name>`.
+    async fn persist_parsed(
+        &mut self,
+        folder_path: &str,
+        uid: i64,
+        html: &str,
+        parsed: &imap::ParsedBody,
+    ) {
+        {
+            let cache = self.cache.lock().await;
+            let _ = cache.save_body(self.account.id, folder_path, uid, html);
+            let _ = cache.update_has_attachment(
+                self.account.id,
+                folder_path,
+                uid,
+                parsed.has_attachments,
+            );
+        }
+
+        if parsed.attachments.is_empty() {
+            return;
+        }
+
+        let dir = self
+            .attachments_dir
+            .join(self.account.id.to_string())
+            .join(sanitize_path_component(folder_path))
+            .join(uid.to_string());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(
+                "Worker[{}]: failed to create attachment dir {:?}: {}",
+                self.account.id,
+                dir,
+                e
+            );
+            return;
+        }
+
+        let mut records = Vec::with_capacity(parsed.attachments.len());
+        for (i, att) in parsed.attachments.iter().enumerate() {
+            let fallback_name = attachment_fallback_name(&att.content_type, i);
+            let safe_name = sanitize_filename(&att.name, &fallback_name);
+            let full = dir.join(format!("{}_{}", i, safe_name));
+            if let Err(e) = std::fs::write(&full, &att.bytes) {
+                tracing::warn!(
+                    "Worker[{}]: failed to write attachment {:?}: {}",
+                    self.account.id,
+                    full,
+                    e
+                );
+                continue;
+            }
+            records.push(crate::cache::AttachmentRecord {
+                name: if att.name.is_empty() {
+                    fallback_name.clone()
+                } else {
+                    att.name.clone()
+                },
+                file_path: full.to_string_lossy().to_string(),
+                content_type: att.content_type.clone(),
+                size: att.bytes.len() as i64,
+            });
+        }
+
+        if !records.is_empty() {
+            let cache = self.cache.lock().await;
+            let _ = cache.replace_attachments(self.account.id, folder_path, uid, &records);
+            tracing::debug!(
+                "Worker[{}]: cached {} attachment(s) for {} uid={}",
+                self.account.id,
+                records.len(),
+                folder_path,
+                uid
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -869,16 +955,9 @@ impl Worker {
                 let html = if parsed.html.is_empty() {
                     format!("<pre>{}</pre>", parsed.text)
                 } else {
-                    parsed.html
+                    parsed.html.clone()
                 };
-                let cache = self.cache.lock().await;
-                let _ = cache.save_body(self.account.id, folder_path, uid, &html);
-                let _ = cache.update_has_attachment(
-                    self.account.id,
-                    folder_path,
-                    uid,
-                    parsed.has_attachments,
-                );
+                self.persist_parsed(folder_path, uid, &html, &parsed).await;
                 tracing::debug!(
                     "Worker[{}]: prefetched body for {} uid={}",
                     self.account.id,
@@ -1106,6 +1185,72 @@ enum IdleResult {
     Disconnected,
     /// A request arrived during IDLE; it was stored on `self.pending`.
     Request,
+}
+
+/// Map a folder path to a single safe directory component (e.g.
+/// `INBOX/Custom` -> `INBOX_Custom`), avoiding nested/absolute paths.
+fn sanitize_path_component(path: &str) -> String {
+    let clean: String = path
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "folder".to_string()
+    } else {
+        clean
+    }
+}
+
+/// Map an attachment's claimed name to a safe filename; falls back to a
+/// generated `attachment_<n>.ext` name when nothing usable is provided.
+fn sanitize_filename(name: &str, fallback: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    if clean.is_empty() || clean == "." {
+        fallback.to_string()
+    } else {
+        clean
+    }
+}
+
+/// Derive a default filename from a MIME type when a part has no name.
+fn attachment_fallback_name(content_type: &str, index: usize) -> String {
+    let lower = content_type.to_lowercase();
+    let ext = match lower.split('/').nth(1) {
+        Some("pdf") => "pdf",
+        Some("zip") => "zip",
+        Some("html") => "html",
+        Some("plain") => "txt",
+        Some("jpeg") => "jpg",
+        Some("png") => "png",
+        Some("gif") => "gif",
+        Some("octet-stream") | None => "bin",
+        Some(other) => {
+            if other.is_empty() {
+                "bin"
+            } else {
+                other
+            }
+        }
+    };
+    format!("attachment_{}.{}", index, ext)
 }
 
 fn parse_idle_event(line: &str) -> Option<IdleResult> {
