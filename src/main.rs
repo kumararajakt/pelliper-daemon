@@ -453,6 +453,41 @@ impl Daemon {
         cache.is_known_address(email).unwrap_or(false)
     }
 
+    /// Block a sender (remote content will be suppressed).
+    async fn block_sender(&self, sender_email: &str) {
+        let cache = self.cache.lock().await;
+        let _ = cache.set_sender_policy(sender_email, true, false);
+    }
+
+    /// Unblock a sender.
+    async fn unblock_sender(&self, sender_email: &str) {
+        let cache = self.cache.lock().await;
+        let _ = cache.remove_sender_policy(sender_email);
+    }
+
+    /// Check if a sender is blocked.
+    async fn is_sender_blocked(&self, sender_email: &str) -> bool {
+        let cache = self.cache.lock().await;
+        cache.is_sender_blocked(sender_email).unwrap_or(false)
+    }
+
+    /// Load all sender block/allow policies. Returns JSON array.
+    async fn load_sender_policies(&self) -> String {
+        let cache = self.cache.lock().await;
+        match cache.load_sender_policies() {
+            Ok(policies) => {
+                let items: Vec<serde_json::Value> = policies
+                    .into_iter()
+                    .map(|(email, blocked, allowed)| {
+                        serde_json::json!({ "email": email, "blocked": blocked, "allowed": allowed })
+                    })
+                    .collect();
+                serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
+            }
+            Err(_) => "[]".to_string(),
+        }
+    }
+
     /// Mark a message read/unread.
     async fn set_message_read(&self, account_id: i64, folder_path: &str, uid: i64, read: bool) {
         if let Some(handle) = self.get_worker(account_id) {

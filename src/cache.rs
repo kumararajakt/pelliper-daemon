@@ -887,6 +887,54 @@ impl Cache {
         )?;
         Ok(count > 0)
     }
+
+    // -----------------------------------------------------------------------
+    // Sender policies (allow/block)
+    // -----------------------------------------------------------------------
+
+    /// Set a sender policy: block or allow remote content for this sender.
+    pub fn set_sender_policy(&self, sender_email: &str, block_sender: bool, allow_remote: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sender_policies (sender_email, block_sender, allow_remote) VALUES (?1, ?2, ?3)
+             ON CONFLICT(sender_email) DO UPDATE SET block_sender = ?2, allow_remote = ?3",
+            rusqlite::params![sender_email.to_lowercase(), block_sender as i32, allow_remote as i32],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a sender policy entry.
+    pub fn remove_sender_policy(&self, sender_email: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sender_policies WHERE sender_email = ?1",
+            rusqlite::params![sender_email.to_lowercase()],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a sender is blocked.
+    pub fn is_sender_blocked(&self, sender_email: &str) -> Result<bool> {
+        let blocked: i32 = self.conn.query_row(
+            "SELECT block_sender FROM sender_policies WHERE sender_email = ?1",
+            rusqlite::params![sender_email.to_lowercase()],
+            |row| row.get(0),
+        ).unwrap_or(0);
+        Ok(blocked != 0)
+    }
+
+    /// Load all sender policies.
+    pub fn load_sender_policies(&self) -> Result<Vec<(String, bool, bool)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sender_email, block_sender, allow_remote FROM sender_policies ORDER BY sender_email"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)? != 0,
+                row.get::<_, i32>(2)? != 0,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>>>()
+    }
 }
 
 #[derive(Debug, Clone)]
