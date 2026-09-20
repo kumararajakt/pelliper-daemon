@@ -211,7 +211,7 @@ async fn outbox_flusher(cache: Arc<Mutex<Cache>>, secrets: Secrets) {
     }
 }
 
-#[interface(name = "org.kde.pelliper.Daemon")]
+#[interface(name = "app.pelliper.Daemon")]
 impl Daemon {
     /// Check if any accounts exist in the database.
     async fn has_accounts(&self) -> bool {
@@ -837,15 +837,15 @@ async fn main() {
     // Register on D-Bus session bus
     let _conn = Builder::session()
         .expect("Failed to connect to D-Bus session bus")
-        .name("org.kde.pelliper.Daemon")
+        .name("app.pelliper.Daemon")
         .expect("Failed to claim D-Bus name")
-        .serve_at("/org/kde/pelliper/Daemon", daemon)
+        .serve_at("/app/pelliper/Daemon", daemon)
         .expect("Failed to register D-Bus object")
         .build()
         .await
         .expect("Failed to start D-Bus server");
 
-    tracing::info!("D-Bus server running as org.kde.pelliper.Daemon");
+    tracing::info!("D-Bus server running as app.pelliper.Daemon");
 
     // Keep the daemon running
     std::future::pending::<()>().await;
