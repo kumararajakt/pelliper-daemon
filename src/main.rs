@@ -30,7 +30,13 @@ fn spawn_worker(
     let account_clone = account.clone();
 
     tokio::spawn(async move {
-        let w = worker::Worker::new(account_clone, cache_clone, secrets_clone, rx, attachments_dir);
+        let w = worker::Worker::new(
+            account_clone,
+            cache_clone,
+            secrets_clone,
+            rx,
+            attachments_dir,
+        );
         w.run().await;
     });
 
@@ -87,8 +93,9 @@ async fn send_with_auth(
             .refresh_token
             .as_deref()
             .ok_or_else(|| "No refresh token stored for account".to_string())?;
-        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
-            .map_err(|_| "PELLIPER_GOOGLE_CLIENT_ID not set (see ~/.local/share/pelliper/.env)".to_string())?;
+        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").map_err(|_| {
+            "PELLIPER_GOOGLE_CLIENT_ID not set (see ~/.local/share/pelliper/.env)".to_string()
+        })?;
         let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
         let token = crate::oauth::refresh_access_token(
             "https://oauth2.googleapis.com/token",
@@ -437,9 +444,7 @@ impl Daemon {
             Ok(results) => {
                 let items: Vec<serde_json::Value> = results
                     .into_iter()
-                    .map(|(email, name)| {
-                        serde_json::json!({ "email": email, "name": name })
-                    })
+                    .map(|(email, name)| serde_json::json!({ "email": email, "name": name }))
                     .collect();
                 serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string())
             }
@@ -501,7 +506,13 @@ impl Daemon {
     }
 
     /// Star/unstar a message.
-    async fn set_message_starred(&self, account_id: i64, folder_path: &str, uid: i64, starred: bool) {
+    async fn set_message_starred(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        starred: bool,
+    ) {
         if let Some(handle) = self.get_worker(account_id) {
             handle.send(worker::WorkerRequest::SetFlags {
                 folder_path: folder_path.to_string(),
@@ -729,11 +740,7 @@ impl Daemon {
         .await
         {
             Ok(()) => {
-                tracing::info!(
-                    "Sent email from {} to {}",
-                    account.email,
-                    to
-                );
+                tracing::info!("Sent email from {} to {}", account.email, to);
                 String::new()
             }
             Err(e) => {
@@ -743,8 +750,7 @@ impl Daemon {
                 tracing::error!("{}", msg);
                 {
                     let cache = self.cache.lock().await;
-                    if let Err(qe) =
-                        cache.enqueue_outbox(account_id, to, cc, "", "", subject, body)
+                    if let Err(qe) = cache.enqueue_outbox(account_id, to, cc, "", "", subject, body)
                     {
                         tracing::error!("Failed to queue message in outbox: {}", qe);
                     }

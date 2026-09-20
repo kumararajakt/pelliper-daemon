@@ -35,11 +35,7 @@ pub async fn refresh_access_token(
     ];
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(token_endpoint)
-        .form(&params)
-        .send()
-        .await?;
+    let resp = client.post(token_endpoint).form(&params).send().await?;
 
     let status = resp.status();
     let body = resp.text().await?;

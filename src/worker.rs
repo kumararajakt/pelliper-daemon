@@ -13,8 +13,11 @@
 //! single task per account that never lets background work starve the user.
 
 use crate::cache::{Account, Cache};
-use crate::imap::{self, ImapMessageSummary, RawImapSession};
+use crate::imap::{self, ImapMessageSummary, ImapSession};
 use crate::secrets::Secrets;
+
+use async_imap::imap_proto::types::{MailboxDatum, Response};
+use futures::StreamExt;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -65,9 +68,7 @@ pub enum WorkerRequest {
     SyncAll,
     /// Tell the worker to watch a specific folder: sync its first page and
     /// IDLE on it for push notifications.
-    SetIdleFolder {
-        folder_path: String,
-    },
+    SetIdleFolder { folder_path: String },
     /// Change read/starred flags on one message (None leaves a flag unchanged).
     SetFlags {
         folder_path: String,
@@ -82,23 +83,13 @@ pub enum WorkerRequest {
         dest_folder: Option<String>,
     },
     /// Delete a message: move to Trash if not already there, otherwise permanently delete.
-    DeleteMessage {
-        folder_path: String,
-        uid: i64,
-    },
+    DeleteMessage { folder_path: String, uid: i64 },
     /// Create a new IMAP folder.
-    CreateFolder {
-        name: String,
-    },
+    CreateFolder { name: String },
     /// Rename an IMAP folder.
-    RenameFolder {
-        old_name: String,
-        new_name: String,
-    },
+    RenameFolder { old_name: String, new_name: String },
     /// Delete an IMAP folder.
-    DeleteFolder {
-        name: String,
-    },
+    DeleteFolder { name: String },
     /// Graceful shutdown.
     Shutdown,
 }
@@ -140,7 +131,7 @@ pub struct Worker {
     secrets: Secrets,
     rx: mpsc::UnboundedReceiver<WorkerRequest>,
 
-    session: Option<RawImapSession>,
+    session: Option<ImapSession>,
     current_folder: Option<String>,
 
     body_prefetch: VecDeque<(String, i64)>,
@@ -196,15 +187,13 @@ impl Worker {
 
     pub async fn run(mut self) {
         let id = self.account.id;
-        tracing::info!(
-            "Worker[{}]: starting ({})",
-            id,
-            self.account.email
-        );
+        tracing::info!("Worker[{}]: starting ({})", id, self.account.email);
 
         // If the cache is cold we must bootstrap the folder list now;
-        // otherwise the UI renders from cache while we connect lazily.
-        if !self.has_cached_messages().await {
+        // otherwise the UI renders from cache while we connect lazily. Also
+        // bootstrap when messages survive but the folder table is empty: the
+        // sidebar would render empty and SyncAll would iterate zero folders.
+        if !self.has_cached_messages().await || self.cached_folders_missing().await {
             if let Err(e) = self.connect().await {
                 tracing::error!("Worker[{}]: bootstrap connect failed: {}", id, e);
             }
@@ -331,14 +320,16 @@ impl Worker {
                 is_read,
                 is_starred,
             } => {
-                self.handle_set_flags(&folder_path, uid, is_read, is_starred).await;
+                self.handle_set_flags(&folder_path, uid, is_read, is_starred)
+                    .await;
             }
             WorkerRequest::MoveMessage {
                 folder_path,
                 uid,
                 dest_folder,
             } => {
-                self.handle_move_message(&folder_path, uid, dest_folder).await;
+                self.handle_move_message(&folder_path, uid, dest_folder)
+                    .await;
             }
             WorkerRequest::DeleteMessage { folder_path, uid } => {
                 self.handle_delete_message(&folder_path, uid).await;
@@ -355,7 +346,7 @@ impl Worker {
             WorkerRequest::Shutdown => {
                 self.shutdown = true;
                 if let Some(mut s) = self.session.take() {
-                    s.logout().await;
+                    let _ = s.logout().await;
                 }
             }
         }
@@ -382,7 +373,10 @@ impl Worker {
             Err(e) => {
                 // On auth error, invalidate token so reconnect gets a fresh one
                 if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" {
-                    tracing::warn!("Worker[{}]: auth error in load_body, refreshing token", self.account.id);
+                    tracing::warn!(
+                        "Worker[{}]: auth error in load_body, refreshing token",
+                        self.account.id
+                    );
                     self.invalidate_token();
                 } else {
                     self.session = None;
@@ -392,7 +386,10 @@ impl Worker {
                         let cache = self.cache.lock().await;
                         let _ = cache.save_body(self.account.id, folder_path, uid, &html);
                         let _ = cache.update_has_attachment(
-                            self.account.id, folder_path, uid, has_attachments,
+                            self.account.id,
+                            folder_path,
+                            uid,
+                            has_attachments,
                         );
                         html
                     }
@@ -403,6 +400,15 @@ impl Worker {
     }
 
     async fn handle_sync_all(&mut self) {
+        // SyncAll is the UI's startup trigger and the "sync now" switch. Make
+        // sure the session is live first: `connect()` refreshes the folder list
+        // from the server, so a cache holding stale messages but an empty
+        // folder table (empty sidebar) self-heals instead of iterating zero
+        // folders and doing nothing.
+        if let Err(e) = self.ensure_session().await {
+            tracing::error!("Worker[{}]: sync_all: no session: {}", self.account.id, e);
+            return;
+        }
         let folders = {
             let cache = self.cache.lock().await;
             cache.load_folders(self.account.id).unwrap_or_default()
@@ -438,10 +444,18 @@ impl Worker {
         let mut add: Vec<&str> = Vec::new();
         let mut remove: Vec<&str> = Vec::new();
         if let Some(read) = is_read {
-            if read { add.push("\\Seen"); } else { remove.push("\\Seen"); }
+            if read {
+                add.push("\\Seen");
+            } else {
+                remove.push("\\Seen");
+            }
         }
         if let Some(starred) = is_starred {
-            if starred { add.push("\\Flagged"); } else { remove.push("\\Flagged"); }
+            if starred {
+                add.push("\\Flagged");
+            } else {
+                remove.push("\\Flagged");
+            }
         }
 
         if self.ensure_session().await.is_err() {
@@ -452,7 +466,10 @@ impl Worker {
         if result.is_err() {
             let e = result.unwrap_err();
             if Self::is_auth_error(&e) && self.account.auth_type == "oauth" {
-                tracing::warn!("Worker[{}]: auth error in set_flags, refreshing token", self.account.id);
+                tracing::warn!(
+                    "Worker[{}]: auth error in set_flags, refreshing token",
+                    self.account.id
+                );
                 self.invalidate_token();
                 if self.ensure_session().await.is_err() {
                     return;
@@ -463,8 +480,11 @@ impl Worker {
 
         {
             let cache = self.cache.lock().await;
-            let _ = cache.update_message_flags(self.account.id, folder_path, uid, is_read, is_starred);
-            let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+            let _ =
+                cache.update_message_flags(self.account.id, folder_path, uid, is_read, is_starred);
+            let unread = cache
+                .count_unread(self.account.id, folder_path)
+                .unwrap_or(0);
             let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         }
     }
@@ -477,9 +497,17 @@ impl Worker {
         add: &[&str],
         remove: &[&str],
     ) -> Result<(), String> {
-        let session = self.session.as_mut().ok_or_else(|| "no session".to_string())?;
-        session.select_folder(folder_path).await.map_err(|e| e.to_string())?;
-        session.store_flags(uid, add, remove).await.map_err(|e| e.to_string())?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "no session".to_string())?;
+        session
+            .select(folder_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        imap::store_flags(session, uid, add, remove)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -500,20 +528,26 @@ impl Worker {
             _ => {
                 let session = self.session.as_mut();
                 match session {
-                    Some(s) => match s.find_folder_by_kind(crate::imap::FolderKind::Trash).await {
-                        Ok(Some(t)) => t,
-                        Ok(None) => {
-                            tracing::warn!(
-                                "Worker[{}]: no Trash folder found for move",
-                                self.account.id
-                            );
-                            return;
+                    Some(s) => {
+                        match imap::find_folder_by_kind(s, crate::imap::FolderKind::Trash).await {
+                            Ok(Some(t)) => t,
+                            Ok(None) => {
+                                tracing::warn!(
+                                    "Worker[{}]: no Trash folder found for move",
+                                    self.account.id
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Worker[{}]: trash lookup failed: {}",
+                                    self.account.id,
+                                    e
+                                );
+                                return;
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!("Worker[{}]: trash lookup failed: {}", self.account.id, e);
-                            return;
-                        }
-                    },
+                    }
                     None => return,
                 }
             }
@@ -523,7 +557,10 @@ impl Worker {
         let move_result = self.do_move(folder_path, uid, &dest).await;
         if let Err(ref e) = move_result {
             if Self::is_auth_error(e) && self.account.auth_type == "oauth" {
-                tracing::warn!("Worker[{}]: auth error in move, refreshing token", self.account.id);
+                tracing::warn!(
+                    "Worker[{}]: auth error in move, refreshing token",
+                    self.account.id
+                );
                 self.invalidate_token();
                 if self.ensure_session().await.is_ok() {
                     let _ = self.do_move(folder_path, uid, &dest).await;
@@ -534,7 +571,9 @@ impl Worker {
         {
             let cache = self.cache.lock().await;
             let _ = cache.move_message(self.account.id, folder_path, uid, &dest);
-            let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+            let unread = cache
+                .count_unread(self.account.id, folder_path)
+                .unwrap_or(0);
             let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         }
 
@@ -542,29 +581,43 @@ impl Worker {
         if let Err(e) = self.sync_folder_first_page(&dest).await {
             tracing::error!(
                 "Worker[{}]: refresh {} after move failed: {}",
-                self.account.id, dest, e
+                self.account.id,
+                dest,
+                e
             );
         }
         return;
     }
 
     async fn do_move(&mut self, folder_path: &str, uid: i64, dest: &str) -> Result<(), String> {
-        let session = self.session.as_mut().ok_or_else(|| "no session".to_string())?;
-        session.select_folder(folder_path).await.map_err(|e| e.to_string())?;
-        match session.uid_move(uid, dest).await {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                tracing::info!(
-                    "Worker[{}]: UID MOVE unsupported, using COPY + EXPUNGE",
-                    self.account.id
-                );
-                session.uid_copy(uid, dest).await.map_err(|e| e.to_string())?;
-                session.store_flags(uid, &["\\Deleted"], &[]).await.map_err(|e| e.to_string())?;
-                session.expunge().await.map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            Err(e) => Err(e.to_string()),
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "no session".to_string())?;
+        session
+            .select(folder_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        // `uid_mv` fails (tagged error) when the server lacks RFC 6851; fall
+        // back to COPY + \Deleted + EXPUNGE.
+        if let Err(e) = session.uid_mv(uid.to_string(), dest).await {
+            tracing::info!(
+                "Worker[{}]: UID MOVE unsupported ({}), using COPY + EXPUNGE",
+                self.account.id,
+                e
+            );
+            session
+                .uid_copy(uid.to_string(), dest)
+                .await
+                .map_err(|e| e.to_string())?;
+            imap::store_flags(session, uid, &["\\Deleted"], &[])
+                .await
+                .map_err(|e| e.to_string())?;
+            let expunge = session.expunge().await.map_err(|e| e.to_string())?;
+            futures::pin_mut!(expunge);
+            while expunge.next().await.is_some() {}
         }
+        Ok(())
     }
 
     /// Delete a message: if already in a Trash folder, permanently remove it
@@ -581,19 +634,25 @@ impl Worker {
             // Permanently delete: \Deleted + EXPUNGE
             let session = self.session.as_mut();
             if let Some(s) = session {
-                let _ = s.select_folder(folder_path).await;
-                let _ = s.store_flags(uid, &["\\Deleted"], &[]).await;
-                let _ = s.expunge().await;
+                let _ = s.select(folder_path).await;
+                let _ = imap::store_flags(s, uid, &["\\Deleted"], &[]).await;
+                if let Ok(expunge) = s.expunge().await {
+                    futures::pin_mut!(expunge);
+                    while expunge.next().await.is_some() {}
+                }
             }
             let cache = self.cache.lock().await;
             let _ = cache.delete_message(self.account.id, folder_path, uid);
-            let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+            let unread = cache
+                .count_unread(self.account.id, folder_path)
+                .unwrap_or(0);
             let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         } else {
             // Soft delete: move to Trash
             let session = self.session.as_mut();
             let trash = match session {
-                Some(s) => match s.find_folder_by_kind(crate::imap::FolderKind::Trash).await {
+                Some(s) => match imap::find_folder_by_kind(s, crate::imap::FolderKind::Trash).await
+                {
                     Ok(Some(t)) => t,
                     Ok(None) => {
                         tracing::warn!(
@@ -612,7 +671,9 @@ impl Worker {
             if self.do_move(folder_path, uid, &trash).await.is_ok() {
                 let cache = self.cache.lock().await;
                 let _ = cache.move_message(self.account.id, folder_path, uid, &trash);
-                let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+                let unread = cache
+                    .count_unread(self.account.id, folder_path)
+                    .unwrap_or(0);
                 let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
             }
         }
@@ -626,16 +687,22 @@ impl Worker {
             Some(s) => s,
             None => return,
         };
-        if let Err(e) = session.create_folder(name).await {
+        if let Err(e) = session.create(name).await {
             tracing::error!("Worker[{}]: create folder failed: {}", self.account.id, e);
             return;
         }
         // Refresh the folder list so the sidebar picks up the new folder.
-        match session.list_folders().await {
+        match imap::list_folders(session).await {
             Ok(folders) => {
                 let cache = self.cache.lock().await;
                 for folder in folders {
-                    let _ = cache.upsert_folder(self.account.id, &folder.path, 0, folder.noselect);
+                    let _ = cache.upsert_folder(
+                        self.account.id,
+                        &folder.path,
+                        0,
+                        folder.noselect,
+                        folder.kind.as_str(),
+                    );
                 }
             }
             Err(e) => {
@@ -652,16 +719,22 @@ impl Worker {
             Some(s) => s,
             None => return,
         };
-        if let Err(e) = session.rename_folder(old_name, new_name).await {
+        if let Err(e) = session.rename(old_name, new_name).await {
             tracing::error!("Worker[{}]: rename folder failed: {}", self.account.id, e);
             return;
         }
         // Refresh the folder list.
-        match session.list_folders().await {
+        match imap::list_folders(session).await {
             Ok(folders) => {
                 let cache = self.cache.lock().await;
                 for folder in folders {
-                    let _ = cache.upsert_folder(self.account.id, &folder.path, 0, folder.noselect);
+                    let _ = cache.upsert_folder(
+                        self.account.id,
+                        &folder.path,
+                        0,
+                        folder.noselect,
+                        folder.kind.as_str(),
+                    );
                 }
             }
             Err(e) => {
@@ -678,7 +751,7 @@ impl Worker {
             Some(s) => s,
             None => return,
         };
-        if let Err(e) = session.delete_folder(name).await {
+        if let Err(e) = session.delete(name).await {
             tracing::error!("Worker[{}]: delete folder failed: {}", self.account.id, e);
             return;
         }
@@ -688,12 +761,17 @@ impl Worker {
             let _ = cache.delete_folder(self.account.id, name);
         }
         if let Some(s) = self.session.as_mut() {
-            match s.list_folders().await {
+            match imap::list_folders(s).await {
                 Ok(folders) => {
                     let cache = self.cache.lock().await;
                     for folder in folders {
-                        let _ =
-                            cache.upsert_folder(self.account.id, &folder.path, 0, folder.noselect);
+                        let _ = cache.upsert_folder(
+                            self.account.id,
+                            &folder.path,
+                            0,
+                            folder.noselect,
+                            folder.kind.as_str(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -712,12 +790,17 @@ impl Worker {
         let mut session = self.connect_session().await?;
 
         // Refresh the folder list so the UI's sidebar is never empty.
-        match session.list_folders().await {
+        match imap::list_folders(&mut session).await {
             Ok(folders) => {
                 let cache = self.cache.lock().await;
                 for folder in folders {
-                    let _ = cache
-                        .upsert_folder(self.account.id, &folder.path, 0, folder.noselect);
+                    let _ = cache.upsert_folder(
+                        self.account.id,
+                        &folder.path,
+                        0,
+                        folder.noselect,
+                        folder.kind.as_str(),
+                    );
                 }
             }
             Err(e) => {
@@ -731,7 +814,9 @@ impl Worker {
 
     /// Get a valid OAuth access token, refreshing if expired or about to expire.
     /// Refreshes 5 minutes before expiry to avoid race conditions.
-    async fn get_valid_access_token(&mut self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn get_valid_access_token(
+        &mut self,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let now = chrono::Utc::now().timestamp();
         // Refresh 5 minutes (300s) before expiry
         let buffer = 300;
@@ -762,10 +847,17 @@ impl Worker {
         // Save new refresh token if Google issued one (rotation)
         if let Some(ref new_rt) = token.refresh_token {
             if new_rt != refresh_token {
-                tracing::info!("Worker[{}]: Google issued new refresh token, saving", self.account.id);
+                tracing::info!(
+                    "Worker[{}]: Google issued new refresh token, saving",
+                    self.account.id
+                );
                 let cache = self.cache.lock().await;
                 if let Err(e) = cache.update_refresh_token(self.account.id, new_rt) {
-                    tracing::error!("Worker[{}]: failed to save new refresh token: {}", self.account.id, e);
+                    tracing::error!(
+                        "Worker[{}]: failed to save new refresh token: {}",
+                        self.account.id,
+                        e
+                    );
                 } else {
                     // Update the in-memory account so future refreshes use the new token
                     self.account.refresh_token = Some(new_rt.clone());
@@ -788,8 +880,12 @@ impl Worker {
 
     async fn connect_session(
         &mut self,
-    ) -> Result<RawImapSession, Box<dyn std::error::Error + Send + Sync>> {
-        let host = self.account.imap_host.clone().unwrap_or_else(|| "localhost".to_string());
+    ) -> Result<ImapSession, Box<dyn std::error::Error + Send + Sync>> {
+        let host = self
+            .account
+            .imap_host
+            .clone()
+            .unwrap_or_else(|| "localhost".to_string());
         let port = self.account.imap_port.unwrap_or(993) as u16;
         let email = self.account.email.clone();
 
@@ -799,7 +895,7 @@ impl Worker {
         } else {
             let key_name = format!("pelliper:{}", email);
             let password = self.secrets.get_password(&key_name).await?;
-            imap::connect_session_password_raw(&host, port, &email, &password).await
+            imap::connect_session_password(&host, port, &email, &password).await
         }
     }
 
@@ -816,7 +912,10 @@ impl Worker {
     fn is_auth_error(e: &str) -> bool {
         let lower = e.to_lowercase();
         lower.contains("auth")
-            && (lower.contains("fail") || lower.contains("invalid") || lower.contains("expired") || lower.contains("rejected"))
+            && (lower.contains("fail")
+                || lower.contains("invalid")
+                || lower.contains("expired")
+                || lower.contains("rejected"))
             || lower.contains("no longer valid")
             || lower.contains("invalid credentials")
     }
@@ -839,7 +938,8 @@ impl Worker {
         &mut self,
         folder_path: &str,
     ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
-        self.ensure_session().await
+        self.ensure_session()
+            .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let session = self.session.as_mut().ok_or("no session")?;
 
@@ -847,22 +947,31 @@ impl Worker {
         // re-opens get a lighter refresh.
         let cached = {
             let cache = self.cache.lock().await;
-            cache.count_messages(self.account.id, folder_path).unwrap_or(0)
+            cache
+                .count_messages(self.account.id, folder_path)
+                .unwrap_or(0)
         };
-        let page_size = if cached == 0 { FIRST_PAGE_SIZE } else { REOPEN_PAGE_SIZE };
+        let page_size = if cached == 0 {
+            FIRST_PAGE_SIZE
+        } else {
+            REOPEN_PAGE_SIZE
+        };
 
-        let summaries = session
-            .fetch_recent_summaries(folder_path, page_size)
-            .await;
+        let summaries = imap::fetch_recent_summaries(session, folder_path, page_size).await;
 
         let summaries = match summaries {
             Ok(s) => s,
             Err(e) if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" => {
-                tracing::warn!("Worker[{}]: auth error in sync_folder_first_page, refreshing token", self.account.id);
+                tracing::warn!(
+                    "Worker[{}]: auth error in sync_folder_first_page, refreshing token",
+                    self.account.id
+                );
                 self.invalidate_token();
-                self.connect().await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+                self.connect()
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
                 let session = self.session.as_mut().ok_or("no session after reconnect")?;
-                session.fetch_recent_summaries(folder_path, page_size).await?
+                imap::fetch_recent_summaries(session, folder_path, page_size).await?
             }
             Err(e) => return Err(e),
         };
@@ -891,7 +1000,9 @@ impl Worker {
             }
             // Use the whole-cache unread count, not just this page, so re-opens
             // and IDLE re-syncs don't undercount older unread mail.
-            let unread = cache.count_unread(self.account.id, folder_path).unwrap_or(0);
+            let unread = cache
+                .count_unread(self.account.id, folder_path)
+                .unwrap_or(0);
             let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         }
 
@@ -952,7 +1063,12 @@ impl Worker {
         match self.sync_folder_first_page(&folder).await {
             Ok(_summaries) => {}
             Err(e) => {
-                tracing::warn!("Worker[{}]: periodic resync of {} failed: {}", id, folder, e);
+                tracing::warn!(
+                    "Worker[{}]: periodic resync of {} failed: {}",
+                    id,
+                    folder,
+                    e
+                );
                 self.session = None;
             }
         }
@@ -997,12 +1113,12 @@ impl Worker {
         folder_path: &str,
         uid: i64,
     ) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
-        self.ensure_session().await
+        self.ensure_session()
+            .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let session = self.session.as_mut().ok_or("no session")?;
 
-        session.select_folder(folder_path).await?;
-        let raw = session.fetch_body(uid).await?;
+        let raw = imap::fetch_body(session, folder_path, uid).await?;
 
         let parsed = imap::parse_message_body(&raw);
         let html = if parsed.html.is_empty() {
@@ -1100,11 +1216,7 @@ impl Worker {
     // Background work: body prefetch
     // -----------------------------------------------------------------------
 
-    async fn queue_body_prefetch(
-        &mut self,
-        folder_path: &str,
-        summaries: &[ImapMessageSummary],
-    ) {
+    async fn queue_body_prefetch(&mut self, folder_path: &str, summaries: &[ImapMessageSummary]) {
         let cache = self.cache.lock().await;
         for msg in summaries.iter().take(PREFETCH_BODY_LIMIT) {
             let key = (folder_path.to_string(), msg.uid);
@@ -1132,12 +1244,7 @@ impl Worker {
             None => return,
         };
 
-        if session.select_folder(folder_path).await.is_err() {
-            self.session = None;
-            return;
-        }
-
-        match session.fetch_body(uid).await {
+        match imap::fetch_body(session, folder_path, uid).await {
             Ok(raw) => {
                 let parsed = imap::parse_message_body(&raw);
                 let html = if parsed.html.is_empty() {
@@ -1210,7 +1317,11 @@ impl Worker {
 
     async fn queue_backfill_for_folder(&mut self, folder_path: &str) {
         // Don't double-queue.
-        if self.backfill_queue.iter().any(|j| j.folder_path == folder_path) {
+        if self
+            .backfill_queue
+            .iter()
+            .any(|j| j.folder_path == folder_path)
+        {
             return;
         }
 
@@ -1260,10 +1371,11 @@ impl Worker {
         &mut self,
         folder_path: &str,
     ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
-        self.ensure_session().await
+        self.ensure_session()
+            .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let session = self.session.as_mut().ok_or("no session")?;
-        session.fetch_all_uids(folder_path).await
+        imap::fetch_all_uids(session, folder_path).await
     }
 
     async fn run_backfill_chunk(&mut self, folder_path: &str, chunk: &[i64]) {
@@ -1278,7 +1390,7 @@ impl Worker {
         let uid_set: Vec<String> = chunk.iter().map(|u| u.to_string()).collect();
         let uid_set_str = uid_set.join(",");
 
-        match session.fetch_summaries_by_uids(&uid_set_str).await {
+        match imap::fetch_summaries_by_uids(session, folder_path, &uid_set_str).await {
             Ok(summaries) => {
                 let cache = self.cache.lock().await;
                 for msg in &summaries {
@@ -1320,31 +1432,24 @@ impl Worker {
     // -----------------------------------------------------------------------
 
     async fn idle_wait(&mut self, folder_path: &str) -> IdleResult {
-        let session = match self.session.as_mut() {
+        let mut session = match self.session.take() {
             Some(s) => s,
             None => return IdleResult::Disconnected,
         };
 
-        if session.select_folder(folder_path).await.is_err() {
+        if session.select(folder_path).await.is_err() {
+            self.session = Some(session);
             return IdleResult::Disconnected;
         }
 
-        if session.idle_start().await.is_err() {
+        let mut handle = session.idle();
+        if handle.init().await.is_err() {
             return IdleResult::Disconnected;
         }
 
-        // current_tag() is read AFTER idle_start(), which increments the tag.
-        let tag_num = session.current_tag();
-
-        tracing::debug!(
-            "Worker[{}]: IDLE on {} (tag T{})",
-            self.account.id,
-            folder_path,
-            tag_num
-        );
+        tracing::debug!("Worker[{}]: IDLE on {}", self.account.id, folder_path);
 
         let idle_timeout = tokio::time::Duration::from_secs(29 * 60);
-        let idle_tag = format!("T{}", tag_num);
 
         let result = tokio::time::timeout(idle_timeout, async {
             loop {
@@ -1367,20 +1472,26 @@ impl Worker {
                     }
                 }
 
-                match session.idle_read_line().await {
-                    Ok(Some(line)) => {
-                        if let Some(event) = parse_idle_event(&line) {
+                // Poll the IDLE stream so requests stay responsive even when
+                // the server is quiet; IDLE responses drive mailbox changes.
+                match tokio::time::timeout(tokio::time::Duration::from_millis(500), handle.next())
+                    .await
+                {
+                    Ok(Some(Ok(resp))) => {
+                        if let Some(event) = idle_event_from_response(resp.parsed()) {
                             return event;
                         }
                     }
+                    Ok(Some(Err(_))) => return IdleResult::Disconnected,
                     Ok(None) => return IdleResult::Disconnected,
-                    Err(_) => return IdleResult::Disconnected,
+                    Err(_) => {} // no push within 500ms — check requests again
                 }
             }
         })
         .await;
 
-        let _ = session.idle_done(&idle_tag).await;
+        // Leave IDLE cleanly and take the session back.
+        self.session = handle.done().await.ok();
 
         match result {
             Ok(IdleResult::MailboxChange) => IdleResult::MailboxChange,
@@ -1397,9 +1508,18 @@ impl Worker {
 
     async fn has_cached_messages(&self) -> bool {
         let cache = self.cache.lock().await;
-        cache
-            .has_cached_messages(self.account.id)
-            .unwrap_or(false)
+        cache.has_cached_messages(self.account.id).unwrap_or(false)
+    }
+
+    /// True when the cache holds messages for this account but no folder rows —
+    /// a broken state (empty sidebar, SyncAll iterates nothing) that a
+    /// bootstrap `connect()` repairs by re-listing folders from the server.
+    async fn cached_folders_missing(&self) -> bool {
+        let cache = self.cache.lock().await;
+        match cache.load_folders(self.account.id) {
+            Ok(folders) => folders.is_empty(),
+            Err(_) => true,
+        }
     }
 }
 
@@ -1504,15 +1624,12 @@ fn parse_address(sender: &str) -> Option<(String, String)> {
     None
 }
 
-fn parse_idle_event(line: &str) -> Option<IdleResult> {
-    let rest = line.strip_prefix("* ")?;
-    if rest.contains("EXISTS")
-        || rest.contains("EXPUNGE")
-        || rest.starts_with("FLAGS")
-        || (rest.contains("FETCH") && rest.contains("FLAGS"))
-    {
-        Some(IdleResult::MailboxChange)
-    } else {
-        None
+fn idle_event_from_response(resp: &Response<'_>) -> Option<IdleResult> {
+    match resp {
+        Response::Expunge(_) => Some(IdleResult::MailboxChange),
+        Response::Fetch(..) => Some(IdleResult::MailboxChange),
+        Response::MailboxData(MailboxDatum::Exists(_)) => Some(IdleResult::MailboxChange),
+        Response::MailboxData(MailboxDatum::Flags(_)) => Some(IdleResult::MailboxChange),
+        _ => None,
     }
 }

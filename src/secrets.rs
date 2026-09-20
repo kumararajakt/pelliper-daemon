@@ -12,7 +12,11 @@ impl Secrets {
         }
     }
 
-    pub async fn store_password(&self, account: &str, password: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn store_password(
+        &self,
+        account: &str,
+        password: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let service = self.service_name.clone();
         let account = account.to_string();
         let password = password.to_string();
@@ -24,7 +28,10 @@ impl Secrets {
         .await?
     }
 
-    pub async fn get_password(&self, account: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn get_password(
+        &self,
+        account: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let service = self.service_name.clone();
         let account = account.to_string();
         tokio::task::spawn_blocking(move || {
@@ -34,7 +41,10 @@ impl Secrets {
         .await?
     }
 
-    pub async fn delete_password(&self, account: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn delete_password(
+        &self,
+        account: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let service = self.service_name.clone();
         let account = account.to_string();
         tokio::task::spawn_blocking(move || {

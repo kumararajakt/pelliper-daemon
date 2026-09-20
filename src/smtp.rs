@@ -40,35 +40,42 @@ pub async fn send_email(
         builder = builder.references(refs.to_string());
     }
     if let Some(r) = reply_to.filter(|s| !s.is_empty()) {
-        builder = builder.reply_to(
-            r.trim().parse().map_err(|e: lettre::address::AddressError| {
-                format!("Invalid Reply-To '{}': {}", r, e)
-            })?,
-        );
+        builder = builder.reply_to(r.trim().parse().map_err(
+            |e: lettre::address::AddressError| format!("Invalid Reply-To '{}': {}", r, e),
+        )?);
     }
 
     for recipient in to.split([',', ';']) {
-        let addr: Mailbox = recipient
-            .trim()
-            .parse()
-            .map_err(|e: lettre::address::AddressError| format!("Invalid recipient '{}': {}", recipient, e))?;
+        let addr: Mailbox =
+            recipient
+                .trim()
+                .parse()
+                .map_err(|e: lettre::address::AddressError| {
+                    format!("Invalid recipient '{}': {}", recipient, e)
+                })?;
         builder = builder.to(addr);
     }
 
     for recipient in cc.split([',', ';']) {
-        let addr: Mailbox = recipient
-            .trim()
-            .parse()
-            .map_err(|e: lettre::address::AddressError| format!("Invalid Cc '{}': {}", recipient, e))?;
+        let addr: Mailbox =
+            recipient
+                .trim()
+                .parse()
+                .map_err(|e: lettre::address::AddressError| {
+                    format!("Invalid Cc '{}': {}", recipient, e)
+                })?;
         builder = builder.cc(addr);
     }
 
     if let Some(bcc) = bcc {
         for recipient in bcc.split([',', ';']) {
-            let addr: Mailbox = recipient
-                .trim()
-                .parse()
-                .map_err(|e: lettre::address::AddressError| format!("Invalid Bcc '{}': {}", recipient, e))?;
+            let addr: Mailbox =
+                recipient
+                    .trim()
+                    .parse()
+                    .map_err(|e: lettre::address::AddressError| {
+                        format!("Invalid Bcc '{}': {}", recipient, e)
+                    })?;
             builder = builder.bcc(addr);
         }
     }
@@ -92,13 +99,10 @@ pub async fn send_email(
         for att in attachments {
             let data = std::fs::read(&att.path)
                 .map_err(|e| format!("Failed to read attachment '{}': {}", att.filename, e))?;
-            let mime_type = mime_guess::from_path(&att.path)
-                .first_or_octet_stream();
-            let content_type = ContentType::parse(mime_type.essence_str())
-                .unwrap_or(ContentType::TEXT_PLAIN);
-            let mime_part = SinglePart::builder()
-                .header(content_type)
-                .body(data);
+            let mime_type = mime_guess::from_path(&att.path).first_or_octet_stream();
+            let content_type =
+                ContentType::parse(mime_type.essence_str()).unwrap_or(ContentType::TEXT_PLAIN);
+            let mime_part = SinglePart::builder().header(content_type).body(data);
             mixed = mixed.singlepart(mime_part);
         }
         builder
@@ -123,14 +127,13 @@ pub async fn send_email(
 
     let mailer = if account.auth_type == "oauth" {
         builder
-            .credentials(Credentials::new(
-                account.email.clone(),
-                auth.to_string(),
-            ))
+            .credentials(Credentials::new(account.email.clone(), auth.to_string()))
             .authentication(vec![Mechanism::Xoauth2])
             .build()
     } else {
-        builder.credentials(Credentials::new(account.email.clone(), auth.to_string())).build()
+        builder
+            .credentials(Credentials::new(account.email.clone(), auth.to_string()))
+            .build()
     };
 
     mailer.send(email).await?;

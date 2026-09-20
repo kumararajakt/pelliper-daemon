@@ -10,6 +10,8 @@ pub struct Folder {
     pub path: String,
     pub unread_count: i32,
     pub noselect: bool,
+    /// SPECIAL-USE-derived classification ("inbox", "sent", ..., "custom").
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -86,6 +88,7 @@ impl Cache {
                 path TEXT NOT NULL,
                 unread_count INTEGER DEFAULT 0,
                 noselect INTEGER DEFAULT 0,
+                kind TEXT NOT NULL DEFAULT 'custom',
                 PRIMARY KEY (account_id, path),
                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
@@ -158,15 +161,21 @@ impl Cache {
             [],
         );
 
+        // Migration: add SPECIAL-USE kind column if missing.
+        // Existing rows stay 'custom' until the next folder sync (upsert_folder)
+        // backfills them from LIST attributes/path heuristics.
+        let _ = self.conn.execute(
+            "ALTER TABLE folders ADD COLUMN kind TEXT NOT NULL DEFAULT 'custom'",
+            [],
+        );
+
         // Migration: add threading columns if missing
-        let _ = self.conn.execute(
-            "ALTER TABLE messages ADD COLUMN message_id TEXT",
-            [],
-        );
-        let _ = self.conn.execute(
-            "ALTER TABLE messages ADD COLUMN references_ TEXT",
-            [],
-        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE messages ADD COLUMN message_id TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE messages ADD COLUMN references_ TEXT", []);
 
         // Migration: add size column to attachments (newer schema)
         let _ = self.conn.execute(
@@ -225,7 +234,9 @@ impl Cache {
             ",
         )?;
 
-        let count: i64 = self.conn.query_row("SELECT count(*) FROM messages_fts", [], |r| r.get(0))?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT count(*) FROM messages_fts", [], |r| r.get(0))?;
         if count == 0 {
             self.conn.execute_batch(
                 "
@@ -301,11 +312,9 @@ impl Cache {
     }
 
     pub fn account_count(&self) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM accounts",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -330,20 +339,42 @@ impl Cache {
     /// Delete an account and all its folders, messages, bodies, and attachments.
     pub fn remove_account(&self, account_id: i64) -> Result<()> {
         // Foreign keys with ON DELETE CASCADE handle messages/bodies/folders
-        self.conn.execute("DELETE FROM attachments WHERE account_id = ?1", rusqlite::params![account_id])?;
-        self.conn.execute("DELETE FROM bodies WHERE account_id = ?1", rusqlite::params![account_id])?;
-        self.conn.execute("DELETE FROM messages WHERE account_id = ?1", rusqlite::params![account_id])?;
-        self.conn.execute("DELETE FROM folders WHERE account_id = ?1", rusqlite::params![account_id])?;
-        self.conn.execute("DELETE FROM accounts WHERE id = ?1", rusqlite::params![account_id])?;
+        self.conn.execute(
+            "DELETE FROM attachments WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM bodies WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM messages WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM folders WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+        )?;
         tracing::info!("Removed account {} and all associated data", account_id);
         Ok(())
     }
 
-    pub fn upsert_folder(&self, account_id: i64, path: &str, unread_count: i32, noselect: bool) -> Result<()> {
+    pub fn upsert_folder(
+        &self,
+        account_id: i64,
+        path: &str,
+        unread_count: i32,
+        noselect: bool,
+        kind: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO folders (account_id, path, unread_count, noselect) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(account_id, path) DO UPDATE SET unread_count = ?3, noselect = ?4",
-            rusqlite::params![account_id, path, unread_count, noselect as i32],
+            "INSERT INTO folders (account_id, path, unread_count, noselect, kind) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account_id, path) DO UPDATE SET unread_count = ?3, noselect = ?4, kind = ?5",
+            rusqlite::params![account_id, path, unread_count, noselect as i32, kind],
         )?;
         Ok(())
     }
@@ -373,7 +404,12 @@ impl Cache {
         Ok(())
     }
 
-    pub fn delete_stale_messages(&self, account_id: i64, folder_path: &str, valid_uids: &[i64]) -> Result<()> {
+    pub fn delete_stale_messages(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        valid_uids: &[i64],
+    ) -> Result<()> {
         if valid_uids.is_empty() {
             return Ok(());
         }
@@ -382,14 +418,13 @@ impl Cache {
             "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid NOT IN ({})",
             placeholders.join(", ")
         );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-            Box::new(account_id),
-            Box::new(folder_path.to_string()),
-        ];
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(account_id), Box::new(folder_path.to_string())];
         for uid in valid_uids {
             params.push(Box::new(*uid));
         }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         self.conn.execute(&sql, param_refs.as_slice())?;
         Ok(())
     }
@@ -480,7 +515,7 @@ impl Cache {
 
     pub fn load_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, unread_count, noselect FROM folders WHERE account_id = ?1 ORDER BY path",
+            "SELECT path, unread_count, noselect, kind FROM folders WHERE account_id = ?1 ORDER BY path",
         )?;
         let folders = stmt
             .query_map(rusqlite::params![account_id], |row| {
@@ -488,6 +523,9 @@ impl Cache {
                     path: row.get(0)?,
                     unread_count: row.get(1)?,
                     noselect: row.get::<_, i32>(2)? != 0,
+                    kind: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "custom".to_string()),
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -507,21 +545,24 @@ impl Cache {
              ORDER BY date DESC LIMIT ?3 OFFSET ?4",
         )?;
         let messages = stmt
-            .query_map(rusqlite::params![account_id, folder_path, limit, offset], |row| {
-                Ok(Message {
-                    uid: row.get(0)?,
-                    subject: row.get(1)?,
-                    sender: row.get(2)?,
-                    date: row.get(3)?,
-                    in_reply_to: row.get(4)?,
-                    message_id: row.get(5)?,
-                    references: row.get(6)?,
-                    has_attachments: row.get::<_, i32>(7)? != 0,
-                    is_read: row.get::<_, i32>(8)? != 0,
-                    is_starred: row.get::<_, i32>(9)? != 0,
-                    preview: row.get(10)?,
-                })
-            })?
+            .query_map(
+                rusqlite::params![account_id, folder_path, limit, offset],
+                |row| {
+                    Ok(Message {
+                        uid: row.get(0)?,
+                        subject: row.get(1)?,
+                        sender: row.get(2)?,
+                        date: row.get(3)?,
+                        in_reply_to: row.get(4)?,
+                        message_id: row.get(5)?,
+                        references: row.get(6)?,
+                        has_attachments: row.get::<_, i32>(7)? != 0,
+                        is_read: row.get::<_, i32>(8)? != 0,
+                        is_starred: row.get::<_, i32>(9)? != 0,
+                        preview: row.get(10)?,
+                    })
+                },
+            )?
             .collect::<Result<Vec<_>>>()?;
         Ok(messages)
     }
@@ -537,9 +578,9 @@ impl Cache {
 
     /// Load all cached UIDs for a folder (for backfill comparison).
     pub fn load_cached_uids(&self, account_id: i64, folder_path: &str) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2")?;
         let uids = stmt
             .query_map(rusqlite::params![account_id, folder_path], |row| {
                 row.get::<_, i64>(0)
@@ -549,14 +590,20 @@ impl Cache {
     }
 
     /// Load the N most recent UIDs for a folder (sorted newest first).
-    pub fn load_recent_uids(&self, account_id: i64, folder_path: &str, limit: usize) -> Result<Vec<i64>> {
+    pub fn load_recent_uids(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
             "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 ORDER BY date DESC LIMIT ?3",
         )?;
         let uids = stmt
-            .query_map(rusqlite::params![account_id, folder_path, limit as i64], |row| {
-                row.get::<_, i64>(0)
-            })?
+            .query_map(
+                rusqlite::params![account_id, folder_path, limit as i64],
+                |row| row.get::<_, i64>(0),
+            )?
             .collect::<Result<Vec<_>>>()?;
         Ok(uids)
     }
@@ -582,9 +629,10 @@ impl Cache {
              LIMIT ?3",
         )?;
         let uids = stmt
-            .query_map(rusqlite::params![account_id, folder_path, limit as i64], |row| {
-                row.get::<_, i64>(0)
-            })?
+            .query_map(
+                rusqlite::params![account_id, folder_path, limit as i64],
+                |row| row.get::<_, i64>(0),
+            )?
             .collect::<Result<Vec<_>>>()?;
         Ok(uids)
     }
@@ -600,7 +648,12 @@ impl Cache {
     }
 
     /// Load cached body HTML for a message. Returns None if not cached.
-    pub fn load_body(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<Option<String>> {
+    pub fn load_body(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+    ) -> Result<Option<String>> {
         let result = self.conn.query_row(
             "SELECT html FROM bodies WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
             rusqlite::params![account_id, folder_path, uid],
@@ -633,7 +686,13 @@ impl Cache {
     }
 
     /// Save body HTML to cache.
-    pub fn save_body(&self, account_id: i64, folder_path: &str, uid: i64, html: &str) -> Result<()> {
+    pub fn save_body(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        html: &str,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO bodies (account_id, folder_path, uid, html) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET html = ?4",
@@ -643,7 +702,13 @@ impl Cache {
     }
 
     /// Update has_attachments flag from actual body parse (corrects BODYSTRUCTURE guesses).
-    pub fn update_has_attachment(&self, account_id: i64, folder_path: &str, uid: i64, has: bool) -> Result<()> {
+    pub fn update_has_attachment(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        has: bool,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE messages SET has_attachments = ?1 WHERE account_id = ?2 AND folder_path = ?3 AND uid = ?4",
             rusqlite::params![has as i32, account_id, folder_path, uid],
@@ -704,22 +769,24 @@ impl Cache {
              WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3
              ORDER BY rowid ASC",
         )?;
-        let rows = stmt.query_map(
-            rusqlite::params![account_id, folder_path, uid],
-            |row| {
-                Ok(AttachmentRecord {
-                    name: row.get(0)?,
-                    file_path: row.get(1)?,
-                    content_type: row.get(2)?,
-                    size: row.get(3)?,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(rusqlite::params![account_id, folder_path, uid], |row| {
+            Ok(AttachmentRecord {
+                name: row.get(0)?,
+                file_path: row.get(1)?,
+                content_type: row.get(2)?,
+                size: row.get(3)?,
+            })
+        })?;
         rows.collect::<Result<Vec<_>>>()
     }
 
     /// Whether the message's parsed body flagged it as having attachments.
-    pub fn message_has_attachments(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<bool> {
+    pub fn message_has_attachments(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+    ) -> Result<bool> {
         let has: i32 = self.conn.query_row(
             "SELECT has_attachments FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
             rusqlite::params![account_id, folder_path, uid],
@@ -811,7 +878,8 @@ impl Cache {
 
     /// Remove a queued message once it's sent or permanently dropped.
     pub fn delete_outbox(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
+        self.conn
+            .execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
 
@@ -893,7 +961,12 @@ impl Cache {
     // -----------------------------------------------------------------------
 
     /// Set a sender policy: block or allow remote content for this sender.
-    pub fn set_sender_policy(&self, sender_email: &str, block_sender: bool, allow_remote: bool) -> Result<()> {
+    pub fn set_sender_policy(
+        &self,
+        sender_email: &str,
+        block_sender: bool,
+        allow_remote: bool,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO sender_policies (sender_email, block_sender, allow_remote) VALUES (?1, ?2, ?3)
              ON CONFLICT(sender_email) DO UPDATE SET block_sender = ?2, allow_remote = ?3",
@@ -913,11 +986,14 @@ impl Cache {
 
     /// Check if a sender is blocked.
     pub fn is_sender_blocked(&self, sender_email: &str) -> Result<bool> {
-        let blocked: i32 = self.conn.query_row(
-            "SELECT block_sender FROM sender_policies WHERE sender_email = ?1",
-            rusqlite::params![sender_email.to_lowercase()],
-            |row| row.get(0),
-        ).unwrap_or(0);
+        let blocked: i32 = self
+            .conn
+            .query_row(
+                "SELECT block_sender FROM sender_policies WHERE sender_email = ?1",
+                rusqlite::params![sender_email.to_lowercase()],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         Ok(blocked != 0)
     }
 
