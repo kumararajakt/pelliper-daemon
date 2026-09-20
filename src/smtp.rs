@@ -1,15 +1,9 @@
-use crate::cache::Account;
+use crate::types::{Account, EmailAttachment};
 use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
 use lettre::message::{Message, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct EmailAttachment {
-    pub path: String,
-    pub filename: String,
-}
 
 pub async fn send_email(
     account: &Account,

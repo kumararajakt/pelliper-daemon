@@ -1,0 +1,123 @@
+//! Folder backfill: index the remaining (older) messages in chunks.
+
+use super::{BackfillJob, Worker};
+use crate::imap;
+use std::collections::HashSet;
+
+impl Worker {
+    // -----------------------------------------------------------------------
+    // Background work: backfill
+    // -----------------------------------------------------------------------
+
+    pub(super) async fn queue_backfill_for_folder(&mut self, folder_path: &str) {
+        // Don't double-queue.
+        if self
+            .backfill_queue
+            .iter()
+            .any(|j| j.folder_path == folder_path)
+        {
+            return;
+        }
+
+        let all_uids = match self.fetch_all_uids(folder_path).await {
+            Ok(uids) => uids,
+            Err(e) => {
+                tracing::error!(
+                    "Worker[{}]: backfill UID fetch failed for {}: {}",
+                    self.account.id,
+                    folder_path,
+                    e
+                );
+                return;
+            }
+        };
+
+        let cached_uids = {
+            let cache = self.cache.lock().await;
+            cache
+                .load_cached_uids(self.account.id, folder_path)
+                .unwrap_or_default()
+        };
+        let cached_set: HashSet<i64> = cached_uids.into_iter().collect();
+        let missing: Vec<i64> = all_uids
+            .into_iter()
+            .filter(|uid| !cached_set.contains(uid))
+            .collect();
+
+        if missing.is_empty() {
+            return;
+        }
+
+        tracing::info!(
+            "Worker[{}]: queued {} messages for backfill in {}",
+            self.account.id,
+            missing.len(),
+            folder_path
+        );
+
+        self.backfill_queue.push_back(BackfillJob {
+            folder_path: folder_path.to_string(),
+            remaining: missing,
+        });
+    }
+
+    async fn fetch_all_uids(
+        &mut self,
+        folder_path: &str,
+    ) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_session()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let session = self.session.as_mut().ok_or("no session")?;
+        imap::fetch_all_uids(session, folder_path).await
+    }
+
+    pub(super) async fn run_backfill_chunk(&mut self, folder_path: &str, chunk: &[i64]) {
+        if self.ensure_session().await.is_err() {
+            return;
+        }
+        let session = match self.session.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let uid_set: Vec<String> = chunk.iter().map(|u| u.to_string()).collect();
+        let uid_set_str = uid_set.join(",");
+
+        match imap::fetch_summaries_by_uids(session, folder_path, &uid_set_str).await {
+            Ok(summaries) => {
+                let cache = self.cache.lock().await;
+                for msg in &summaries {
+                    let _ = cache.upsert_message(
+                        self.account.id,
+                        folder_path,
+                        msg.uid,
+                        &msg.subject,
+                        &msg.sender,
+                        msg.date,
+                        msg.is_read,
+                        msg.is_starred,
+                        msg.has_attachments,
+                        &msg.preview,
+                        &msg.message_id,
+                        &msg.references,
+                    );
+                }
+                tracing::debug!(
+                    "Worker[{}]: backfilled {} messages in {}",
+                    self.account.id,
+                    summaries.len(),
+                    folder_path
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Worker[{}]: backfill chunk failed for {}: {}",
+                    self.account.id,
+                    folder_path,
+                    e
+                );
+            }
+        }
+    }
+}

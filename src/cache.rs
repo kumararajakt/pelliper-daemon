@@ -1,53 +1,9 @@
+use crate::types::{Account, AttachmentRecord, Folder, Message, OutboxItem};
 use rusqlite::{Connection, Result};
 use std::path::PathBuf;
 
 pub struct Cache {
     conn: Connection,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Folder {
-    pub path: String,
-    pub unread_count: i32,
-    pub noselect: bool,
-    /// SPECIAL-USE-derived classification ("inbox", "sent", ..., "custom").
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Message {
-    pub uid: i64,
-    pub subject: Option<String>,
-    pub sender: Option<String>,
-    pub date: i64,
-    pub in_reply_to: Option<String>,
-    pub message_id: Option<String>,
-    pub references: Option<String>,
-    pub has_attachments: bool,
-    pub is_read: bool,
-    pub is_starred: bool,
-    pub preview: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AttachmentRecord {
-    pub name: String,
-    pub file_path: String,
-    pub content_type: String,
-    pub size: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct OutboxItem {
-    pub id: i64,
-    pub account_id: i64,
-    pub to_addr: String,
-    pub cc_addr: Option<String>,
-    pub bcc_addr: Option<String>,
-    pub reply_to: Option<String>,
-    pub subject: String,
-    pub body: String,
-    pub attempts: i32,
 }
 
 impl Cache {
@@ -125,7 +81,8 @@ impl Cache {
                 uid INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 file_path TEXT NOT NULL,
-                content_type TEXT
+                content_type TEXT,
+                size INTEGER DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS sender_policies (
@@ -154,34 +111,6 @@ impl Cache {
             );
             ",
         )?;
-
-        // Migration: add noselect column if missing
-        let _ = self.conn.execute(
-            "ALTER TABLE folders ADD COLUMN noselect INTEGER DEFAULT 0",
-            [],
-        );
-
-        // Migration: add SPECIAL-USE kind column if missing.
-        // Existing rows stay 'custom' until the next folder sync (upsert_folder)
-        // backfills them from LIST attributes/path heuristics.
-        let _ = self.conn.execute(
-            "ALTER TABLE folders ADD COLUMN kind TEXT NOT NULL DEFAULT 'custom'",
-            [],
-        );
-
-        // Migration: add threading columns if missing
-        let _ = self
-            .conn
-            .execute("ALTER TABLE messages ADD COLUMN message_id TEXT", []);
-        let _ = self
-            .conn
-            .execute("ALTER TABLE messages ADD COLUMN references_ TEXT", []);
-
-        // Migration: add size column to attachments (newer schema)
-        let _ = self.conn.execute(
-            "ALTER TABLE attachments ADD COLUMN size INTEGER DEFAULT 0",
-            [],
-        );
 
         Ok(())
     }
@@ -404,31 +333,6 @@ impl Cache {
         Ok(())
     }
 
-    pub fn delete_stale_messages(
-        &self,
-        account_id: i64,
-        folder_path: &str,
-        valid_uids: &[i64],
-    ) -> Result<()> {
-        if valid_uids.is_empty() {
-            return Ok(());
-        }
-        let placeholders: Vec<String> = valid_uids.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid NOT IN ({})",
-            placeholders.join(", ")
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            vec![Box::new(account_id), Box::new(folder_path.to_string())];
-        for uid in valid_uids {
-            params.push(Box::new(*uid));
-        }
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        self.conn.execute(&sql, param_refs.as_slice())?;
-        Ok(())
-    }
-
     pub fn update_folder_unread(&self, account_id: i64, path: &str, unread: i32) -> Result<()> {
         self.conn.execute(
             "UPDATE folders SET unread_count = ?1 WHERE account_id = ?2 AND path = ?3",
@@ -585,25 +489,6 @@ impl Cache {
             .query_map(rusqlite::params![account_id, folder_path], |row| {
                 row.get::<_, i64>(0)
             })?
-            .collect::<Result<Vec<_>>>()?;
-        Ok(uids)
-    }
-
-    /// Load the N most recent UIDs for a folder (sorted newest first).
-    pub fn load_recent_uids(
-        &self,
-        account_id: i64,
-        folder_path: &str,
-        limit: usize,
-    ) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 ORDER BY date DESC LIMIT ?3",
-        )?;
-        let uids = stmt
-            .query_map(
-                rusqlite::params![account_id, folder_path, limit as i64],
-                |row| row.get::<_, i64>(0),
-            )?
             .collect::<Result<Vec<_>>>()?;
         Ok(uids)
     }
@@ -1011,22 +896,4 @@ impl Cache {
         })?;
         rows.collect::<Result<Vec<_>>>()
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct Account {
-    pub id: i64,
-    pub email: String,
-    pub display_name: Option<String>,
-    pub provider: Option<String>,
-    pub auth_type: String,
-    pub imap_host: Option<String>,
-    pub imap_port: Option<i64>,
-    pub imap_security: Option<String>,
-    pub smtp_host: Option<String>,
-    pub smtp_port: Option<i64>,
-    pub smtp_security: Option<String>,
-    pub username: Option<String>,
-    pub refresh_token: Option<String>,
-    pub enabled: bool,
 }

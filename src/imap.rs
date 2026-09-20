@@ -9,6 +9,8 @@ use async_imap::imap_proto::types::{BodyStructure, SectionPath};
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use futures::StreamExt;
 
+use crate::types::{FolderKind, ImapFolder, ImapMessageSummary};
+
 pub type CompatTls = tokio_util::compat::Compat<TlsStream<TcpStream>>;
 /// The authenticated IMAP session type used by the worker.
 pub type ImapSession = async_imap::Session<CompatTls>;
@@ -203,87 +205,6 @@ async fn connect_tls(
 // ---------------------------------------------------------------------------
 // Session management for sync
 // ---------------------------------------------------------------------------
-
-/// Information about a discovered IMAP folder.
-pub struct ImapFolder {
-    pub path: String,
-    pub noselect: bool,
-    pub kind: FolderKind,
-}
-
-/// Semantic classification of a folder based on SPECIAL-USE attributes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum FolderKind {
-    Inbox,
-    Sent,
-    Drafts,
-    Trash,
-    Junk,
-    Archive,
-    Starred,
-    Custom,
-}
-
-impl FolderKind {
-    /// Parse from IMAP flag string (e.g., "\\Sent" -> Sent).
-    pub fn from_flag(flag: &str) -> Option<Self> {
-        match flag.to_lowercase().as_str() {
-            "\\inbox" | "inbox" => Some(FolderKind::Inbox),
-            "\\sent" | "sent" => Some(FolderKind::Sent),
-            "\\drafts" | "drafts" => Some(FolderKind::Drafts),
-            "\\trash" | "trash" => Some(FolderKind::Trash),
-            "\\junk" | "junk" | "\\spam" | "spam" => Some(FolderKind::Junk),
-            "\\archive" | "archive" | "\\all" | "all" => Some(FolderKind::Archive),
-            "\\flagged" | "flagged" | "\\starred" | "starred" => Some(FolderKind::Starred),
-            _ => None,
-        }
-    }
-
-    /// Stable lowercase string, persisted in the cache `folders.kind` column
-    /// and consumed by the UI model (mirror of `FolderModel::roleFromKind`).
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FolderKind::Inbox => "inbox",
-            FolderKind::Sent => "sent",
-            FolderKind::Drafts => "drafts",
-            FolderKind::Trash => "trash",
-            FolderKind::Junk => "junk",
-            FolderKind::Archive => "archive",
-            FolderKind::Starred => "starred",
-            FolderKind::Custom => "custom",
-        }
-    }
-
-    /// Classify by path heuristics (fallback when no SPECIAL-USE attribute).
-    pub fn from_path(path: &str) -> Self {
-        let leaf = path.rsplit('/').next().unwrap_or(path);
-        let lower = leaf.to_lowercase();
-        match lower.as_str() {
-            "inbox" => FolderKind::Inbox,
-            "sent" | "sent items" | "sent mail" | "sent messages" => FolderKind::Sent,
-            "drafts" | "draft" => FolderKind::Drafts,
-            "trash" | "deleted items" | "deleted messages" | "bin" | "deleted" => FolderKind::Trash,
-            "junk" | "junk e-mail" | "spam" => FolderKind::Junk,
-            "archive" | "archives" | "all mail" | "all" => FolderKind::Archive,
-            "starred" | "flagged" | "important" => FolderKind::Starred,
-            _ => FolderKind::Custom,
-        }
-    }
-}
-
-/// Summary of an IMAP message (header-level fields only).
-pub struct ImapMessageSummary {
-    pub uid: i64,
-    pub subject: String,
-    pub sender: String,
-    pub date: i64,
-    pub is_read: bool,
-    pub is_starred: bool,
-    pub has_attachments: bool,
-    pub preview: String,
-    pub message_id: String,
-    pub references: String,
-}
 
 /// Fetch the newest `limit` message summaries for a folder, newest first.
 ///
@@ -943,48 +864,5 @@ fn html_escape(input: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_message_id_strips_brackets_and_comments() {
-        assert_eq!(normalize_message_id("<a@b.com>"), "a@b.com");
-        assert_eq!(normalize_message_id("a@b.com"), "a@b.com");
-        // RFC 5322 comment trailing the id
-        assert_eq!(normalize_message_id("<a@b.com> (Comment)"), "a@b.com");
-        // Comment first, then the id
-        assert_eq!(normalize_message_id("(C) <a@b.com>"), "a@b.com");
-        // Nested comments must not disrupt extraction
-        assert_eq!(normalize_message_id("<a@b.com> (x (y))"), "a@b.com");
-        assert_eq!(normalize_message_id(""), "");
-        assert_eq!(normalize_message_id("   "), "");
-    }
-
-    #[test]
-    fn normalize_references_joins_and_dedups() {
-        assert_eq!(
-            normalize_references("<a@b.com> <c@d.com>"),
-            "a@b.com c@d.com"
-        );
-        // Trailing comment is dropped
-        assert_eq!(
-            normalize_references("<a@b.com> <c@d.com> (thread topic)"),
-            "a@b.com c@d.com"
-        );
-        // Bare ids without angle brackets are kept
-        assert_eq!(normalize_references("a@b.com c@d.com"), "a@b.com c@d.com");
-        // Duplicates are removed
-        assert_eq!(normalize_references("<a@b.com> <a@b.com>"), "a@b.com");
-        assert_eq!(normalize_references(""), "");
-    }
-
-    #[test]
-    fn threading_matches_after_normalization() {
-        // A raw-path message stored `message_id` with brackets; the parent's
-        // References (ENVELOPE source) had none. After normalization both are
-        // the same bare id, so threadmodel.cpp's linkage finds the parent.
-        let child_message_id = normalize_message_id("<reply@host>");
-        let parent_refs = normalize_references("reply@host");
-        assert_eq!(child_message_id, parent_refs);
-    }
-}
+#[path = "imap.test.rs"]
+mod tests;
