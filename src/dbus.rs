@@ -57,8 +57,9 @@ impl Daemon {
         auth_type: &str,
         auth_token: &str,
         refresh_token: &str,
+        provider: &str,
     ) -> bool {
-        tracing::info!("add_account: {} ({})", email, auth_type);
+        tracing::info!("add_account: {} ({} {})", email, auth_type, provider);
 
         // Check if account already exists
         {
@@ -90,7 +91,11 @@ impl Daemon {
             id: 0,
             email: email.to_string(),
             display_name: Some(display_name.to_string()),
-            provider: None,
+            provider: if provider.is_empty() {
+                None
+            } else {
+                Some(provider.to_string())
+            },
             auth_type: auth_type.to_string(),
             imap_host: Some(imap_host.to_string()),
             imap_port: Some(imap_port as i64),

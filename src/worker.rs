@@ -332,23 +332,23 @@ impl Worker {
             .refresh_token
             .as_deref()
             .ok_or("No refresh token")?;
-        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID")
-            .map_err(|_| "PELLIPER_GOOGLE_CLIENT_ID not set (see ~/.local/share/pelliper/.env)")?;
-        let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
+        let provider = crate::oauth::provider_for(&self.account)?;
+        let (client_id, client_secret) = crate::oauth::client_credentials(provider)?;
         let token = crate::oauth::refresh_access_token(
-            "https://oauth2.googleapis.com/token",
+            provider.token_endpoint,
             &client_id,
             &client_secret,
             refresh_token,
         )
         .await?;
 
-        // Save new refresh token if Google issued one (rotation)
+        // Save the new refresh token if the provider issued one (Google rotates them)
         if let Some(ref new_rt) = token.refresh_token {
             if new_rt != refresh_token {
                 tracing::info!(
-                    "Worker[{}]: Google issued new refresh token, saving",
-                    self.account.id
+                    "Worker[{}]: {} issued new refresh token, saving",
+                    self.account.id,
+                    provider.id
                 );
                 let cache = self.cache.lock().await;
                 if let Err(e) = cache.update_refresh_token(self.account.id, new_rt) {

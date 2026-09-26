@@ -28,12 +28,10 @@ pub(crate) async fn send_with_auth(
             .refresh_token
             .as_deref()
             .ok_or_else(|| "No refresh token stored for account".to_string())?;
-        let client_id = std::env::var("PELLIPER_GOOGLE_CLIENT_ID").map_err(|_| {
-            "PELLIPER_GOOGLE_CLIENT_ID not set (see ~/.local/share/pelliper/.env)".to_string()
-        })?;
-        let client_secret = std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").unwrap_or_default();
+        let provider = crate::oauth::provider_for(account)?;
+        let (client_id, client_secret) = crate::oauth::client_credentials(provider)?;
         let token = crate::oauth::refresh_access_token(
-            "https://oauth2.googleapis.com/token",
+            provider.token_endpoint,
             &client_id,
             &client_secret,
             refresh_token,
