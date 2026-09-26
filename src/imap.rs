@@ -331,6 +331,8 @@ pub async fn list_folders(
     session: &mut ImapSession,
 ) -> Result<Vec<ImapFolder>, Box<dyn std::error::Error + Send + Sync>> {
     let mut folders = Vec::new();
+    // Parallel to `folders`: whether the kind came from a SPECIAL-USE attribute.
+    let mut by_attribute: Vec<bool> = Vec::new();
     let stream = session
         .list(None, Some("*"))
         .await
@@ -338,72 +340,92 @@ pub async fn list_folders(
     futures::pin_mut!(stream);
     while let Some(name) = stream.next().await {
         let name = name.map_err(|e| e.to_string())?;
-        let mut noselect = false;
-        let mut kind = FolderKind::Custom;
-        let mut special_use_found = false;
-        for attr in name.attributes() {
-            match attr {
-                NameAttribute::NoSelect => noselect = true,
-                NameAttribute::All => {
-                    kind = FolderKind::Archive;
-                    special_use_found = true;
-                }
-                NameAttribute::Archive => {
-                    kind = FolderKind::Archive;
-                    special_use_found = true;
-                }
-                NameAttribute::Drafts => {
-                    kind = FolderKind::Drafts;
-                    special_use_found = true;
-                }
-                NameAttribute::Flagged => {
-                    kind = FolderKind::Starred;
-                    special_use_found = true;
-                }
-                NameAttribute::Junk => {
-                    kind = FolderKind::Junk;
-                    special_use_found = true;
-                }
-                NameAttribute::Sent => {
-                    kind = FolderKind::Sent;
-                    special_use_found = true;
-                }
-                NameAttribute::Trash => {
-                    kind = FolderKind::Trash;
-                    special_use_found = true;
-                }
-                NameAttribute::Extension(name) => {
-                    if let Some(k) = FolderKind::from_flag(name.as_ref()) {
-                        kind = k;
-                        special_use_found = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !special_use_found {
-            kind = FolderKind::from_path(name.name());
-        }
+        let noselect = name.attributes().contains(&NameAttribute::NoSelect);
+        let (kind, from_attribute) = classify_with_source(name.name(), name.attributes());
+        by_attribute.push(from_attribute);
         folders.push(ImapFolder {
             path: name.name().to_string(),
             noselect,
             kind,
         });
     }
+    demote_name_matched_impostors(&mut folders, &by_attribute);
     tracing::info!("Discovered {} folders", folders.len());
     Ok(folders)
 }
 
-/// Find a folder by semantic kind (e.g. Trash for delete/move-to-trash).
-pub async fn find_folder_by_kind(
-    session: &mut ImapSession,
-    wanted: FolderKind,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let folders = list_folders(session).await?;
-    Ok(folders
-        .into_iter()
-        .find(|f| f.kind == wanted && !f.noselect)
-        .map(|f| f.path))
+/// Classify a mailbox, also reporting whether the kind came from an RFC 6154
+/// SPECIAL-USE attribute (`true`) rather than name matching (`false`).
+///
+/// The flag is what lets `list_folders` prefer the server's real special-use
+/// folder when it also exposes a stray folder that merely *looks* like it fills
+/// the same role — e.g. Gmail's `[Gmail]/Trash` (`\Trash`) sitting next to a
+/// plain top-level `Trash` label.
+pub fn classify_with_source(path: &str, attrs: &[NameAttribute]) -> (FolderKind, bool) {
+    let mut kind = FolderKind::Custom;
+    let mut from_attribute = false;
+    for attr in attrs {
+        match attr {
+            NameAttribute::All | NameAttribute::Archive => kind = FolderKind::Archive,
+            NameAttribute::Drafts => kind = FolderKind::Drafts,
+            NameAttribute::Flagged => kind = FolderKind::Starred,
+            NameAttribute::Junk => kind = FolderKind::Junk,
+            NameAttribute::Sent => kind = FolderKind::Sent,
+            NameAttribute::Trash => kind = FolderKind::Trash,
+            NameAttribute::Extension(name) => {
+                if let Some(k) = FolderKind::from_flag(name.as_ref()) {
+                    kind = k;
+                } else {
+                    continue;
+                }
+            }
+            _ => continue,
+        }
+        from_attribute = true;
+    }
+    if !from_attribute {
+        // Servers without RFC 6154 support (Outlook/Exchange, older Dovecot)
+        // send no attributes at all, so the name heuristic is the only signal
+        // they will ever produce.
+        kind = FolderKind::from_path(path);
+    }
+    (kind, from_attribute)
+}
+
+/// When a role has a real SPECIAL-USE folder, demote any name-matched impostor
+/// of that role to `Custom`.
+///
+/// Without this, a stray folder such as a plain top-level `Trash` label can
+/// shadow the server's actual `[Gmail]/Trash`, and mail "deleted" into it never
+/// leaves the mailbox — it just gains a label, while the sidebar shows the role
+/// twice. `Inbox` is excluded: it is never resolved by heuristic lookup.
+pub fn demote_name_matched_impostors(folders: &mut [ImapFolder], by_attribute: &[bool]) {
+    for role in [
+        FolderKind::Sent,
+        FolderKind::Drafts,
+        FolderKind::Trash,
+        FolderKind::Junk,
+        FolderKind::Archive,
+        FolderKind::Starred,
+    ] {
+        let has_authoritative = folders
+            .iter()
+            .zip(by_attribute)
+            .any(|(f, attr)| f.kind == role && *attr);
+        if has_authoritative {
+            for (f, attr) in folders.iter_mut().zip(by_attribute) {
+                if f.kind == role && !*attr {
+                    tracing::debug!(
+                        "demoting name-matched {:?} impostor {} (server has a {:?} folder)",
+                        role,
+                        f.path,
+                        role
+                    );
+                    f.kind = FolderKind::Custom;
+                }
+            }
+        }
+    }
 }
 
 /// Convert a library `Fetch` response into an `ImapMessageSummary`.

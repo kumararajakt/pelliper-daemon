@@ -177,14 +177,13 @@ impl Worker {
         let id = self.account.id;
         tracing::info!("Worker[{}]: starting ({})", id, self.account.email);
 
-        // If the cache is cold we must bootstrap the folder list now;
-        // otherwise the UI renders from cache while we connect lazily. Also
-        // bootstrap when messages survive but the folder table is empty: the
-        // sidebar would render empty and SyncAll would iterate zero folders.
-        if !self.has_cached_messages().await || self.cached_folders_missing().await {
-            if let Err(e) = self.connect().await {
-                tracing::error!("Worker[{}]: bootstrap connect failed: {}", id, e);
-            }
+        // Always connect at startup. The folder list is the one thing the UI
+        // cannot derive from the cache: folders created or removed in another
+        // client must converge here, and the sidebar reads `folders` directly.
+        // Messages are unaffected — a warm cache still paints instantly, and
+        // `connect()` only re-lists folders, it does not fetch mail.
+        if let Err(e) = self.connect().await {
+            tracing::error!("Worker[{}]: bootstrap connect failed: {}", id, e);
         }
 
         'outer: loop {
@@ -550,24 +549,42 @@ impl Worker {
             }
         }
     }
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
 
-    async fn has_cached_messages(&self) -> bool {
+    /// Resolve a semantic role (e.g. Trash) to a concrete folder path, using the
+    /// folder list already classified and cached by `connect()`.
+    ///
+    /// Reading the cache rather than re-issuing `LIST` is deliberate: the cached
+    /// rows have already had name-matched impostors demoted, so this returns the
+    /// server's authoritative special-use folder. A fresh `LIST` would re-apply
+    /// the name heuristic and pick whichever candidate the server happened to
+    /// list first — so "delete" could file mail into a user's own `Trash` label
+    /// instead of the real trash, where it would never leave the mailbox.
+    async fn resolve_role_folder(&self, kind: crate::types::FolderKind) -> Option<String> {
         let cache = self.cache.lock().await;
-        cache.has_cached_messages(self.account.id).unwrap_or(false)
+        let folders = cache.load_folders(self.account.id).ok()?;
+        folders
+            .into_iter()
+            .find(|f| !f.noselect && f.kind == kind.as_str())
+            .map(|f| f.path)
     }
 
-    /// True when the cache holds messages for this account but no folder rows —
-    /// a broken state (empty sidebar, SyncAll iterates nothing) that a
-    /// bootstrap `connect()` repairs by re-listing folders from the server.
-    async fn cached_folders_missing(&self) -> bool {
+    /// Whether the daemon's classified folder list says this path is `kind`.
+    ///
+    /// Prefers the cached classification over `FolderKind::from_path` because
+    /// the cached rows have had name-matched impostors demoted. Returns `false`
+    /// when the folder is unknown, so callers on a destructive path default to
+    /// the recoverable behaviour instead of the irreversible one.
+    async fn is_role_folder(&self, path: &str, kind: crate::types::FolderKind) -> bool {
         let cache = self.cache.lock().await;
-        match cache.load_folders(self.account.id) {
-            Ok(folders) => folders.is_empty(),
-            Err(_) => true,
-        }
+        cache
+            .load_folders(self.account.id)
+            .ok()
+            .map(|folders| {
+                folders
+                    .iter()
+                    .any(|f| f.path == path && f.kind == kind.as_str())
+            })
+            .unwrap_or(false)
     }
 }
 

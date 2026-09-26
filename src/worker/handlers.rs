@@ -233,32 +233,19 @@ impl Worker {
 
         let dest = match dest_folder {
             Some(d) if !d.is_empty() => d,
-            _ => {
-                let session = self.session.as_mut();
-                match session {
-                    Some(s) => {
-                        match imap::find_folder_by_kind(s, crate::types::FolderKind::Trash).await {
-                            Ok(Some(t)) => t,
-                            Ok(None) => {
-                                tracing::warn!(
-                                    "Worker[{}]: no Trash folder found for move",
-                                    self.account.id
-                                );
-                                return;
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Worker[{}]: trash lookup failed: {}",
-                                    self.account.id,
-                                    e
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    None => return,
+            _ => match self
+                .resolve_role_folder(crate::types::FolderKind::Trash)
+                .await
+            {
+                Some(t) => t,
+                None => {
+                    tracing::warn!(
+                        "Worker[{}]: no Trash folder found for move",
+                        self.account.id
+                    );
+                    return;
                 }
-            }
+            },
         };
 
         // Try the move; on auth error, invalidate token and retry once
@@ -335,8 +322,13 @@ impl Worker {
             return;
         }
 
-        let in_trash =
-            crate::types::FolderKind::from_path(folder_path) == crate::types::FolderKind::Trash;
+        // Consult the classified folder list, not the folder's name. `list_folders`
+        // demotes name-matched impostors when the server exposes a real SPECIAL-USE
+        // trash, so a user folder that merely happens to be called "Deleted" is a
+        // normal folder here and takes the soft delete instead of an EXPUNGE.
+        let in_trash = self
+            .is_role_folder(folder_path, crate::types::FolderKind::Trash)
+            .await;
 
         if in_trash {
             // Permanently delete: \Deleted + EXPUNGE
@@ -357,29 +349,18 @@ impl Worker {
             let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         } else {
             // Soft delete: move to Trash
-            let session = self.session.as_mut();
-            let trash = match session {
-                Some(s) => {
-                    match imap::find_folder_by_kind(s, crate::types::FolderKind::Trash).await {
-                        Ok(Some(t)) => t,
-                        Ok(None) => {
-                            tracing::warn!(
-                                "Worker[{}]: no Trash folder found for delete",
-                                self.account.id
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Worker[{}]: trash lookup failed: {}",
-                                self.account.id,
-                                e
-                            );
-                            return;
-                        }
-                    }
+            let trash = match self
+                .resolve_role_folder(crate::types::FolderKind::Trash)
+                .await
+            {
+                Some(t) => t,
+                None => {
+                    tracing::warn!(
+                        "Worker[{}]: no Trash folder found for delete",
+                        self.account.id
+                    );
+                    return;
                 }
-                None => return,
             };
             if self.do_move(folder_path, uid, &trash).await.is_ok() {
                 let cache = self.cache.lock().await;

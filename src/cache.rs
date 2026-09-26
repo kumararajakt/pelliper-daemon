@@ -247,15 +247,6 @@ impl Cache {
         Ok(count)
     }
 
-    pub fn has_cached_messages(&self, account_id: i64) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE account_id = ?1",
-            rusqlite::params![account_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
     pub fn account_exists(&self, email: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM accounts WHERE email = ?1",
