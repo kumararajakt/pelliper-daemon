@@ -5,11 +5,11 @@ use tokio::time::{timeout, Duration};
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use async_imap::imap_proto::types::{BodyStructure, SectionPath};
+use async_imap::imap_proto::types::{Address, BodyStructure, SectionPath};
 use async_imap::types::{Fetch, Flag, NameAttribute};
 use futures::StreamExt;
 
-use crate::types::{FolderKind, ImapFolder, ImapMessageSummary};
+use crate::types::{FolderKind, ImapFolder, ImapMessageSummary, MessageHeaders};
 
 pub type CompatTls = tokio_util::compat::Compat<TlsStream<TcpStream>>;
 /// The authenticated IMAP session type used by the worker.
@@ -18,9 +18,24 @@ pub type ImapSession = async_imap::Session<CompatTls>;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IMAP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Summary fetch query: UID, flags, body structure, inline preview bytes,
-/// and the headers needed for subject/sender/date/threading.
-const SUMMARY_FETCH_QUERY: &str = "(UID FLAGS BODYSTRUCTURE BODY.PEEK[1]<0.2048> BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE MESSAGE-ID REFERENCES IN-REPLY-TO)])";
+/// Summary fetch query: UID, flags, body structure, the server-computed
+/// `ENVELOPE`, and the two threading headers `ENVELOPE` has no field for.
+///
+/// `ENVELOPE` covers the ten RFC2822 fields the server can decode for us, and
+/// is the only source of `To`/`Cc`/`Bcc`/`Reply-To`. It has exactly ten
+/// fields and **no `references`**, so `HEADER.FIELDS (REFERENCES
+/// IN-REPLY-TO)` is fetched alongside it: `src/threadmodel.cpp` builds its
+/// union-find from `references_`, and with it empty every message would be
+/// its own thread root.
+///
+/// The field list is deliberately narrow. Fetching the whole block
+/// (`BODY.PEEK[HEADER]`) cost ~5.6 KB per message — almost entirely
+/// `Return-Path`, `DKIM-Signature`, `ARC-Seal` and `Received`, none of which
+/// anything reads. `PEEK` keeps `\Seen` unset.
+///
+/// Both attributes cost the same round trip: this is one FETCH either way.
+const SUMMARY_FETCH_QUERY: &str =
+    "(UID FLAGS BODYSTRUCTURE ENVELOPE BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])";
 
 /// Inline preview characters kept per summary.
 const PREVIEW_CHARS: usize = 240;
@@ -234,7 +249,7 @@ pub async fn fetch_recent_summaries(
             summaries.push(msg);
         }
     }
-    summaries.sort_by(|a, b| b.date.cmp(&a.date));
+    summaries.sort_by(|a, b| b.headers.date_ts.cmp(&a.headers.date_ts));
     summaries.truncate(limit);
     tracing::info!(
         "Fetched {} recent messages from {}",
@@ -430,10 +445,16 @@ pub fn demote_name_matched_impostors(folders: &mut [ImapFolder], by_attribute: &
 
 /// Convert a library `Fetch` response into an `ImapMessageSummary`.
 ///
-/// Headers come from the `BODY[HEADER.FIELDS (...)]` literal (normalized by
-/// imap-proto to `SectionPath::Full(Header)`, so `fetch.header()` returns it);
-/// the preview from the `BODY[1]<0.2048>` partial (matched as
-/// `SectionPath::Part([1], None)`); attachments from the typed BODYSTRUCTURE.
+/// The typed `ENVELOPE` supplies every address and scalar header, and
+/// `HEADER.FIELDS (REFERENCES IN-REPLY-TO)` — which imap-proto also normalizes
+/// to `SectionPath::Full(Header)`, so `fetch.header()` returns it — supplies
+/// the two fields ENVELOPE cannot express. Whichever the server populated wins,
+/// envelope first, so servers that omit one still produce a full row.
+/// Attachments come from the typed BODYSTRUCTURE.
+///
+/// `preview` is read from the `BODY[1]` partial (`SectionPath::Part([1], None)`),
+/// which `SUMMARY_FETCH_QUERY` does not currently request — so it is always
+/// empty until a `BODY.PEEK[1]<0.N>` item is added back to the query.
 fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
     let uid = fetch.uid.unwrap_or(0) as i64;
     if uid == 0 {
@@ -455,36 +476,96 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
         .map(bodystructure_has_attachments)
         .unwrap_or(false);
 
-    // Inline preview from the BODY[1] partial (may be absent on some servers).
+    // Inline preview from the BODY[1] partial; absent because the fetch query
+    // does not request it, so this is always empty.
     let preview = fetch
         .section(&SectionPath::Part(vec![1], None))
         .map(preview_from_unknown)
         .unwrap_or_default();
 
-    // Header block from the BODY[HEADER.FIELDS (...)] literal.
     let header_bytes = fetch.header().unwrap_or_default();
     let header_text = String::from_utf8_lossy(header_bytes);
+    let env = fetch.envelope();
 
-    let subject = parse_header(&header_text, "Subject");
-    let sender = parse_header(&header_text, "From");
-    let date_str = parse_header(&header_text, "Date");
-    let date = parse_date(&date_str);
-    // Normalize Message-IDs (strip angle brackets / comments) so threading
-    // links match regardless of raw vs ENVELOPE source.
-    let message_id = normalize_message_id(&parse_header(&header_text, "Message-ID"));
+    // ENVELOPE is now the *only* source for these: the fetched header block
+    // holds just References and In-Reply-To, so there is nothing to fall back
+    // to for the rest. A server that omits ENVELOPE therefore yields empty
+    // scalars — it would also break every other IMAP client.
+    let subject = env
+        .and_then(|e| envelope_scalar(e.subject.as_deref()))
+        .unwrap_or_default();
+    let date_header = env
+        .and_then(|e| envelope_scalar(e.date.as_deref()))
+        .unwrap_or_default();
+    let raw_message_id = env
+        .and_then(|e| envelope_scalar(e.message_id.as_deref()))
+        .unwrap_or_default();
+    let envelope_in_reply_to = env
+        .and_then(|e| envelope_scalar(e.in_reply_to.as_deref()))
+        .unwrap_or_default();
+
+    // The six address lists, each already JSON. A list the server did not send
+    // is the empty array, and so is a wholly absent ENVELOPE, so the column
+    // contract in `cache.rs` ("absent is `[]`, not NULL") holds either way.
+    const NO_ADDRESSES: &str = "[]";
+    let (from, from_hdr, reply_to, to, cc, bcc) = match &env {
+        Some(e) => (
+            envelope_addresses(e.from.as_deref()),
+            envelope_addresses(e.sender.as_deref()),
+            envelope_addresses(e.reply_to.as_deref()),
+            envelope_addresses(e.to.as_deref()),
+            envelope_addresses(e.cc.as_deref()),
+            // Stripped by the sending MTA, so ENVELOPE rarely carries it.
+            envelope_addresses(e.bcc.as_deref()),
+        ),
+        None => (
+            NO_ADDRESSES.to_string(),
+            NO_ADDRESSES.to_string(),
+            NO_ADDRESSES.to_string(),
+            NO_ADDRESSES.to_string(),
+            NO_ADDRESSES.to_string(),
+            NO_ADDRESSES.to_string(),
+        ),
+    };
+
+    let date = parse_date(&date_header);
+
+    // Message-IDs are normalized (angle brackets / comments stripped) so that
+    // threading links match no matter which source supplied them — the UI's
+    // union-find in `src/threadmodel.cpp` compares these strings verbatim.
+    let message_id = normalize_message_id(&raw_message_id);
+    let mut in_reply_to = normalize_references(&envelope_in_reply_to);
+    if in_reply_to.is_empty() {
+        in_reply_to = normalize_references(&parse_header(&header_text, "In-Reply-To"));
+    }
+    // `References` has no ENVELOPE field, so the header block is its only
+    // source. Fall back to In-Reply-To so a single-level reply still threads
+    // when the sender omitted References.
     let references_raw = parse_header(&header_text, "References");
-    let in_reply_to = normalize_references(&parse_header(&header_text, "In-Reply-To"));
-
-    // Use In-Reply-To as fallback for References if empty.
     let references = if references_raw.is_empty() {
-        in_reply_to
+        in_reply_to.clone()
     } else {
         normalize_references(&references_raw)
     };
 
-    if subject.is_empty() && sender.is_empty() && uid != 0 {
+    let headers = MessageHeaders {
+        subject: subject.clone(),
+        from: from.clone(),
+        sender: from_hdr,
+        reply_to,
+        to,
+        cc,
+        bcc,
+        date: date_header,
+        date_ts: date,
+        in_reply_to,
+        references,
+        message_id,
+    };
+
+    if subject.is_empty() && from == "[]" && uid != 0 {
         tracing::debug!(
-            "Empty headers for uid={}, header_text (first 200): {:?}",
+            "Empty ENVELOPE for uid={}, fetched header text: {:?}",
             uid,
             &header_text[..header_text.len().min(200)]
         );
@@ -492,16 +573,251 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
 
     Some(ImapMessageSummary {
         uid,
-        subject,
-        sender,
-        date,
+        from,
         is_read,
         is_starred,
         has_attachments,
         preview,
-        message_id,
-        references,
+        headers,
     })
+}
+
+/// The first `{name, email}` entry of a stored address header, for indexing a
+/// single correspondent (e.g. the sender autocomplete).
+pub fn first_address(list_json: &str) -> Option<(String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        email: String,
+    }
+    let entries: Vec<Entry> = serde_json::from_str(list_json).ok()?;
+    let first = entries.into_iter().next()?;
+    if first.email.is_empty() && first.name.is_empty() {
+        None
+    } else {
+        Some((first.email, first.name))
+    }
+}
+
+/// Decode an `ENVELOPE` scalar (date, subject, in-reply-to, message-id).
+/// Returns `None` for NIL so the caller can fall back to the header block.
+fn envelope_scalar(value: Option<&[u8]>) -> Option<String> {
+    let raw = value.filter(|b| !b.is_empty())?;
+    Some(decode_rfc2047(&String::from_utf8_lossy(raw)))
+}
+
+/// One entry of a stored address header, serialized into the JSON array that
+/// lives in the `*_addr` columns of `message_headers`.
+///
+/// `name` and `email` are always present (possibly empty strings) so the UI
+/// never has to test for a missing key.
+#[derive(serde::Serialize)]
+struct AddressEntry {
+    name: String,
+    email: String,
+}
+
+/// Format an `ENVELOPE` address list as a JSON array of `{name, email}`
+/// objects, e.g. `[{"name":"Alice","email":"alice@example.com"}]`.
+///
+/// Structured rather than a flat display string so recipients stay
+/// addressable: group syntax (a `host` of NIL) yields an entry with an empty
+/// `email` and the group name in `name`, which a display string would lose.
+/// The UI turns one of these back into display text on read.
+fn envelope_addresses(list: Option<&[Address<'_>]>) -> String {
+    let entries: Vec<AddressEntry> = list
+        .unwrap_or_default()
+        .iter()
+        .map(envelope_address)
+        .filter(|e| !e.name.is_empty() || !e.email.is_empty())
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Split one `ENVELOPE` address into its personal name and addr-spec.
+fn envelope_address(addr: &Address<'_>) -> AddressEntry {
+    let part = |v: Option<&[u8]>| -> String {
+        v.filter(|b| !b.is_empty())
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default()
+    };
+    let mailbox = part(addr.mailbox.as_deref());
+    let host = part(addr.host.as_deref());
+    // A NIL host with a non-empty mailbox is group syntax: the mailbox holds
+    // the *group name*, not an addr-spec, so it belongs in `name` with an
+    // empty `email`. Putting it in `email` would hand the UI something that
+    // looks addressable but is not.
+    let (name_from_mailbox, email) = if mailbox.is_empty() {
+        (String::new(), host)
+    } else if host.is_empty() {
+        (mailbox, String::new())
+    } else {
+        (String::new(), format!("{}@{}", mailbox, host))
+    };
+    let name = addr
+        .name
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .map(|b| decode_rfc2047(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
+    AddressEntry {
+        name: if name.is_empty() {
+            name_from_mailbox
+        } else {
+            name
+        },
+        email,
+    }
+}
+
+/// Parse an address header out of a raw header block into the same JSON shape
+/// `envelope_addresses` produces, so both write paths agree on one format.
+///
+/// Used only by the body-fetch path, which has the whole message; the FETCH
+/// path gets structured addresses from ENVELOPE directly.
+fn address_list_from_raw(value: &str) -> String {
+    let entries: Vec<AddressEntry> = split_address_list(value)
+        .into_iter()
+        .filter_map(|one| parse_one_address(&one).map(|(email, name)| AddressEntry { name, email }))
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Split one address into `(email, display name)`.
+///
+/// Takes the last `<...>` as the addr-spec and everything before it as the
+/// display name; with no angle brackets the whole thing is the addr-spec.
+/// Strips RFC2047 encoding from the name, matching `envelope_address`.
+fn parse_one_address(one: &str) -> Option<(String, String)> {
+    let one = one.trim();
+    if one.is_empty() {
+        return None;
+    }
+    // Group syntax, e.g. `undisclosed-recipients:;`. The name is the group
+    // label; there is no addr-spec, matching how `envelope_address` treats a
+    // NIL host.
+    if let Some(group) = one.strip_suffix(":;") {
+        let group = group.trim();
+        return if group.is_empty() {
+            None
+        } else {
+            Some((String::new(), group.to_string()))
+        };
+    }
+    let (name, email) = match (one.rfind('<'), one.rfind('>')) {
+        (Some(lt), Some(gt)) if gt > lt => (
+            decode_rfc2047(one[..lt].trim().trim_matches('"').trim()),
+            one[lt + 1..gt].trim().to_string(),
+        ),
+        _ => (String::new(), one.to_string()),
+    };
+    let email = email.trim_matches(['<', '>']).trim().to_string();
+    if name.is_empty() && email.is_empty() {
+        None
+    } else {
+        Some((email, name))
+    }
+}
+
+/// Split an address header on top-level commas, respecting quoted strings and
+/// angle brackets so `Doe, Jane <j@x>` stays in one piece.
+fn split_address_list(value: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut angle = 0i32;
+    for ch in value.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                current.push(ch);
+            }
+            '<' if !quoted => {
+                angle += 1;
+                current.push(ch);
+            }
+            '>' if !quoted => {
+                angle = (angle - 1).max(0);
+                current.push(ch);
+            }
+            ',' if !quoted && angle == 0 => parts.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current);
+    }
+    parts.into_iter().map(|p| p.trim().to_string()).collect()
+}
+
+/// Split a raw RFC822 message into its header block and body.
+///
+/// Returns everything before the first blank line, excluding that line's own
+/// terminator, so the result is exactly the header lines. Handles both CRLF
+/// and bare-LF endings. A message with no blank line is treated as
+/// all-headers rather than erroring.
+pub fn split_header_block(raw: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    while start < raw.len() {
+        let Some(rel) = raw[start..].iter().position(|&b| b == b'\n') else {
+            break; // unterminated final line
+        };
+        let line_end = start + rel;
+        // An empty line ("\n") or a bare CR ("\r\n") ends the header block.
+        if raw[start..line_end].iter().all(|&b| b == b'\r') {
+            // Drop the terminator of the header line above it.
+            return match raw[..start].strip_suffix(b"\r\n") {
+                Some(block) => block,
+                None => raw[..start].strip_suffix(b"\n").unwrap_or(&raw[..start]),
+            };
+        }
+        start = line_end + 1;
+    }
+    raw
+}
+
+/// Build a `MessageHeaders` from a complete raw RFC822 message — the
+/// `BODY.PEEK[]` payload.
+///
+/// The body-fetch path already holds every header, so this fills in
+/// `message_headers` at no extra network cost. It covers messages the
+/// header-only FETCH never reached (older mail, backfill that has not run)
+/// and refreshes rows whose ENVELOPE fields were previously empty.
+/// Build a `MessageHeaders` from a complete raw RFC822 message.
+///
+/// Used by the body-fetch path, which already has the whole message in hand,
+/// so it reads every header directly. Address fields go out in the same JSON
+/// shape the FETCH path produces, so the two paths agree on one column format
+/// — that matters because they can write the same message in either order.
+pub fn headers_from_raw_message(raw: &[u8]) -> MessageHeaders {
+    let block = split_header_block(raw);
+    let text = String::from_utf8_lossy(block);
+    let at = |name: &str| -> String { parse_header(&text, name) };
+    let date = at("Date");
+    let in_reply_to_raw = at("In-Reply-To");
+    let references_raw = at("References");
+    let in_reply_to = normalize_references(&in_reply_to_raw);
+    MessageHeaders {
+        subject: at("Subject"),
+        from: address_list_from_raw(&at("From")),
+        sender: address_list_from_raw(&at("Sender")),
+        reply_to: address_list_from_raw(&at("Reply-To")),
+        to: address_list_from_raw(&at("To")),
+        cc: address_list_from_raw(&at("Cc")),
+        bcc: address_list_from_raw(&at("Bcc")),
+        date_ts: parse_date(&date),
+        date,
+        in_reply_to: in_reply_to.clone(),
+        // Same fallback the FETCH path applies, so both agree on one column.
+        references: if references_raw.is_empty() {
+            in_reply_to
+        } else {
+            normalize_references(&references_raw)
+        },
+        message_id: normalize_message_id(&at("Message-ID")),
+    }
 }
 
 /// Detect attachments from a typed BODYSTRUCTURE: a part with a name/filename

@@ -177,11 +177,6 @@ impl Worker {
         let id = self.account.id;
         tracing::info!("Worker[{}]: starting ({})", id, self.account.email);
 
-        // Always connect at startup. The folder list is the one thing the UI
-        // cannot derive from the cache: folders created or removed in another
-        // client must converge here, and the sidebar reads `folders` directly.
-        // Messages are unaffected — a warm cache still paints instantly, and
-        // `connect()` only re-lists folders, it does not fetch mail.
         if let Err(e) = self.connect().await {
             tracing::error!("Worker[{}]: bootstrap connect failed: {}", id, e);
         }
@@ -191,7 +186,7 @@ impl Worker {
                 break;
             }
 
-            // ---- Priority 0: drain every pending user request (non-blocking)
+            // ---- Step 0: drain every pending user request (non-blocking)
             if let Some(req) = self.pending.take() {
                 self.handle_request(req).await;
             }
@@ -207,19 +202,19 @@ impl Worker {
                 }
             }
 
-            // ---- Priority 1: body prefetch (one per iteration)
+            // ---- Step 1: body prefetch (one per iteration)
             if let Some((path, uid)) = self.body_prefetch.pop_front() {
                 self.run_one_body_prefetch(&path, uid).await;
                 continue;
             }
 
-            // ---- Priority 2: attachment prefetch (one per iteration)
+            // ---- Step 2: attachment prefetch (one per iteration)
             if let Some((path, uid)) = self.attachment_prefetch.pop_front() {
                 self.run_one_attachment_prefetch(&path, uid).await;
                 continue;
             }
 
-            // ---- Priority 3: backfill chunk (one chunk per iteration)
+            // ---- Step 3: backfill chunk (one chunk per iteration)
             if let Some(job) = self.backfill_queue.front_mut() {
                 let n = BACKFILL_CHUNK.min(job.remaining.len());
                 if n > 0 {
@@ -233,7 +228,7 @@ impl Worker {
                 }
             }
 
-            // ---- Priority 4: IDLE (blocks until push notification)
+            // ---- Step 4: IDLE (blocks until push notification)
             if self.session.is_some() {
                 if let Some(folder) = self.current_folder.clone() {
                     match self.idle_wait(&folder).await {
@@ -478,23 +473,40 @@ impl Worker {
         {
             let cache = self.cache.lock().await;
             for msg in &summaries {
-                let _ = cache.upsert_message(
+                if let Err(e) = cache.upsert_message(
                     self.account.id,
                     folder_path,
                     msg.uid,
-                    &msg.subject,
-                    &msg.sender,
-                    msg.date,
                     msg.is_read,
                     msg.is_starred,
                     msg.has_attachments,
                     &msg.preview,
-                    &msg.message_id,
-                    &msg.references,
-                );
-                // Record sender address for autocomplete.
-                if let Some((email, name)) = parse_address(&msg.sender) {
+                ) {
+                    tracing::error!(
+                        "Worker[{}]: upsert_message {}/{} failed: {e}",
+                        self.account.id,
+                        folder_path,
+                        msg.uid
+                    );
+                    continue;
+                }
+                // Record sender address for autocomplete. The From list is
+                // JSON, so take its first entry.
+                if let Some((email, name)) = imap::first_address(&msg.from) {
                     let _ = cache.upsert_address(&email, &name);
+                }
+                // Full header block + ENVELOPE. Must follow upsert_message:
+                // the row is foreign-keyed to it, so it cannot be written
+                // first. This is also what indexes the message for search.
+                if let Err(e) =
+                    cache.save_message_headers(self.account.id, folder_path, msg.uid, &msg.headers)
+                {
+                    tracing::error!(
+                        "Worker[{}]: save_message_headers {}/{} failed: {e}",
+                        self.account.id,
+                        folder_path,
+                        msg.uid
+                    );
                 }
             }
             // Use the whole-cache unread count, not just this page, so re-opens
@@ -598,27 +610,4 @@ enum IdleResult {
     Disconnected,
     /// A request arrived during IDLE; it was stored on `self.pending`.
     Request,
-}
-
-/// Parse an IMAP sender string like "John Doe <john@example.com>" into
-/// (email, display_name). Returns None if the string is empty or unparseable.
-fn parse_address(sender: &str) -> Option<(String, String)> {
-    let s = sender.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if let Some(start) = s.find('<') {
-        if let Some(end) = s.find('>') {
-            let email = s[start + 1..end].trim().to_string();
-            let name = s[..start].trim().trim_matches('"').to_string();
-            if !email.is_empty() {
-                return Some((email, name));
-            }
-        }
-    }
-    // Bare email address (no angle brackets).
-    if s.contains('@') && !s.contains(' ') {
-        return Some((s.to_string(), String::new()));
-    }
-    None
 }

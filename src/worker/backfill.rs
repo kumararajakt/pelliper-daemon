@@ -88,20 +88,37 @@ impl Worker {
             Ok(summaries) => {
                 let cache = self.cache.lock().await;
                 for msg in &summaries {
-                    let _ = cache.upsert_message(
+                    if let Err(e) = cache.upsert_message(
                         self.account.id,
                         folder_path,
                         msg.uid,
-                        &msg.subject,
-                        &msg.sender,
-                        msg.date,
                         msg.is_read,
                         msg.is_starred,
                         msg.has_attachments,
                         &msg.preview,
-                        &msg.message_id,
-                        &msg.references,
-                    );
+                    ) {
+                        tracing::error!(
+                            "Worker[{}]: upsert_message {}/{} failed: {e}",
+                            self.account.id,
+                            folder_path,
+                            msg.uid
+                        );
+                        continue;
+                    }
+                    // After upsert_message: the header row is keyed to it.
+                    if let Err(e) = cache.save_message_headers(
+                        self.account.id,
+                        folder_path,
+                        msg.uid,
+                        &msg.headers,
+                    ) {
+                        tracing::error!(
+                            "Worker[{}]: save_message_headers {}/{} failed: {e}",
+                            self.account.id,
+                            folder_path,
+                            msg.uid
+                        );
+                    }
                 }
                 tracing::debug!(
                     "Worker[{}]: backfilled {} messages in {}",

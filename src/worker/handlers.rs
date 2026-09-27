@@ -73,7 +73,14 @@ impl Worker {
         match self.fetch_single_body(folder_path, uid).await {
             Ok((html, has_attachments)) => {
                 let cache = self.cache.lock().await;
-                let _ = cache.save_body(self.account.id, folder_path, uid, &html);
+                if let Err(e) = cache.save_body(self.account.id, folder_path, uid, &html) {
+                    tracing::error!(
+                        "Worker[{}]: save_body {}/{} failed: {e}",
+                        self.account.id,
+                        folder_path,
+                        uid
+                    );
+                }
                 let _ =
                     cache.update_has_attachment(self.account.id, folder_path, uid, has_attachments);
                 html
@@ -92,7 +99,14 @@ impl Worker {
                 match self.fetch_single_body(folder_path, uid).await {
                     Ok((html, has_attachments)) => {
                         let cache = self.cache.lock().await;
-                        let _ = cache.save_body(self.account.id, folder_path, uid, &html);
+                        if let Err(e) = cache.save_body(self.account.id, folder_path, uid, &html) {
+                            tracing::error!(
+                                "Worker[{}]: save_body {}/{} failed: {e}",
+                                self.account.id,
+                                folder_path,
+                                uid
+                            );
+                        }
                         let _ = cache.update_has_attachment(
                             self.account.id,
                             folder_path,
@@ -112,7 +126,9 @@ impl Worker {
         // sure the session is live first: `connect()` refreshes the folder list
         // from the server, so a cache holding stale messages but an empty
         // folder table (empty sidebar) self-heals instead of iterating zero
-        // folders and doing nothing.
+        // folders and doing nothing. `connect()` only lists folders — it does
+        // not fetch first pages — so a fresh cache stays empty until something
+        // requests a sync.
         if let Err(e) = self.ensure_session().await {
             tracing::error!("Worker[{}]: sync_all: no session: {}", self.account.id, e);
             return;

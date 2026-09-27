@@ -34,7 +34,8 @@ impl Worker {
         };
 
         // Persist body + attachments so both are cached for offline/viewing.
-        self.persist_parsed(folder_path, uid, &html, &parsed).await;
+        self.persist_parsed(folder_path, uid, &html, &parsed, &raw)
+            .await;
 
         Ok((html, parsed.has_attachments))
     }
@@ -42,22 +43,54 @@ impl Worker {
     /// Save the parsed body HTML and any attachment files for a message, then
     /// refresh its `has_attachments` flag. Files land under
     /// `attachments/<account>/<sanitized-folder>/<uid>/<index>_<name>`.
+    ///
+    /// `raw` is the complete `BODY.PEEK[]` payload, so the header block is
+    /// already in hand: it is cached into `message_headers` here at no extra
+    /// network cost, which also covers messages the header-only FETCH never
+    /// reached.
     async fn persist_parsed(
         &mut self,
         folder_path: &str,
         uid: i64,
         html: &str,
         parsed: &imap::ParsedBody,
+        raw: &[u8],
     ) {
         {
             let cache = self.cache.lock().await;
-            let _ = cache.save_body(self.account.id, folder_path, uid, html);
-            let _ = cache.update_has_attachment(
+            // Logged, not swallowed: a silently-failing body write is exactly
+            // how the broken FTS trigger hid for so long.
+            if let Err(e) = cache.save_body(self.account.id, folder_path, uid, html) {
+                tracing::error!(
+                    "Worker[{}]: save_body {}/{} failed: {e}",
+                    self.account.id,
+                    folder_path,
+                    uid
+                );
+            }
+            if let Err(e) = cache.update_has_attachment(
                 self.account.id,
                 folder_path,
                 uid,
                 parsed.has_attachments,
-            );
+            ) {
+                tracing::warn!(
+                    "Worker[{}]: update_has_attachment {}/{} failed: {e}",
+                    self.account.id,
+                    folder_path,
+                    uid
+                );
+            }
+            let headers = imap::headers_from_raw_message(raw);
+            if let Err(e) = cache.save_message_headers(self.account.id, folder_path, uid, &headers)
+            {
+                tracing::error!(
+                    "Worker[{}]: save_message_headers {}/{} failed: {e}",
+                    self.account.id,
+                    folder_path,
+                    uid
+                );
+            }
         }
 
         if parsed.attachments.is_empty() {
@@ -107,7 +140,14 @@ impl Worker {
 
         if !records.is_empty() {
             let cache = self.cache.lock().await;
-            let _ = cache.replace_attachments(self.account.id, folder_path, uid, &records);
+            if let Err(e) = cache.replace_attachments(self.account.id, folder_path, uid, &records) {
+                tracing::error!(
+                    "Worker[{}]: replace_attachments {}/{} failed: {e}",
+                    self.account.id,
+                    folder_path,
+                    uid
+                );
+            }
             tracing::debug!(
                 "Worker[{}]: cached {} attachment(s) for {} uid={}",
                 self.account.id,
@@ -162,7 +202,8 @@ impl Worker {
                 } else {
                     parsed.html.clone()
                 };
-                self.persist_parsed(folder_path, uid, &html, &parsed).await;
+                self.persist_parsed(folder_path, uid, &html, &parsed, &raw)
+                    .await;
                 tracing::debug!(
                     "Worker[{}]: prefetched body for {} uid={}",
                     self.account.id,

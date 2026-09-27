@@ -1,4 +1,4 @@
-use crate::types::{Account, AttachmentRecord, Folder, Message, OutboxItem};
+use crate::types::{Account, AttachmentRecord, Folder, Message, MessageHeaders, OutboxItem};
 use rusqlite::{Connection, Result};
 use std::path::PathBuf;
 
@@ -53,17 +53,57 @@ impl Cache {
                 account_id INTEGER NOT NULL,
                 folder_path TEXT NOT NULL,
                 uid INTEGER NOT NULL,
-                subject TEXT,
-                sender TEXT,
-                date INTEGER,
-                in_reply_to TEXT,
-                message_id TEXT,
-                references_ TEXT,
                 has_attachments INTEGER DEFAULT 0,
                 is_read INTEGER DEFAULT 0,
                 is_starred INTEGER DEFAULT 0,
                 preview TEXT,
                 PRIMARY KEY (account_id, folder_path, uid)
+            );
+
+            -- Every header of every message, and the only place they live.
+            --
+            -- The six `*_addr` columns are JSON arrays of objects with `name`
+            -- and `email` keys, e.g. a one-element list holding Alice's
+            -- display name and address. An absent header is the two-character
+            -- string `[]`, not NULL. They are structured rather than display
+            -- strings so recipients stay addressable (a group entry has no
+            -- addr-spec, and the UI wants the name and the address
+            -- separately); the UI renders one back to text on read. FTS
+            -- indexes `from_addr` as its `sender` column -- FTS5 tokenizes
+            -- the JSON punctuation away, so both the name and the address stay
+            -- searchable.
+            --
+            -- `date_ts` is the parsed unix timestamp of the `Date:` header and
+            -- exists because `date` itself is a string: ordering by the raw
+            -- header sorts lexically on the weekday name. Every `ORDER BY` on
+            -- message recency uses this column, never `date`.
+            --
+            -- `ENVELOPE` has no `references` field, so `references_` is the one
+            -- column that cannot come from it; the daemon fetches
+            -- `HEADER.FIELDS (REFERENCES IN-REPLY-TO)` alongside the envelope
+            -- purely to fill it. Threading reads it.
+            --
+            -- FK to `messages` is what forces write order: a header row cannot
+            -- be inserted before its message, which is also why the FTS
+            -- triggers fire from this table rather than from `messages`.
+            CREATE TABLE IF NOT EXISTS message_headers (
+                account_id INTEGER NOT NULL,
+                folder_path TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                subject TEXT,
+                from_addr TEXT,
+                sender_addr TEXT,
+                reply_to_addr TEXT,
+                to_addr TEXT,
+                cc_addr TEXT,
+                bcc_addr TEXT,
+                date TEXT,
+                date_ts INTEGER NOT NULL DEFAULT 0,
+                in_reply_to TEXT,
+                references_ TEXT,
+                message_id TEXT,
+                PRIMARY KEY (account_id, folder_path, uid),
+                FOREIGN KEY (account_id, folder_path, uid) REFERENCES messages(account_id, folder_path, uid) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS bodies (
@@ -125,40 +165,105 @@ impl Cache {
                 account_id UNINDEXED, folder_path UNINDEXED, uid UNINDEXED
             );
 
-            CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id,
+            -- Search index maintenance.
+            --
+            -- Rows are keyed on `messages.rowid` and maintained from
+            -- `message_headers`, which is where the indexed columns now live.
+            -- Every trigger rebuilds the WHOLE row rather than issuing a
+            -- partial column insert: FTS5 rejects a partial INSERT against an
+            -- existing rowid ('constraint failed'), and that error rolls back
+            -- the enclosing statement — which is why the old bodies_fts_ai,
+            -- doing `INSERT INTO messages_fts(body, rowid)`, silently
+            -- discarded every cached body.
+            --
+            -- There is deliberately NO trigger on `messages` UPDATE. Flag
+            -- changes fire it constantly, and reindexing on every read toggle
+            -- is pure waste; `preview` is not reindexed either (it is always
+            -- empty — see SUMMARY_FETCH_QUERY).
+
+            CREATE TRIGGER IF NOT EXISTS message_headers_fts_ai AFTER INSERT ON message_headers BEGIN
+                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
+                    WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid);
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
                                          account_id, folder_path, uid)
-                VALUES (new.rowid, new.subject, new.sender, new.preview, new.message_id,
-                        new.account_id, new.folder_path, new.uid);
+                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
+                       m.account_id, m.folder_path, m.uid
+                FROM messages m
+                JOIN message_headers h
+                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+                LEFT JOIN bodies b
+                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
+                WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid;
             END;
 
-            CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
-                DELETE FROM messages_fts WHERE rowid = old.rowid;
+            CREATE TRIGGER IF NOT EXISTS message_headers_fts_au AFTER UPDATE ON message_headers BEGIN
+                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
+                    WHERE m.account_id = old.account_id AND m.folder_path = old.folder_path AND m.uid = old.uid);
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
+                                         account_id, folder_path, uid)
+                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
+                       m.account_id, m.folder_path, m.uid
+                FROM messages m
+                JOIN message_headers h
+                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+                LEFT JOIN bodies b
+                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
+                WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid;
             END;
 
-            CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
-                DELETE FROM messages_fts WHERE rowid = old.rowid;
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id,
-                                         account_id, folder_path, uid)
-                VALUES (new.rowid, new.subject, new.sender, new.preview, new.message_id,
-                        new.account_id, new.folder_path, new.uid);
+            CREATE TRIGGER IF NOT EXISTS message_headers_fts_ad AFTER DELETE ON message_headers BEGIN
+                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
+                    WHERE m.account_id = old.account_id AND m.folder_path = old.folder_path AND m.uid = old.uid);
             END;
 
             CREATE TRIGGER IF NOT EXISTS bodies_fts_ai AFTER INSERT ON bodies BEGIN
-                INSERT INTO messages_fts(body, rowid)
-                VALUES (new.html, (SELECT rowid FROM messages
-                        WHERE account_id = new.account_id
-                          AND folder_path = new.folder_path
-                          AND uid = new.uid));
+                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
+                    WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid);
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
+                                         account_id, folder_path, uid)
+                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
+                       m.account_id, m.folder_path, m.uid
+                FROM messages m
+                JOIN message_headers h
+                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+                JOIN bodies b
+                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
+                WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid;
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS bodies_fts_au AFTER UPDATE ON bodies BEGIN
+                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
+                    WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid);
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
+                                         account_id, folder_path, uid)
+                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
+                       m.account_id, m.folder_path, m.uid
+                FROM messages m
+                JOIN message_headers h
+                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+                JOIN bodies b
+                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
+                WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid;
             END;
 
             CREATE TRIGGER IF NOT EXISTS bodies_fts_ad AFTER DELETE ON bodies BEGIN
-                UPDATE messages_fts
-                SET body = NULL
-                WHERE rowid = (SELECT rowid FROM messages
-                        WHERE account_id = old.account_id
-                          AND folder_path = old.folder_path
-                          AND uid = old.uid);
+                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
+                    WHERE m.account_id = old.account_id AND m.folder_path = old.folder_path AND m.uid = old.uid);
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
+                                         account_id, folder_path, uid)
+                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, NULL,
+                       m.account_id, m.folder_path, m.uid
+                FROM messages m
+                JOIN message_headers h
+                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+                WHERE m.account_id = old.account_id AND m.folder_path = old.folder_path AND m.uid = old.uid;
+            END;
+
+            -- Deleting a message cascades to its header row, whose trigger
+            -- already removed the FTS row; this covers a message that has no
+            -- header row at all.
+            CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+                DELETE FROM messages_fts WHERE rowid = old.rowid;
             END;
             ",
         )?;
@@ -169,19 +274,15 @@ impl Cache {
         if count == 0 {
             self.conn.execute_batch(
                 "
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id,
+                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
                                          account_id, folder_path, uid)
-                SELECT rowid, subject, sender, preview, message_id, account_id, folder_path, uid
-                FROM messages;
-
-                UPDATE messages_fts
-                SET body = (
-                    SELECT b.html FROM bodies b
-                    JOIN messages m ON m.rowid = messages_fts.rowid
-                    WHERE b.account_id = m.account_id
-                      AND b.folder_path = m.folder_path
-                      AND b.uid = m.uid
-                );
+                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
+                       m.account_id, m.folder_path, m.uid
+                FROM messages m
+                JOIN message_headers h
+                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+                LEFT JOIN bodies b
+                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid;
                 ",
             )?;
         }
@@ -304,22 +405,17 @@ impl Cache {
         account_id: i64,
         folder_path: &str,
         uid: i64,
-        subject: &str,
-        sender: &str,
-        date: i64,
         is_read: bool,
         is_starred: bool,
         has_attachments: bool,
         preview: &str,
-        message_id: &str,
-        references: &str,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO messages (account_id, folder_path, uid, subject, sender, date, is_read, is_starred, has_attachments, preview, message_id, references_)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO messages (account_id, folder_path, uid, is_read, is_starred, has_attachments, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET
-                subject = ?4, sender = ?5, date = ?6, is_read = ?7, is_starred = ?8, has_attachments = ?9, preview = ?10, message_id = ?11, references_ = ?12",
-            rusqlite::params![account_id, folder_path, uid, subject, sender, date, is_read as i32, is_starred as i32, has_attachments as i32, preview, message_id, references],
+                is_read = ?4, is_starred = ?5, has_attachments = ?6, preview = ?7",
+            rusqlite::params![account_id, folder_path, uid, is_read as i32, is_starred as i32, has_attachments as i32, preview],
         )?;
         Ok(())
     }
@@ -358,7 +454,9 @@ impl Cache {
         Ok(())
     }
 
-    /// Move a message (and its cached body) from one folder to another.
+    /// Move a message (and its cached headers and body) from one folder to
+    /// another.  All three tables are keyed by the same composite key, so each
+    /// is copied before the source row is deleted (which cascades the rest).
     pub fn move_message(
         &self,
         account_id: i64,
@@ -368,11 +466,19 @@ impl Cache {
     ) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO messages
-                (account_id, folder_path, uid, subject, sender, date, in_reply_to,
-                 message_id, references_, has_attachments, is_read, is_starred, preview)
-             SELECT account_id, ?2, uid, subject, sender, date, in_reply_to,
-                    message_id, references_, has_attachments, is_read, is_starred, preview
+                (account_id, folder_path, uid, has_attachments, is_read, is_starred, preview)
+             SELECT account_id, ?2, uid, has_attachments, is_read, is_starred, preview
              FROM messages
+             WHERE account_id = ?1 AND folder_path = ?3 AND uid = ?4",
+            rusqlite::params![account_id, to_folder, from_folder, uid],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO message_headers
+                (account_id, folder_path, uid, subject, from_addr, sender_addr, reply_to_addr,
+                 to_addr, cc_addr, bcc_addr, date, date_ts, in_reply_to, references_, message_id)
+             SELECT account_id, ?2, uid, subject, from_addr, sender_addr, reply_to_addr,
+                    to_addr, cc_addr, bcc_addr, date, date_ts, in_reply_to, references_, message_id
+             FROM message_headers
              WHERE account_id = ?1 AND folder_path = ?3 AND uid = ?4",
             rusqlite::params![account_id, to_folder, from_folder, uid],
         )?;
@@ -427,6 +533,12 @@ impl Cache {
         Ok(folders)
     }
 
+    /// Page through a folder's messages, newest first.
+    ///
+    /// Header columns are joined in from `message_headers`; recency sorts on
+    /// `h.date_ts` (the parsed timestamp), never `h.date` (the raw header
+    /// string, which sorts lexically). A LEFT JOIN keeps a message visible
+    /// even if its header row is missing.
     pub fn load_messages(
         &self,
         account_id: i64,
@@ -435,9 +547,13 @@ impl Cache {
         limit: i64,
     ) -> Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
-            "SELECT uid, subject, sender, date, in_reply_to, message_id, references_, has_attachments, is_read, is_starred, preview
-             FROM messages WHERE account_id = ?1 AND folder_path = ?2
-             ORDER BY date DESC LIMIT ?3 OFFSET ?4",
+            "SELECT m.uid, h.subject, h.from_addr, h.date_ts, h.in_reply_to, h.message_id,
+                    h.references_, m.has_attachments, m.is_read, m.is_starred, m.preview
+             FROM messages m
+             LEFT JOIN message_headers h
+               ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+             WHERE m.account_id = ?1 AND m.folder_path = ?2
+             ORDER BY h.date_ts DESC LIMIT ?3 OFFSET ?4",
         )?;
         let messages = stmt
             .query_map(
@@ -447,7 +563,10 @@ impl Cache {
                         uid: row.get(0)?,
                         subject: row.get(1)?,
                         sender: row.get(2)?,
-                        date: row.get(3)?,
+                        // NULL when the LEFT JOIN found no header row; a
+                        // headerless message sorts as epoch rather than
+                        // failing the whole page load.
+                        date: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
                         in_reply_to: row.get(4)?,
                         message_id: row.get(5)?,
                         references: row.get(6)?,
@@ -494,6 +613,8 @@ impl Cache {
     ) -> Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.uid FROM messages m
+             JOIN message_headers h
+               ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
              WHERE m.account_id = ?1 AND m.folder_path = ?2 AND m.has_attachments = 1
                AND NOT EXISTS (
                    SELECT 1 FROM attachments a
@@ -501,7 +622,7 @@ impl Cache {
                      AND a.folder_path = m.folder_path
                      AND a.uid = m.uid
                )
-             ORDER BY m.date DESC
+             ORDER BY h.date_ts DESC
              LIMIT ?3",
         )?;
         let uids = stmt
@@ -543,6 +664,11 @@ impl Cache {
     }
 
     /// Load the threading headers needed to reply: (message_id, references).
+    /// The threading headers of one message, for building a reply.
+    ///
+    /// Reads from `message_headers`, which is where they live. Returns `None`
+    /// when the message has no header row at all, and `None` fields when the
+    /// message predates header caching.
     pub fn message_refs(
         &self,
         account_id: i64,
@@ -550,15 +676,72 @@ impl Cache {
         uid: i64,
     ) -> Result<Option<(Option<String>, Option<String>)>> {
         let result = self.conn.query_row(
-            "SELECT message_id, references_ FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+            "SELECT message_id, references_ FROM message_headers
+             WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
             rusqlite::params![account_id, folder_path, uid],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
         );
         match result {
             Ok(orm) => Ok(Some(orm)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Save a message's complete header block plus its decoded ENVELOPE
+    /// fields.  The row is keyed to `messages` by (account_id, folder_path,
+    /// uid) and cascades on delete, so callers must have upserted the message
+    /// itself first — a header row with no parent would fail the foreign key.
+    /// Empty input is skipped rather than stored as an empty shell.
+    ///
+    /// This write is also what indexes the message for search: the FTS triggers
+    /// fire from this table, because it owns the indexed header columns.
+    pub fn save_message_headers(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        headers: &MessageHeaders,
+    ) -> Result<()> {
+        if headers.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO message_headers (
+                 account_id, folder_path, uid,
+                 subject, from_addr, sender_addr, reply_to_addr,
+                 to_addr, cc_addr, bcc_addr, date, date_ts,
+                 in_reply_to, references_, message_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET
+                 subject = ?4, from_addr = ?5, sender_addr = ?6,
+                 reply_to_addr = ?7, to_addr = ?8, cc_addr = ?9, bcc_addr = ?10,
+                 date = ?11, date_ts = ?12, in_reply_to = ?13, references_ = ?14,
+                 message_id = ?15",
+            rusqlite::params![
+                account_id,
+                folder_path,
+                uid,
+                headers.subject,
+                headers.from,
+                headers.sender,
+                headers.reply_to,
+                headers.to,
+                headers.cc,
+                headers.bcc,
+                headers.date,
+                headers.date_ts,
+                headers.in_reply_to,
+                headers.references,
+                headers.message_id,
+            ],
+        )?;
+        Ok(())
     }
 
     /// Save body HTML to cache.
@@ -888,3 +1071,7 @@ impl Cache {
         rows.collect::<Result<Vec<_>>>()
     }
 }
+
+#[cfg(test)]
+#[path = "cache.test.rs"]
+mod tests;

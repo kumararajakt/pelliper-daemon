@@ -130,18 +130,86 @@ impl FolderKind {
     }
 }
 
-/// Summary of an IMAP message (header-level fields only).
+/// Every header of a message, stored in the `message_headers` cache table and
+/// cached on both FETCH paths: `ImapSession::summary_from_fetch` (from the
+/// server's `ENVELOPE`) and `headers_from_raw_message` (from a full RFC822
+/// message, which the body-fetch path already has in hand).
+///
+/// The two paths produce identical values for the same message, which is what
+/// makes it safe for either to write the row.
+///
+/// The fields mirror RFC3501's `ENVELOPE` — date, subject, from, sender,
+/// reply-to, to, cc, bcc, in-reply-to, message-id — plus `references`. That
+/// last one is the reason the summary query still fetches any header bytes at
+/// all: `ENVELOPE` has exactly ten fields and none of them is `References`, so
+/// it can only come from `HEADER.FIELDS (REFERENCES IN-REPLY-TO)`.
+#[derive(Debug, Clone, Default)]
+pub struct MessageHeaders {
+    pub subject: String,
+    /// The six address headers, each a JSON array of `{"name":…,"email":…}`
+    /// objects — e.g. `[{"name":"Alice","email":"alice@example.com"}]`.
+    ///
+    /// Structured rather than a display string so recipients stay
+    /// addressable: a group entry has no addr-spec, and the UI wants the
+    /// display name and the address separately. The UI renders one of these
+    /// back to text on read (`addressDisplayString()` in `src/addressfield.h`).
+    pub from: String,
+    pub sender: String,
+    pub reply_to: String,
+    pub to: String,
+    pub cc: String,
+    pub bcc: String,
+    /// The raw `Date:` header, verbatim.
+    pub date: String,
+    /// The `Date:` header parsed to a unix timestamp. This — not `date` — is
+    /// what every recency sort uses; ordering by the header string sorts on
+    /// the weekday name.
+    pub date_ts: i64,
+    pub in_reply_to: String,
+    /// `References:`, normalized to bare Message-IDs. ENVELOPE has no such
+    /// field, so this only ever comes from the `HEADER.FIELDS (REFERENCES
+    /// IN-REPLY-TO)` item in `SUMMARY_FETCH_QUERY`. Without it threading has
+    /// nothing to link, so that item is not optional.
+    pub references: String,
+    pub message_id: String,
+}
+
+impl MessageHeaders {
+    /// True when this carries nothing worth writing to the cache, so callers
+    /// can skip the row instead of storing an empty shell.
+    ///
+    /// The address fields are JSON arrays, so an absent header is the two-byte
+    /// string `"[]"` rather than `""` — both count as empty here.
+    pub fn is_empty(&self) -> bool {
+        fn blank(v: &str) -> bool {
+            v.is_empty() || v == "[]"
+        }
+        blank(&self.subject)
+            && blank(&self.from)
+            && blank(&self.date)
+            && blank(&self.to)
+            && self.message_id.is_empty()
+    }
+}
+
+/// What the worker needs from a FETCHed message: its identity, its cached
+/// *state* (flags, attachment flag, preview), and its headers.
+///
+/// Every header-derived field lives in `headers` rather than being flattened
+/// onto this struct — `subject`/`date`/`message_id`/`references` used to be
+/// duplicated here and in the `messages` table, and both copies are gone.
 pub struct ImapMessageSummary {
     pub uid: i64,
-    pub subject: String,
-    pub sender: String,
-    pub date: i64,
+    /// The `From` list, kept flattened because the daemon reads one entry from
+    /// it to feed the correspondent index (`addresses` table). Same JSON
+    /// shape as `headers.from`, so it is never a second format.
+    pub from: String,
     pub is_read: bool,
     pub is_starred: bool,
     pub has_attachments: bool,
     pub preview: String,
-    pub message_id: String,
-    pub references: String,
+    /// Every header, and the only place subject/date/threading fields live.
+    pub headers: MessageHeaders,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
