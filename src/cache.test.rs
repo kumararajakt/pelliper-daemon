@@ -617,3 +617,127 @@ fn clearing_a_folder_after_a_uidvalidity_change_drops_only_that_folder() {
     assert_eq!(cache.count_messages(1, "Archive").expect("count"), 1);
     assert_eq!(fts_hits(&cache, "archived"), 1);
 }
+
+#[test]
+fn create_tables_adds_sync_cursor_columns_to_a_pre_existing_folders_table() {
+    // Same story as uidvalidity: an old-format DB has no cursor columns, and
+    // `CREATE TABLE IF NOT EXISTS` won't evolve it. Recreate the pre-cursor
+    // shape (with uidvalidity, as after the gap #1 migration) and re-run.
+    let (cache, _dir) = scratch();
+    cache
+        .conn
+        .execute_batch(
+            "DROP TABLE folders;
+             CREATE TABLE folders (
+                 account_id INTEGER NOT NULL,
+                 path TEXT NOT NULL,
+                 unread_count INTEGER DEFAULT 0,
+                 noselect INTEGER DEFAULT 0,
+                 kind TEXT NOT NULL DEFAULT 'custom',
+                 uidvalidity INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (account_id, path),
+                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+             );",
+        )
+        .expect("pre-cursor folders table");
+
+    cache.create_tables().expect("re-run create_tables");
+    add_account(&cache);
+    cache
+        .upsert_folder(1, "INBOX", 0, false, "inbox")
+        .expect("folder");
+
+    // Defaults: high-water 0, backfill never planned.
+    assert_eq!(
+        cache.folder_sync_state(1, "INBOX").expect("state"),
+        (0, None)
+    );
+    cache
+        .set_folder_last_seen_uid(1, "INBOX", 5_000)
+        .expect("set last seen");
+    cache
+        .set_folder_backfill_cursor(1, "INBOX", Some(4_999))
+        .expect("set cursor");
+    assert_eq!(
+        cache.folder_sync_state(1, "INBOX").expect("state"),
+        (5_000, Some(4_999))
+    );
+}
+
+#[test]
+fn sync_cursors_default_and_round_trip() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .upsert_folder(1, "INBOX", 0, false, "inbox")
+        .expect("folder");
+
+    // A fresh folder has no high-water and no backfill plan.
+    assert_eq!(
+        cache.folder_sync_state(1, "INBOX").expect("state"),
+        (0, None)
+    );
+    // An unknown folder reads the same as a fresh one — sync seeds it.
+    assert_eq!(
+        cache.folder_sync_state(1, "Nope").expect("state"),
+        (0, None)
+    );
+
+    cache
+        .set_folder_last_seen_uid(1, "INBOX", 900)
+        .expect("set last seen");
+    cache
+        .set_folder_backfill_cursor(1, "INBOX", Some(500))
+        .expect("set cursor");
+    assert_eq!(
+        cache.folder_sync_state(1, "INBOX").expect("state"),
+        (900, Some(500))
+    );
+
+    // Some(0) marks history complete.
+    cache
+        .set_folder_backfill_cursor(1, "INBOX", Some(0))
+        .expect("complete");
+    assert_eq!(
+        cache.folder_sync_state(1, "INBOX").expect("state"),
+        (900, Some(0))
+    );
+}
+
+#[test]
+fn min_cached_uid_is_the_deepest_cached_message() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+
+    assert_eq!(cache.min_cached_uid(1, "INBOX").expect("empty"), None);
+    add_message(&cache, 9);
+    add_message(&cache, 5);
+    add_message(&cache, 7);
+    assert_eq!(cache.min_cached_uid(1, "INBOX").expect("min"), Some(5));
+}
+
+#[test]
+fn clearing_a_folder_resets_its_sync_cursors() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    add_message(&cache, 42);
+    cache
+        .upsert_folder(1, "INBOX", 0, false, "inbox")
+        .expect("folder");
+    cache
+        .set_folder_last_seen_uid(1, "INBOX", 100)
+        .expect("set last seen");
+    cache
+        .set_folder_backfill_cursor(1, "INBOX", Some(50))
+        .expect("set cursor");
+
+    cache.clear_folder_messages(1, "INBOX").expect("clear");
+
+    // A UIDVALIDITY change invalidates the UID space, so the cursors pointing
+    // into it must go: the folder re-syncs cold and re-plans from scratch.
+    assert_eq!(
+        cache.folder_sync_state(1, "INBOX").expect("state"),
+        (0, None)
+    );
+    assert_eq!(cache.min_cached_uid(1, "INBOX").expect("min"), None);
+}

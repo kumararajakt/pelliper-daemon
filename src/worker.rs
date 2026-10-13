@@ -33,8 +33,10 @@ const FIRST_PAGE_SIZE: usize = 200;
 /// Page size for re-opens: the cache already has most messages, so a smaller
 /// fetch of the newest messages (plus merge via upsert) is enough.
 const REOPEN_PAGE_SIZE: usize = 50;
-/// How many messages to fetch per backfill round-trip. Bigger = fewer
-/// round-trips; smaller = more responsive to interleaved user requests.
+/// Width (in UIDs) of each history-backfill window: the walk fetches
+/// `UID FETCH lo:hi` bands descending from the persisted cursor. Bigger =
+/// fewer round-trips; smaller = more responsive to interleaved user requests.
+/// The same band size bounds incremental new-mail catch-up fetches.
 const BACKFILL_CHUNK: usize = 1_000;
 /// Fallback re-sync interval used when the worker is NOT actively IDLE-watching
 /// a folder (no folder selected yet, no session, or after a disconnect). IMAP
@@ -104,14 +106,17 @@ impl WorkerHandle {
 // Background jobs
 // ---------------------------------------------------------------------------
 
-/// Remaining UIDs to backfill for a folder.
+/// Remaining UIDs to backfill for a folder, persisted as a cursor.
 struct BackfillJob {
     folder_path: String,
     /// The folder's UIDVALIDITY when the job was planned. If the server reports
     /// a different value later the queued UIDs name different messages, so the
     /// job is dropped and re-seeded by the next sync.
     uidvalidity: i64,
-    remaining: Vec<i64>,
+    /// Top (highest UID) of the next window to fetch. `0` = complete.
+    /// The window walks **downward** from here in `BACKFILL_CHUNK`-wide bands,
+    /// so an interrupted run resumes without re-running `UID SEARCH ALL`.
+    cursor: i64,
 }
 // ---------------------------------------------------------------------------
 // Worker
@@ -218,15 +223,13 @@ impl Worker {
                 continue;
             }
 
-            // ---- Step 3: backfill chunk (one chunk per iteration)
-            if let Some((path, uidvalidity, remaining)) = self.backfill_queue.front().map(|job| {
-                (
-                    job.folder_path.clone(),
-                    job.uidvalidity,
-                    job.remaining.len(),
-                )
-            }) {
-                if remaining == 0 {
+            // ---- Step 3: backfill window (one chunk per iteration)
+            if let Some((path, uidvalidity, cursor)) = self
+                .backfill_queue
+                .front()
+                .map(|job| (job.folder_path.clone(), job.uidvalidity, job.cursor))
+            {
+                if cursor <= 0 {
                     self.backfill_queue.pop_front();
                     continue;
                 }
@@ -241,15 +244,18 @@ impl Worker {
                     self.backfill_queue.pop_front();
                     continue;
                 }
-                let n = BACKFILL_CHUNK.min(remaining);
-                let chunk: Vec<i64> = {
-                    let job = self
-                        .backfill_queue
-                        .front_mut()
-                        .expect("backfill job present for chunk");
-                    job.remaining.drain(..n).collect()
-                };
-                self.run_backfill_chunk(&path, &chunk).await;
+                let hi = cursor;
+                let lo = (hi - BACKFILL_CHUNK as i64 + 1).max(1);
+                if self.run_backfill_chunk(&path, lo, hi).await {
+                    // The chunk wrote and persisted the cursor; advance the
+                    // in-memory job so the next iteration picks up below it.
+                    let next = lo - 1;
+                    if next <= 0 {
+                        self.backfill_queue.pop_front();
+                    } else if let Some(job) = self.backfill_queue.front_mut() {
+                        job.cursor = next;
+                    }
+                }
                 continue;
             }
 
@@ -447,12 +453,14 @@ impl Worker {
         self.session = None;
     }
 
-    /// Fetch the most recent page of a folder's messages, cache the results,
-    /// and queue background work for the remainder.  The page size adapts to
-    /// the cache: `FIRST_PAGE_SIZE` on first open (cold folder), a smaller
-    /// `REOPEN_PAGE_SIZE` when messages are already cached (refresh).  Because
-    /// messages are upserted, re-fetching a page merges new/updated mail while
-    /// leaving older cached messages intact.  Returns the summaries.
+    /// Sync the top of a folder's UID space and queue background work for the
+    /// rest. Drives the persisted per-folder cursors: a cold folder (no
+    /// `last_seen_uid`) seeds with a sequence-range page and snapshots the
+    /// server high-water; a warm folder asks the server only for UIDs above
+    /// the high-water and fetches exactly those, in bounded chunks; with no
+    /// new mail it falls back to a small newest-page refresh so flag changes
+    /// still land. All writes are upserts, so overlaps merge harmlessly.
+    /// Returns the summaries fetched.
     async fn sync_folder_first_page(
         &mut self,
         folder_path: &str,
@@ -460,7 +468,13 @@ impl Worker {
         self.ensure_session()
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-        let session = self.session.as_mut().ok_or("no session")?;
+
+        // EXAMINE once for the whole plan: UIDVALIDITY (reset guard), EXISTS
+        // and UIDNEXT (high-water rule).
+        let (uidvalidity, exists, uid_next) = {
+            let session = self.session.as_mut().ok_or("no session")?;
+            imap::examine_folder(session, folder_path).await?
+        };
 
         // UIDVALIDITY guard. Everything below is keyed on `(folder, uid)`, but
         // IMAP only guarantees those UIDs stay meaningful while the folder's
@@ -469,158 +483,263 @@ impl Worker {
         // mail: drop them (and any queued work keyed on the old UIDs) before
         // syncing afresh. A 0 means the server did not report one — unknown,
         // not a change.
-        match imap::folder_uidvalidity(session, folder_path).await {
-            Ok(uidvalidity) if uidvalidity != 0 => {
-                let cached = {
+        if uidvalidity != 0 {
+            let cached = {
+                let cache = self.cache.lock().await;
+                cache
+                    .folder_uidvalidity(self.account.id, folder_path)
+                    .unwrap_or(0)
+            };
+            if cached != 0 && cached != uidvalidity {
+                let cleared = {
                     let cache = self.cache.lock().await;
                     cache
-                        .folder_uidvalidity(self.account.id, folder_path)
+                        .clear_folder_messages(self.account.id, folder_path)
                         .unwrap_or(0)
                 };
-                if cached != 0 && cached != uidvalidity {
-                    let cleared = {
-                        let cache = self.cache.lock().await;
-                        cache
-                            .clear_folder_messages(self.account.id, folder_path)
-                            .unwrap_or(0)
-                    };
-                    tracing::warn!(
-                        "Worker[{}]: UIDVALIDITY changed for {} ({} -> {}); cleared {} cached message(s)",
-                        self.account.id,
-                        folder_path,
-                        cached,
-                        uidvalidity,
-                        cleared
-                    );
-                    // Forget background work planned against the old UIDs. The
-                    // re-sync below queues fresh work for the new numbering.
-                    self.body_prefetch.retain(|(p, _)| p != folder_path);
-                    self.body_prefetched.retain(|(p, _)| p != folder_path);
-                    self.attachment_prefetch.retain(|(p, _)| p != folder_path);
-                    self.attachment_prefetched.retain(|(p, _)| p != folder_path);
-                    self.backfill_queue
-                        .retain(|job| job.folder_path != folder_path);
-                }
-                if cached != uidvalidity {
-                    let cache = self.cache.lock().await;
-                    if let Err(e) =
-                        cache.set_folder_uidvalidity(self.account.id, folder_path, uidvalidity)
-                    {
-                        tracing::error!(
-                            "Worker[{}]: failed to store UIDVALIDITY for {}: {e}",
-                            self.account.id,
-                            folder_path
-                        );
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                // A failed probe must not block the sync; proceed without the
-                // reset check and try again on the next sync.
                 tracing::warn!(
-                    "Worker[{}]: UIDVALIDITY probe for {} failed: {}",
+                    "Worker[{}]: UIDVALIDITY changed for {} ({} -> {}); cleared {} cached message(s)",
                     self.account.id,
                     folder_path,
-                    e
+                    cached,
+                    uidvalidity,
+                    cleared
                 );
+                // Forget background work planned against the old UIDs. The
+                // re-sync below queues fresh work for the new numbering.
+                self.body_prefetch.retain(|(p, _)| p != folder_path);
+                self.body_prefetched.retain(|(p, _)| p != folder_path);
+                self.attachment_prefetch.retain(|(p, _)| p != folder_path);
+                self.attachment_prefetched.retain(|(p, _)| p != folder_path);
+                self.backfill_queue
+                    .retain(|job| job.folder_path != folder_path);
             }
-        }
-
-        // First open (no cached messages in this folder) gets a bigger page;
-        // re-opens get a lighter refresh.
-        let cached = {
-            let cache = self.cache.lock().await;
-            cache
-                .count_messages(self.account.id, folder_path)
-                .unwrap_or(0)
-        };
-        let page_size = if cached == 0 {
-            FIRST_PAGE_SIZE
-        } else {
-            REOPEN_PAGE_SIZE
-        };
-
-        let summaries = imap::fetch_recent_summaries(session, folder_path, page_size).await;
-
-        let summaries = match summaries {
-            Ok(s) => s,
-            Err(e) if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" => {
-                tracing::warn!(
-                    "Worker[{}]: auth error in sync_folder_first_page, refreshing token",
-                    self.account.id
-                );
-                self.invalidate_token();
-                self.connect()
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-                let session = self.session.as_mut().ok_or("no session after reconnect")?;
-                imap::fetch_recent_summaries(session, folder_path, page_size).await?
-            }
-            Err(e) => return Err(e),
-        };
-
-        {
-            let cache = self.cache.lock().await;
-            for msg in &summaries {
-                if let Err(e) = cache.upsert_message(
-                    self.account.id,
-                    folder_path,
-                    msg.uid,
-                    msg.is_read,
-                    msg.is_starred,
-                    msg.has_attachments,
-                    &msg.preview,
-                ) {
-                    tracing::error!(
-                        "Worker[{}]: upsert_message {}/{} failed: {e}",
-                        self.account.id,
-                        folder_path,
-                        msg.uid
-                    );
-                    continue;
-                }
-                // Record sender address for autocomplete. The From list is
-                // JSON, so take its first entry.
-                if let Some((email, name)) = imap::first_address(&msg.from) {
-                    let _ = cache.upsert_address(&email, &name);
-                }
-                // Full header block + ENVELOPE. Must follow upsert_message:
-                // the row is foreign-keyed to it, so it cannot be written
-                // first. This is also what indexes the message for search.
+            if cached != uidvalidity {
+                let cache = self.cache.lock().await;
                 if let Err(e) =
-                    cache.save_message_headers(self.account.id, folder_path, msg.uid, &msg.headers)
+                    cache.set_folder_uidvalidity(self.account.id, folder_path, uidvalidity)
                 {
                     tracing::error!(
-                        "Worker[{}]: save_message_headers {}/{} failed: {e}",
+                        "Worker[{}]: failed to store UIDVALIDITY for {}: {e}",
                         self.account.id,
-                        folder_path,
-                        msg.uid
+                        folder_path
                     );
                 }
             }
-            // Use the whole-cache unread count, not just this page, so re-opens
-            // and IDLE re-syncs don't undercount older unread mail.
-            let unread = cache
-                .count_unread(self.account.id, folder_path)
-                .unwrap_or(0);
-            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         }
 
-        // Queue background work for this folder.
-        self.queue_body_prefetch(folder_path, &summaries).await;
+        // High-water UID: UIDNEXT-1 when consistent with EXISTS, else SEARCH.
+        let high = {
+            let session = self.session.as_mut().ok_or("no session")?;
+            imap::mailbox_highest_uid(session, folder_path, exists, uid_next).await?
+        };
+
+        let (last_seen_uid, _backfill_cursor) = {
+            let cache = self.cache.lock().await;
+            cache
+                .folder_sync_state(self.account.id, folder_path)
+                .unwrap_or((0, None))
+        };
+
+        // Front-plane fetch. Three cases:
+        //  - never synced (cold/legacy): newest-page seed, then snapshot the
+        //    high-water so later cycles only ask the server for UIDs above it;
+        //  - warm with new mail: fetch exactly the UIDs above the high-water
+        //    in bounded chunks, advancing the watermark only when all land
+        //    (a post-offline catch-up cannot stall the loop forever, and a
+        //    partial failure is re-checked next cycle instead of losing mail);
+        //  - warm without new mail: cheap newest-page refresh for flag
+        //    changes, watermark untouched.
+        let summaries = if last_seen_uid == 0 {
+            let cached_count = {
+                let cache = self.cache.lock().await;
+                cache
+                    .count_messages(self.account.id, folder_path)
+                    .unwrap_or(0)
+            };
+            let page_size = if cached_count == 0 {
+                FIRST_PAGE_SIZE
+            } else {
+                REOPEN_PAGE_SIZE
+            };
+            let summaries = self.fetch_recent_page(folder_path, page_size).await?;
+            let cache = self.cache.lock().await;
+            let _ = cache.set_folder_last_seen_uid(
+                self.account.id,
+                folder_path,
+                last_seen_uid.max(high),
+            );
+            summaries
+        } else {
+            let new_uids = {
+                let session = self.session.as_mut().ok_or("no session")?;
+                imap::uid_search_after(session, folder_path, last_seen_uid).await?
+            };
+            if new_uids.is_empty() {
+                self.fetch_recent_page(folder_path, REOPEN_PAGE_SIZE)
+                    .await?
+            } else {
+                let mut summaries = Vec::new();
+                let mut all_landed = true;
+                for window in new_uids.chunks(BACKFILL_CHUNK) {
+                    let uid_set: Vec<String> = window.iter().map(|u| u.to_string()).collect();
+                    match self.fetch_uid_set(folder_path, &uid_set.join(",")).await {
+                        Ok(part) => {
+                            self.write_summaries_to_cache(folder_path, &part).await;
+                            summaries.extend(part);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Worker[{}]: new-mail fetch for {} failed mid-window: {}",
+                                self.account.id,
+                                folder_path,
+                                e
+                            );
+                            all_landed = false;
+                            break;
+                        }
+                    }
+                }
+                if all_landed {
+                    let next = new_uids
+                        .iter()
+                        .copied()
+                        .max()
+                        .unwrap_or(0)
+                        .max(last_seen_uid);
+                    let cache = self.cache.lock().await;
+                    let _ = cache.set_folder_last_seen_uid(self.account.id, folder_path, next);
+                }
+                summaries
+            }
+        };
+
+        // Prefetch newest-first so the newest mail wins the body window.
+        let mut newest_first = summaries;
+        newest_first.sort_by_key(|a| std::cmp::Reverse(a.headers.date_ts));
+        self.queue_body_prefetch(folder_path, &newest_first).await;
         self.queue_attachment_prefetch(folder_path).await;
         self.queue_backfill_for_folder(folder_path).await;
 
         tracing::info!(
-            "Worker[{}]: synced {} recent messages for {} (page size {})",
+            "Worker[{}]: synced {} recent messages for {}",
             self.account.id,
-            summaries.len(),
-            folder_path,
-            page_size
+            newest_first.len(),
+            folder_path
         );
 
-        Ok(summaries)
+        Ok(newest_first)
+    }
+
+    /// Fetch a sequence-range page of summaries, reconnecting and retrying
+    /// once when an OAuth token turns out to be invalid mid-session.
+    async fn fetch_recent_page(
+        &mut self,
+        folder_path: &str,
+        page_size: usize,
+    ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_session()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let first = {
+            let session = self.session.as_mut().ok_or("no session")?;
+            imap::fetch_recent_summaries(session, folder_path, page_size).await
+        };
+        match first {
+            Ok(s) => Ok(s),
+            Err(e) if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" => {
+                tracing::warn!(
+                    "Worker[{}]: auth error fetching {} page, refreshing token",
+                    self.account.id,
+                    folder_path
+                );
+                self.invalidate_token();
+                self.connect().await?;
+                let session = self.session.as_mut().ok_or("no session after reconnect")?;
+                imap::fetch_recent_summaries(session, folder_path, page_size).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Fetch summaries for an explicit UID set, retrying once on an OAuth auth
+    /// error. Shared by incremental new-mail sync and history backfill windows.
+    async fn fetch_uid_set(
+        &mut self,
+        folder_path: &str,
+        uid_set: &str,
+    ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_session()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let first = {
+            let session = self.session.as_mut().ok_or("no session")?;
+            imap::fetch_summaries_by_uids(session, folder_path, uid_set).await
+        };
+        match first {
+            Ok(s) => Ok(s),
+            Err(e) if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" => {
+                tracing::warn!(
+                    "Worker[{}]: auth error fetching {} UID set, refreshing token",
+                    self.account.id,
+                    folder_path
+                );
+                self.invalidate_token();
+                self.connect().await?;
+                let session = self.session.as_mut().ok_or("no session after reconnect")?;
+                imap::fetch_summaries_by_uids(session, folder_path, uid_set).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Upsert a batch of summaries (message row, autocomplete address, header
+    /// block) and refresh the folder's unread count from the whole cache.
+    async fn write_summaries_to_cache(&self, folder_path: &str, summaries: &[ImapMessageSummary]) {
+        let cache = self.cache.lock().await;
+        for msg in summaries {
+            // Record sender address for autocomplete. The From list is
+            // JSON, so take its first entry.
+            if let Some((email, name)) = imap::first_address(&msg.from) {
+                let _ = cache.upsert_address(&email, &name);
+            }
+            if let Err(e) = cache.upsert_message(
+                self.account.id,
+                folder_path,
+                msg.uid,
+                msg.is_read,
+                msg.is_starred,
+                msg.has_attachments,
+                &msg.preview,
+            ) {
+                tracing::error!(
+                    "Worker[{}]: upsert_message {}/{} failed: {e}",
+                    self.account.id,
+                    folder_path,
+                    msg.uid
+                );
+                continue;
+            }
+            // Full header block + ENVELOPE. Must follow upsert_message:
+            // the row is foreign-keyed to it, so it cannot be written
+            // first. This is also what indexes the message for search.
+            if let Err(e) =
+                cache.save_message_headers(self.account.id, folder_path, msg.uid, &msg.headers)
+            {
+                tracing::error!(
+                    "Worker[{}]: save_message_headers {}/{} failed: {e}",
+                    self.account.id,
+                    folder_path,
+                    msg.uid
+                );
+            }
+        }
+        // Use the whole-cache unread count, not just this batch, so re-opens
+        // and IDLE re-syncs don't undercount older unread mail.
+        let unread = cache
+            .count_unread(self.account.id, folder_path)
+            .unwrap_or(0);
+        let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
     }
     /// Periodic poll fired when the worker is not actively IDLE-watching a
     /// folder (no folder selected yet, or no live session). Tries to

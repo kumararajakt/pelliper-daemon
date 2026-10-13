@@ -402,3 +402,34 @@ fn envelope_scalar_treats_nil_as_absent() {
         Some("Mon, 5 Jan 2026 10:00:00 +0000".to_string())
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sync cursors: UIDNEXT consistency + incremental UID filtering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trusted_highest_uid_requires_uidnext_consistent_with_exists() {
+    // UIDNEXT 101 with 5 live messages: 100 is the highest assigned UID.
+    assert_eq!(trusted_highest_uid(5, Some(101)), Some(100));
+    // UIDNEXT exactly one above an empty mailbox.
+    assert_eq!(trusted_highest_uid(0, Some(1)), Some(0));
+    // Missing or zero UIDNEXT (IMAP4rev1 allows omitting it) is untrusted.
+    assert_eq!(trusted_highest_uid(5, None), None);
+    assert_eq!(trusted_highest_uid(5, Some(0)), None);
+    // Inconsistent: UIDNEXT-1 below the live count cannot be a valid high
+    // watermark (Flectar's rule); fall back to SEARCH instead.
+    assert_eq!(trusted_highest_uid(50, Some(10)), None);
+    assert_eq!(trusted_highest_uid(2, Some(2)), None);
+}
+
+#[test]
+fn filter_uids_after_keeps_only_strictly_newer_uids_sorted() {
+    // Unsorted + duplicates come back sorted, deduped, strictly above.
+    assert_eq!(filter_uids_after(vec![9, 7, 100, 9, 5], 7), vec![9, 100]);
+    assert_eq!(filter_uids_after(vec![5, 6, 7], 7), Vec::<i64>::new());
+    // The RFC 3501 range-reversal quirk: when `last_seen` is above the
+    // mailbox's highest UID, the server can hand back that older highest UID
+    // even though it is not new.
+    assert_eq!(filter_uids_after(vec![1000, 3], 4_000), Vec::<i64>::new());
+    assert_eq!(filter_uids_after(vec![], 0), Vec::<i64>::new());
+}

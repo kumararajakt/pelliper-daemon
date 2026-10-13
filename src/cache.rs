@@ -44,6 +44,14 @@ impl Cache {
             -- UIDVALIDITY is unchanged; if it ever changes the server has
             -- renumbered every message, so the cached (folder, uid) rows now
             -- name different mail and must be discarded.
+            --
+            -- Sync cursors. `last_seen_uid` is the forward high-water mark:
+            -- every UID at or below it has been accounted for, so incremental
+            -- sync only asks the server for UIDs above it. `backfill_cursor`
+            -- is history-backfill progress: the top of the next UID window to
+            -- fetch (NULL = never planned, 0 = complete). Persisting both is
+            -- what lets a restart resume instead of re-planning with
+            -- `UID SEARCH ALL`.
             CREATE TABLE IF NOT EXISTS folders (
                 account_id INTEGER NOT NULL,
                 path TEXT NOT NULL,
@@ -51,6 +59,8 @@ impl Cache {
                 noselect INTEGER DEFAULT 0,
                 kind TEXT NOT NULL DEFAULT 'custom',
                 uidvalidity INTEGER NOT NULL DEFAULT 0,
+                last_seen_uid INTEGER NOT NULL DEFAULT 0,
+                backfill_cursor INTEGER,
                 PRIMARY KEY (account_id, path),
                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
@@ -158,21 +168,28 @@ impl Cache {
             ",
         )?;
 
-        // Additive column migration. `CREATE TABLE IF NOT EXISTS` is a no-op on
-        // an existing table, so databases created before folders tracked
-        // UIDVALIDITY would keep the old shape forever. Patch the column in
-        // place; the probe makes this safe to run on every startup.
-        let has_uidvalidity = {
+        // Additive column migrations. `CREATE TABLE IF NOT EXISTS` is a no-op
+        // on an existing table, so databases written before a column existed
+        // would keep the old shape forever. Patch the columns in place; the
+        // probe makes each ALTER safe to run on every startup.
+        let columns: Vec<String> = {
             let mut stmt = self.conn.prepare("PRAGMA table_info(folders)")?;
-            let columns = stmt
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>>>()?;
-            columns.iter().any(|name| name == "uidvalidity")
+            let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            names.filter_map(Result::ok).collect()
         };
-        if !has_uidvalidity {
+        if !columns.iter().any(|name| name == "uidvalidity") {
             self.conn.execute_batch(
                 "ALTER TABLE folders ADD COLUMN uidvalidity INTEGER NOT NULL DEFAULT 0;",
             )?;
+        }
+        if !columns.iter().any(|name| name == "last_seen_uid") {
+            self.conn.execute_batch(
+                "ALTER TABLE folders ADD COLUMN last_seen_uid INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !columns.iter().any(|name| name == "backfill_cursor") {
+            self.conn
+                .execute_batch("ALTER TABLE folders ADD COLUMN backfill_cursor INTEGER;")?;
         }
 
         Ok(())
@@ -570,8 +587,9 @@ impl Cache {
     /// UIDs (a UIDVALIDITY change) and `(folder, uid)` can no longer be
     /// trusted. Message headers and bodies cascade; attachment rows are keyed
     /// without a foreign key, so they are removed explicitly. FTS rows go
-    /// through the `message_headers` delete triggers. Returns the number of
-    /// messages removed.
+    /// through the `message_headers` delete triggers. The sync cursors are
+    /// reset too — they are meaningless once the UID space is invalidated.
+    /// Returns the number of messages removed.
     pub fn clear_folder_messages(&self, account_id: i64, folder_path: &str) -> Result<usize> {
         let removed = self.conn.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2",
@@ -581,7 +599,74 @@ impl Cache {
             "DELETE FROM attachments WHERE account_id = ?1 AND folder_path = ?2",
             rusqlite::params![account_id, folder_path],
         )?;
+        self.conn.execute(
+            "UPDATE folders SET last_seen_uid = 0, backfill_cursor = NULL
+             WHERE account_id = ?1 AND path = ?2",
+            rusqlite::params![account_id, folder_path],
+        )?;
         Ok(removed)
+    }
+
+    /// The folder's persisted sync cursors: `(last_seen_uid, backfill_cursor)`.
+    /// `last_seen_uid` is the forward high-water mark (0 = never synced);
+    /// `backfill_cursor` is the top of the next history window (None = never
+    /// planned, Some(0) = complete). An unknown folder reads as a fresh one.
+    pub fn folder_sync_state(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+    ) -> Result<(i64, Option<i64>)> {
+        let result = self.conn.query_row(
+            "SELECT last_seen_uid, backfill_cursor FROM folders WHERE account_id = ?1 AND path = ?2",
+            rusqlite::params![account_id, folder_path],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        );
+        match result {
+            Ok(state) => Ok(state),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((0, None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Advance (or initialize) a folder's forward high-water UID. Only ever
+    /// grows: incremental sync asks for UIDs strictly above this.
+    pub fn set_folder_last_seen_uid(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        last_seen_uid: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE folders SET last_seen_uid = ?1 WHERE account_id = ?2 AND path = ?3",
+            rusqlite::params![last_seen_uid, account_id, folder_path],
+        )?;
+        Ok(())
+    }
+
+    /// Persist history-backfill progress: the top of the next UID window to
+    /// fetch. `Some(0)` marks the folder fully backfilled.
+    pub fn set_folder_backfill_cursor(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        cursor: Option<i64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE folders SET backfill_cursor = ?1 WHERE account_id = ?2 AND path = ?3",
+            rusqlite::params![cursor, account_id, folder_path],
+        )?;
+        Ok(())
+    }
+
+    /// The lowest UID already cached in a folder, if any. Used to seed the
+    /// history cursor so an existing cache is not re-downloaded.
+    pub fn min_cached_uid(&self, account_id: i64, folder_path: &str) -> Result<Option<i64>> {
+        let min: Option<i64> = self.conn.query_row(
+            "SELECT MIN(uid) FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, folder_path],
+            |row| row.get(0),
+        )?;
+        Ok(min)
     }
 
     pub fn load_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
@@ -658,19 +743,6 @@ impl Cache {
             |row| row.get(0),
         )?;
         Ok(count)
-    }
-
-    /// Load all cached UIDs for a folder (for backfill comparison).
-    pub fn load_cached_uids(&self, account_id: i64, folder_path: &str) -> Result<Vec<i64>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2")?;
-        let uids = stmt
-            .query_map(rusqlite::params![account_id, folder_path], |row| {
-                row.get::<_, i64>(0)
-            })?
-            .collect::<Result<Vec<_>>>()?;
-        Ok(uids)
     }
 
     /// UIDs of messages flagged as having attachments but with no attachment

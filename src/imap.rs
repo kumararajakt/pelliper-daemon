@@ -233,6 +233,91 @@ pub async fn folder_uidvalidity(
     Ok(mailbox.uid_validity.map(i64::from).unwrap_or(0))
 }
 
+/// EXAMINE a folder once and return everything the sync loop needs:
+/// `(uidvalidity, exists, uid_next)` — 0 / None when the server does not
+/// report them. One round trip instead of probing each value separately.
+pub async fn examine_folder(
+    session: &mut ImapSession,
+    folder: &str,
+) -> Result<(i64, u32, Option<u32>), Box<dyn std::error::Error + Send + Sync>> {
+    let mailbox = session.examine(folder).await.map_err(|e| e.to_string())?;
+    Ok((
+        mailbox.uid_validity.map(i64::from).unwrap_or(0),
+        mailbox.exists,
+        mailbox.uid_next,
+    ))
+}
+
+/// The highest UID implied by `UIDNEXT`, but only when the server metadata is
+/// internally consistent — Flectar's rule. UIDs are unique positive integers,
+/// so `UIDNEXT - 1` (the highest UID ever assigned) cannot sit below the
+/// number of live messages; an inconsistent or absent UIDNEXT reads as
+/// "untrusted" and the caller falls back to SEARCH.
+fn trusted_highest_uid(exists: u32, uid_next: Option<u32>) -> Option<u32> {
+    let high = uid_next?.checked_sub(1)?;
+    (high >= exists).then_some(high)
+}
+
+/// The mailbox's highest UID: `UIDNEXT - 1` when consistent with EXISTS,
+/// otherwise the maximum of `UID SEARCH ALL`. Returns 0 for an empty mailbox.
+pub async fn mailbox_highest_uid(
+    session: &mut ImapSession,
+    folder: &str,
+    exists: u32,
+    uid_next: Option<u32>,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    if exists == 0 {
+        return Ok(0);
+    }
+    if let Some(high) = trusted_highest_uid(exists, uid_next) {
+        return Ok(i64::from(high));
+    }
+    let uids = fetch_all_uids(session, folder).await?;
+    match uids.iter().copied().max() {
+        Some(max) if max >= i64::from(exists) => Ok(max),
+        Some(_) => Err(format!(
+            "mailbox reported {exists} messages but the highest UID is below that"
+        )
+        .into()),
+        None => {
+            Err(format!("mailbox reported {exists} messages but UID SEARCH returned none").into())
+        }
+    }
+}
+
+/// Every UID strictly above `last_seen`: `UID SEARCH UID (last_seen+1):*`.
+/// The client-side filter is load-bearing, not redundant — when `last_seen`
+/// is above the mailbox's highest UID the `n:*` range reverses (RFC 3501) and
+/// could return that older highest UID.
+pub async fn uid_search_after(
+    session: &mut ImapSession,
+    folder: &str,
+    last_seen: i64,
+) -> Result<Vec<i64>, Box<dyn std::error::Error + Send + Sync>> {
+    if last_seen < 0 {
+        return Ok(Vec::new());
+    }
+    session.examine(folder).await.map_err(|e| e.to_string())?;
+    let query = format!("UID {}:*", last_seen.saturating_add(1));
+    let uids = session
+        .uid_search(&query)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(filter_uids_after(
+        uids.into_iter().map(i64::from).collect(),
+        last_seen,
+    ))
+}
+
+/// Keep only the UIDs strictly above `last_seen`, sorted ascending and
+/// deduped (SEARCH results are a set, but ordering must not be assumed).
+fn filter_uids_after(uids: Vec<i64>, last_seen: i64) -> Vec<i64> {
+    let mut uids: Vec<i64> = uids.into_iter().filter(|u| *u > last_seen).collect();
+    uids.sort_unstable();
+    uids.dedup();
+    uids
+}
+
 /// Fetch the newest `limit` message summaries for a folder, newest first.
 ///
 /// Uses a *sequence-number* range (`{last}:*`) so the page is the newest

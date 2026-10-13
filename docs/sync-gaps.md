@@ -14,7 +14,7 @@ not raw feature parity. Each is independently shippable.
 | # | Gap | Impact | Effort | Risk |
 |---|-----|--------|--------|------|
 | 1 | ~~No UIDVALIDITY tracking~~ ✅ done | Data corruption/mis-association on server UID reset | S | M |
-| 2 | No persisted sync cursor | Repeated full `UID SEARCH ALL` + newest-page refetch | M | M |
+| 2 | ~~No persisted sync cursor~~ ✅ done | Repeated full `UID SEARCH ALL` + newest-page refetch | M | M |
 | 3 | No expunge/flag reconciliation | Stale rows; server-side changes never applied locally | M | M |
 | 4 | No durable action ledger (non-send) | Offline/failed flags, moves, deletes silently diverge | L | M |
 | 5 | Cache mutated even when IMAP op fails | Local state claims success that server rejected | S | L |
@@ -75,7 +75,18 @@ old messages.
 
 ## 2. Persist a per-folder sync cursor
 
-**Current.** Each sync refetches the newest `FIRST_PAGE_SIZE`/`REOPEN_PAGE_SIZE`
+**Status: implemented.** `folders.last_seen_uid` (forward high-water) and
+`folders.backfill_cursor` (history walk position) are persisted with additive
+migrations in `create_tables`. Cold folders seed from a sequence-range page and
+snapshot the server high-water; warm folders fetch only `imap::uid_search_after`
+(`UID SEARCH UID (last+1):*`, client-side filtered) in `BACKFILL_CHUNK`-wide
+windows. History backfill walks the UID space downward from a persisted cursor
+(`imap::mailbox_highest_uid`, trusted only when `UIDNEXT − 1 ≥ EXISTS`, else a
+search fallback), so `UID SEARCH ALL` never runs after a folder is seeded.
+`clear_folder_messages` resets both cursors on a UIDVALIDITY change. Covered by
+new cases in `src/imap.test.rs` and `src/cache.test.rs`.
+
+**Original analysis.** Each sync refetches the newest `FIRST_PAGE_SIZE`/`REOPEN_PAGE_SIZE`
 messages by sequence range (`sync_folder_first_page` → `fetch_recent_summaries`),
 and backfill issues `UID SEARCH ALL` then diffs against every cached UID
 (`worker/backfill.rs` `queue_backfill_for_folder`). Nothing is persisted between
