@@ -107,6 +107,10 @@ impl WorkerHandle {
 /// Remaining UIDs to backfill for a folder.
 struct BackfillJob {
     folder_path: String,
+    /// The folder's UIDVALIDITY when the job was planned. If the server reports
+    /// a different value later the queued UIDs name different messages, so the
+    /// job is dropped and re-seeded by the next sync.
+    uidvalidity: i64,
     remaining: Vec<i64>,
 }
 // ---------------------------------------------------------------------------
@@ -215,17 +219,38 @@ impl Worker {
             }
 
             // ---- Step 3: backfill chunk (one chunk per iteration)
-            if let Some(job) = self.backfill_queue.front_mut() {
-                let n = BACKFILL_CHUNK.min(job.remaining.len());
-                if n > 0 {
-                    let chunk: Vec<i64> = job.remaining.drain(..n).collect();
-                    let path = job.folder_path.clone();
-                    self.run_backfill_chunk(&path, &chunk).await;
-                    continue;
-                } else {
+            if let Some((path, uidvalidity, remaining)) = self.backfill_queue.front().map(|job| {
+                (
+                    job.folder_path.clone(),
+                    job.uidvalidity,
+                    job.remaining.len(),
+                )
+            }) {
+                if remaining == 0 {
                     self.backfill_queue.pop_front();
                     continue;
                 }
+                // Drop a job planned under an older UIDVALIDITY: its UIDs now
+                // name different messages. The next sync re-seeds the folder.
+                if !self.backfill_uidvalidity_ok(&path, uidvalidity).await {
+                    tracing::warn!(
+                        "Worker[{}]: dropping stale backfill job for {} (UIDVALIDITY changed)",
+                        self.account.id,
+                        path
+                    );
+                    self.backfill_queue.pop_front();
+                    continue;
+                }
+                let n = BACKFILL_CHUNK.min(remaining);
+                let chunk: Vec<i64> = {
+                    let job = self
+                        .backfill_queue
+                        .front_mut()
+                        .expect("backfill job present for chunk");
+                    job.remaining.drain(..n).collect()
+                };
+                self.run_backfill_chunk(&path, &chunk).await;
+                continue;
             }
 
             // ---- Step 4: IDLE (blocks until push notification)
@@ -436,6 +461,71 @@ impl Worker {
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
         let session = self.session.as_mut().ok_or("no session")?;
+
+        // UIDVALIDITY guard. Everything below is keyed on `(folder, uid)`, but
+        // IMAP only guarantees those UIDs stay meaningful while the folder's
+        // UIDVALIDITY is unchanged. When the server reports a new value it has
+        // renumbered every message, so the cached rows now point at different
+        // mail: drop them (and any queued work keyed on the old UIDs) before
+        // syncing afresh. A 0 means the server did not report one — unknown,
+        // not a change.
+        match imap::folder_uidvalidity(session, folder_path).await {
+            Ok(uidvalidity) if uidvalidity != 0 => {
+                let cached = {
+                    let cache = self.cache.lock().await;
+                    cache
+                        .folder_uidvalidity(self.account.id, folder_path)
+                        .unwrap_or(0)
+                };
+                if cached != 0 && cached != uidvalidity {
+                    let cleared = {
+                        let cache = self.cache.lock().await;
+                        cache
+                            .clear_folder_messages(self.account.id, folder_path)
+                            .unwrap_or(0)
+                    };
+                    tracing::warn!(
+                        "Worker[{}]: UIDVALIDITY changed for {} ({} -> {}); cleared {} cached message(s)",
+                        self.account.id,
+                        folder_path,
+                        cached,
+                        uidvalidity,
+                        cleared
+                    );
+                    // Forget background work planned against the old UIDs. The
+                    // re-sync below queues fresh work for the new numbering.
+                    self.body_prefetch.retain(|(p, _)| p != folder_path);
+                    self.body_prefetched.retain(|(p, _)| p != folder_path);
+                    self.attachment_prefetch.retain(|(p, _)| p != folder_path);
+                    self.attachment_prefetched.retain(|(p, _)| p != folder_path);
+                    self.backfill_queue
+                        .retain(|job| job.folder_path != folder_path);
+                }
+                if cached != uidvalidity {
+                    let cache = self.cache.lock().await;
+                    if let Err(e) =
+                        cache.set_folder_uidvalidity(self.account.id, folder_path, uidvalidity)
+                    {
+                        tracing::error!(
+                            "Worker[{}]: failed to store UIDVALIDITY for {}: {e}",
+                            self.account.id,
+                            folder_path
+                        );
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // A failed probe must not block the sync; proceed without the
+                // reset check and try again on the next sync.
+                tracing::warn!(
+                    "Worker[{}]: UIDVALIDITY probe for {} failed: {}",
+                    self.account.id,
+                    folder_path,
+                    e
+                );
+            }
+        }
 
         // First open (no cached messages in this folder) gets a bigger page;
         // re-opens get a lighter refresh.

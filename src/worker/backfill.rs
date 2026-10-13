@@ -32,11 +32,16 @@ impl Worker {
             }
         };
 
-        let cached_uids = {
+        let (cached_uids, uidvalidity) = {
             let cache = self.cache.lock().await;
-            cache
-                .load_cached_uids(self.account.id, folder_path)
-                .unwrap_or_default()
+            (
+                cache
+                    .load_cached_uids(self.account.id, folder_path)
+                    .unwrap_or_default(),
+                cache
+                    .folder_uidvalidity(self.account.id, folder_path)
+                    .unwrap_or(0),
+            )
         };
         let cached_set: HashSet<i64> = cached_uids.into_iter().collect();
         let missing: Vec<i64> = all_uids
@@ -57,8 +62,42 @@ impl Worker {
 
         self.backfill_queue.push_back(BackfillJob {
             folder_path: folder_path.to_string(),
+            uidvalidity,
             remaining: missing,
         });
+    }
+
+    /// Whether the live session still reports the UIDVALIDITY a backfill job
+    /// was planned under. A change means the queued UIDs now name different
+    /// messages, so the job must be dropped; the next sync re-seeds it. A job
+    /// with no recorded UIDVALIDITY (0) cannot be checked and is accepted.
+    pub(super) async fn backfill_uidvalidity_ok(
+        &mut self,
+        folder_path: &str,
+        expected: i64,
+    ) -> bool {
+        if expected == 0 {
+            return true;
+        }
+        if self.ensure_session().await.is_err() {
+            return false;
+        }
+        let session = match self.session.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+        match imap::folder_uidvalidity(session, folder_path).await {
+            Ok(current) => current == 0 || current == expected,
+            Err(e) => {
+                tracing::warn!(
+                    "Worker[{}]: UIDVALIDITY recheck for {} failed: {}",
+                    self.account.id,
+                    folder_path,
+                    e
+                );
+                false
+            }
+        }
     }
 
     async fn fetch_all_uids(

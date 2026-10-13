@@ -221,6 +221,18 @@ async fn connect_tls(
 // Session management for sync
 // ---------------------------------------------------------------------------
 
+/// Read a folder's UIDVALIDITY, the value that tells us whether the server's
+/// UIDs are still the ones we cached. EXAMINE avoids taking a writable lock.
+/// Returns 0 when the server does not report one, which callers must treat as
+/// "unknown" rather than as a change.
+pub async fn folder_uidvalidity(
+    session: &mut ImapSession,
+    folder: &str,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    let mailbox = session.examine(folder).await.map_err(|e| e.to_string())?;
+    Ok(mailbox.uid_validity.map(i64::from).unwrap_or(0))
+}
+
 /// Fetch the newest `limit` message summaries for a folder, newest first.
 ///
 /// Uses a *sequence-number* range (`{last}:*`) so the page is the newest

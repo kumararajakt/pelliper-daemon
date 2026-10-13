@@ -39,12 +39,18 @@ impl Cache {
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- `uidvalidity` is the server's UIDVALIDITY for this folder, or 0
+            -- when never observed. IMAP UIDs are only stable while a folder's
+            -- UIDVALIDITY is unchanged; if it ever changes the server has
+            -- renumbered every message, so the cached (folder, uid) rows now
+            -- name different mail and must be discarded.
             CREATE TABLE IF NOT EXISTS folders (
                 account_id INTEGER NOT NULL,
                 path TEXT NOT NULL,
                 unread_count INTEGER DEFAULT 0,
                 noselect INTEGER DEFAULT 0,
                 kind TEXT NOT NULL DEFAULT 'custom',
+                uidvalidity INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (account_id, path),
                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
             );
@@ -151,6 +157,23 @@ impl Cache {
             );
             ",
         )?;
+
+        // Additive column migration. `CREATE TABLE IF NOT EXISTS` is a no-op on
+        // an existing table, so databases created before folders tracked
+        // UIDVALIDITY would keep the old shape forever. Patch the column in
+        // place; the probe makes this safe to run on every startup.
+        let has_uidvalidity = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(folders)")?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>>>()?;
+            columns.iter().any(|name| name == "uidvalidity")
+        };
+        if !has_uidvalidity {
+            self.conn.execute_batch(
+                "ALTER TABLE folders ADD COLUMN uidvalidity INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
 
         Ok(())
     }
@@ -512,6 +535,53 @@ impl Cache {
             rusqlite::params![account_id, path],
         )?;
         Ok(())
+    }
+
+    /// The stored UIDVALIDITY for a folder, or 0 when it has never been
+    /// observed (a missing folder row also reads as 0).
+    pub fn folder_uidvalidity(&self, account_id: i64, folder_path: &str) -> Result<i64> {
+        let result = self.conn.query_row(
+            "SELECT uidvalidity FROM folders WHERE account_id = ?1 AND path = ?2",
+            rusqlite::params![account_id, folder_path],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(value) => Ok(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Record the UIDVALIDITY the server currently reports for a folder.
+    pub fn set_folder_uidvalidity(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uidvalidity: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE folders SET uidvalidity = ?1 WHERE account_id = ?2 AND path = ?3",
+            rusqlite::params![uidvalidity, account_id, folder_path],
+        )?;
+        Ok(())
+    }
+
+    /// Drop every cached message in a folder, used when the server reassigns
+    /// UIDs (a UIDVALIDITY change) and `(folder, uid)` can no longer be
+    /// trusted. Message headers and bodies cascade; attachment rows are keyed
+    /// without a foreign key, so they are removed explicitly. FTS rows go
+    /// through the `message_headers` delete triggers. Returns the number of
+    /// messages removed.
+    pub fn clear_folder_messages(&self, account_id: i64, folder_path: &str) -> Result<usize> {
+        let removed = self.conn.execute(
+            "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, folder_path],
+        )?;
+        self.conn.execute(
+            "DELETE FROM attachments WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, folder_path],
+        )?;
+        Ok(removed)
     }
 
     pub fn load_folders(&self, account_id: i64) -> Result<Vec<Folder>> {

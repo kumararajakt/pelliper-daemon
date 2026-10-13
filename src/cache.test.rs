@@ -501,3 +501,119 @@ fn move_message_carries_the_headers_across() {
         "body indexed at the new location"
     );
 }
+
+#[test]
+fn folder_uidvalidity_defaults_to_zero_and_round_trips() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .upsert_folder(1, "INBOX", 0, false, "inbox")
+        .expect("upsert_folder");
+
+    // Never observed yet.
+    assert_eq!(cache.folder_uidvalidity(1, "INBOX").expect("read"), 0);
+    cache
+        .set_folder_uidvalidity(1, "INBOX", 4_200)
+        .expect("set");
+    assert_eq!(cache.folder_uidvalidity(1, "INBOX").expect("read"), 4_200);
+    // An unknown folder reads as "never observed", not an error.
+    assert_eq!(cache.folder_uidvalidity(1, "Nope").expect("read"), 0);
+}
+
+#[test]
+fn create_tables_adds_uidvalidity_to_a_pre_existing_folders_table() {
+    // `CREATE TABLE IF NOT EXISTS` cannot evolve a table, so databases written
+    // before UIDVALIDITY tracking get the column via a targeted ALTER during
+    // create_tables. Recreate the old shape and re-run it.
+    let (cache, _dir) = scratch();
+    cache
+        .conn
+        .execute_batch(
+            "DROP TABLE folders;
+             CREATE TABLE folders (
+                 account_id INTEGER NOT NULL,
+                 path TEXT NOT NULL,
+                 unread_count INTEGER DEFAULT 0,
+                 noselect INTEGER DEFAULT 0,
+                 kind TEXT NOT NULL DEFAULT 'custom',
+                 PRIMARY KEY (account_id, path),
+                 FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+             );",
+        )
+        .expect("legacy folders table");
+
+    cache.create_tables().expect("re-run create_tables");
+    add_account(&cache);
+    cache
+        .upsert_folder(1, "INBOX", 0, false, "inbox")
+        .expect("folder");
+    // The newly added column defaults to "never observed" and is writable.
+    assert_eq!(cache.folder_uidvalidity(1, "INBOX").expect("read"), 0);
+    cache.set_folder_uidvalidity(1, "INBOX", 99).expect("set");
+    assert_eq!(cache.folder_uidvalidity(1, "INBOX").expect("read"), 99);
+}
+
+#[test]
+fn rediscovering_a_folder_preserves_its_uidvalidity() {
+    // `connect()` re-upserts every folder on startup with a fresh unread
+    // count; that must not wipe the recorded UIDVALIDITY, or the next sync
+    // would mistake the folder for brand new.
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .upsert_folder(1, "INBOX", 0, false, "inbox")
+        .expect("upsert_folder");
+    cache.set_folder_uidvalidity(1, "INBOX", 7).expect("set");
+    cache
+        .upsert_folder(1, "INBOX", 5, false, "inbox")
+        .expect("re-upsert");
+    assert_eq!(cache.folder_uidvalidity(1, "INBOX").expect("read"), 7);
+}
+
+#[test]
+fn clearing_a_folder_after_a_uidvalidity_change_drops_only_that_folder() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+
+    // INBOX: message + header + body, so the delete has to cascade and leave
+    // the search index clean.
+    add_message(&cache, 7);
+    cache
+        .save_message_headers(1, "INBOX", 7, &sample_headers())
+        .expect("headers");
+    cache
+        .save_body(1, "INBOX", 7, "<p>quarterly snow forecast</p>")
+        .expect("body");
+
+    // A second folder that must survive untouched.
+    cache
+        .upsert_message(1, "Archive", 7, false, false, false, "")
+        .expect("archive message");
+    let mut archived = sample_headers();
+    archived.subject = "archived".to_string();
+    cache
+        .save_message_headers(1, "Archive", 7, &archived)
+        .expect("archive headers");
+
+    assert_eq!(fts_hits(&cache, "hi"), 1);
+    assert_eq!(fts_hits(&cache, "quarterly"), 1);
+
+    let removed = cache.clear_folder_messages(1, "INBOX").expect("clear");
+    assert_eq!(removed, 1, "one message removed");
+
+    assert_eq!(cache.count_messages(1, "INBOX").expect("count"), 0);
+    assert_eq!(
+        fts_hits(&cache, "hi"),
+        0,
+        "the cleared folder's subject left the index"
+    );
+    assert_eq!(
+        fts_hits(&cache, "quarterly"),
+        0,
+        "the cleared folder's body left the index"
+    );
+
+    // Other folders keep their mail.
+    assert_eq!(cache.count_messages(1, "Archive").expect("count"), 1);
+    assert_eq!(fts_hits(&cache, "archived"), 1);
+}
