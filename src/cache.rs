@@ -659,22 +659,20 @@ impl Cache {
     }
 
     /// UIDs of messages cached in a given range [lo, hi] (inclusive), ascending.
-    pub fn cached_uids_in_range(
-        &self,
-        account_id: i64,
-        folder_path: &str,
-        lo: i64,
-        hi: i64,
-    ) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid >= ?3 AND uid <= ?4 ORDER BY uid",
-        )?;
-        let uids = stmt
-            .query_map(rusqlite::params![account_id, folder_path, lo, hi], |row| {
-                row.get::<_, i64>(0)
-            })?
-            .collect::<Result<Vec<_>>>()?;
-        Ok(uids)
+    pub fn delete_messages(&mut self, account_id: i64, folder_path: &str, uids: &[i64]) -> Result<usize> {
+        if uids.is_empty() {
+            return Ok(0);
+        }
+        let mut removed = 0;
+        let tx = self.conn.transaction()?;
+        for uid in uids {
+            removed += tx.execute(
+                "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+                rusqlite::params![account_id, folder_path, uid],
+            )?;
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// The lowest UID already cached in a folder, if any. Used to seed the
