@@ -659,7 +659,12 @@ impl Cache {
     }
 
     /// UIDs of messages cached in a given range [lo, hi] (inclusive), ascending.
-    pub fn delete_messages(&mut self, account_id: i64, folder_path: &str, uids: &[i64]) -> Result<usize> {
+    pub fn delete_messages(
+        &mut self,
+        account_id: i64,
+        folder_path: &str,
+        uids: &[i64],
+    ) -> Result<usize> {
         if uids.is_empty() {
             return Ok(0);
         }
