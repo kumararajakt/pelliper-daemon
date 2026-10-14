@@ -18,7 +18,7 @@ not raw feature parity. Each is independently shippable.
 | 3 | No expunge/flag reconciliation | Stale rows; server-side changes never applied locally | M | M |
 | 4 | No durable action ledger (non-send) | Offline/failed flags, moves, deletes silently diverge | L | M |
 | 5 | Cache mutated even when IMAP op fails | Local state claims success that server rejected | S | L |
-| 6 | No IDLE capability probe | Connects IDLE to servers that don't advertise it | S | L |
+| 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
 | 7 | Trigger-driven FTS fragility | A failed trigger silently drops body indexing | M | M |
 | 8 | No migration runner | Schema changes are silent no-ops on existing DBs | S | L |
 | 9 | Threading owned implicitly by UI | No threads table; contract undocumented | L | L |
@@ -210,23 +210,13 @@ that maps `Result` to "should apply local mutation".
 
 ## 6. Probe IDLE capability once per connection
 
-**Current.** `idle_wait` (`src/worker/idle.rs`) issues `session.idle()` and
-`handle.init()` whenever a session exists and a folder is selected; it never
-checks the server's CAPABILITY. Servers without `IDLE` (or that reject `IDLE`
-mid-session) cause a disconnect/reselect loop instead of falling back to
-polling.
-
-**Flectar reference.** `imap/mod.rs::supports_idle` probes CAPABILITY once per
-connection; the actor only enters IDLE when advertised and otherwise polls on a
-deadline.
-
-**Proposed change.** On connect, read CAPABILITY and cache `supports_idle` on the
-`Worker`; in the priority loop, only take the IDLE branch when true, otherwise
-rely on the existing `RESYNC_INTERVAL_SECS` timer.
-
-**Files.** `src/imap.rs` (new `supports_idle`), `src/worker.rs`, `src/worker/idle.rs`.
-
-**Test.** Unit test the CAPABILITY parser in `src/imap.test.rs`.
+**Status: implemented.** On connect, `Worker` now probes CAPABILITY via
+`imap::supports_idle` and caches `supports_idle`; the priority loop only takes
+the IDLE branch when true (otherwise it falls back to the existing 120s
+periodic resync). `imap::supports_idle` is a thin wrapper over
+`session.capabilities()` that returns true if `IDLE` is advertised. The
+pre-existing `idle_wait` logic (including the 29m RFC793 IDLE timeout and
+interleaving request checks) remains unchanged.
 
 ---
 

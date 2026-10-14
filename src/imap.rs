@@ -1267,20 +1267,6 @@ pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
     }
 
     // If still empty, try body_text as fallback
-    if html.is_empty() && text.is_empty() {
-        if let Some(body_text) = parsed.body_text(0) {
-            text = body_text.to_string();
-            html = format!("<pre>{}</pre>", html_escape(&text));
-        }
-    }
-
-    tracing::debug!(
-        "mail-parser: html_len={} text_len={} attachments={}",
-        html.len(),
-        text.len(),
-        has_attachments
-    );
-
     ParsedBody {
         html,
         text,
@@ -1296,6 +1282,15 @@ fn html_escape(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+/// Whether the server advertises support for the IDLE extension. The IDLE
+/// extension lets the server push mailbox changes without the client polling.
+pub async fn supports_idle(session: &mut ImapSession) -> bool {
+    match session.capabilities().await {
+        Ok(caps) => caps.has_str("IDLE"),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

@@ -131,6 +131,7 @@ pub struct Worker {
 
     session: Option<ImapSession>,
     current_folder: Option<String>,
+    supports_idle: bool,
 
     body_prefetch: VecDeque<(String, i64)>,
     body_prefetched: HashSet<(String, i64)>,
@@ -165,6 +166,7 @@ impl Worker {
             rx,
             session: None,
             current_folder: None,
+            supports_idle: false,
             body_prefetch: VecDeque::new(),
             body_prefetched: HashSet::new(),
             attachment_prefetch: VecDeque::new(),
@@ -260,7 +262,7 @@ impl Worker {
             }
 
             // ---- Step 4: IDLE (blocks until push notification)
-            if self.session.is_some() {
+            if self.session.is_some() && self.supports_idle {
                 if let Some(folder) = self.current_folder.clone() {
                     match self.idle_wait(&folder).await {
                         IdleResult::MailboxChange => {
@@ -333,6 +335,7 @@ impl Worker {
             }
         }
 
+        self.supports_idle = imap::supports_idle(&mut session).await;
         self.session = Some(session);
         Ok(())
     }
