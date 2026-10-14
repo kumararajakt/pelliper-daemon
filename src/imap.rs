@@ -356,17 +356,21 @@ pub async fn fetch_recent_summaries(
     Ok(summaries)
 }
 
-/// Fetch summaries for an explicit UID set (used by backfill chunks).
+/// Fetch summaries for an explicit UID set.
 pub async fn fetch_summaries_by_uids(
     session: &mut ImapSession,
     folder: &str,
     uid_set: &str,
 ) -> Result<Vec<ImapMessageSummary>, Box<dyn std::error::Error + Send + Sync>> {
     session.examine(folder).await.map_err(|e| e.to_string())?;
-    let mut stream = session
+    if uid_set.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stream = session
         .uid_fetch(uid_set, SUMMARY_FETCH_QUERY)
         .await
         .map_err(|e| e.to_string())?;
+    futures::pin_mut!(stream);
     let mut summaries = Vec::new();
     while let Some(f) = stream.next().await {
         let f = f.map_err(|e| e.to_string())?;

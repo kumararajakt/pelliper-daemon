@@ -658,6 +658,25 @@ impl Cache {
         Ok(())
     }
 
+    /// UIDs of messages cached in a given range [lo, hi] (inclusive), ascending.
+    pub fn cached_uids_in_range(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid >= ?3 AND uid <= ?4 ORDER BY uid",
+        )?;
+        let uids = stmt
+            .query_map(rusqlite::params![account_id, folder_path, lo, hi], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(uids)
+    }
+
     /// The lowest UID already cached in a folder, if any. Used to seed the
     /// history cursor so an existing cache is not re-downloaded.
     pub fn min_cached_uid(&self, account_id: i64, folder_path: &str) -> Result<Option<i64>> {
