@@ -141,7 +141,7 @@ expunges each cycle; `reconcile_flags` skips rows with a pending intent, and
 - Once item 4 (pending actions) exists, skip rows with an in-flight local intent.
 
 **Files.** `src/worker.rs`, `src/worker/backfill.rs`, `src/cache.rs`
-(new bulk `load_cached_uids`/`delete_messages`/`update_flags_bulk`).
+(new bulk `cached_uids_in_range`/`delete_messages`/`update_message_flags`).
 
 **Test.** Cache-level test: seed rows, delete some server-side, assert only the
 survivors remain and FTS no longer matches the removed ones.
