@@ -15,7 +15,7 @@ not raw feature parity. Each is independently shippable.
 |---|-----|--------|--------|------|
 | 1 | ~~No UIDVALIDITY tracking~~ ✅ done | Data corruption/mis-association on server UID reset | S | M |
 | 2 | ~~No persisted sync cursor~~ ✅ done | Repeated full `UID SEARCH ALL` + newest-page refetch | M | M |
-| 3 | No expunge/flag reconciliation | Stale rows; server-side changes never applied locally | M | M |
+| 3 | ~~No expunge/flag reconciliation~~ ✅ done | Stale rows; server-side changes never applied locally | M | M |
 | 4 | No durable action ledger (non-send) | Offline/failed flags, moves, deletes silently diverge | L | M |
 | 5 | Cache mutated even when IMAP op fails | Local state claims success that server rejected | S | L |
 | 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
