@@ -185,11 +185,12 @@ impl Worker {
         if self.ensure_session().await.is_err() {
             return;
         }
-        // Try the operation; on auth error, invalidate token and retry once
-        let result = self.do_set_flags(folder_path, uid, &add, &remove).await;
-        if result.is_err() {
-            let e = result.unwrap_err();
-            if Self::is_auth_error(&e) && self.account.auth_type == "oauth" {
+        // Try the operation; on auth error, invalidate token and retry once.
+        // The cache is only updated when the server accepted the STORE — a
+        // rejected mutation must not be recorded locally (sync gap #5).
+        match self.do_set_flags(folder_path, uid, &add, &remove).await {
+            Ok(()) => {}
+            Err(e) if Self::is_auth_error(&e) && self.account.auth_type == "oauth" => {
                 tracing::warn!(
                     "Worker[{}]: auth error in set_flags, refreshing token",
                     self.account.id
@@ -198,7 +199,26 @@ impl Worker {
                 if self.ensure_session().await.is_err() {
                     return;
                 }
-                let _ = self.do_set_flags(folder_path, uid, &add, &remove).await;
+                if let Err(e) = self.do_set_flags(folder_path, uid, &add, &remove).await {
+                    tracing::warn!(
+                        "Worker[{}]: set_flags retry for {}/{} failed: {}",
+                        self.account.id,
+                        folder_path,
+                        uid,
+                        e
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Worker[{}]: set_flags for {}/{} failed: {}",
+                    self.account.id,
+                    folder_path,
+                    uid,
+                    e
+                );
+                return;
             }
         }
 
@@ -264,18 +284,40 @@ impl Worker {
             },
         };
 
-        // Try the move; on auth error, invalidate token and retry once
-        let move_result = self.do_move(folder_path, uid, &dest).await;
-        if let Err(ref e) = move_result {
-            if Self::is_auth_error(e) && self.account.auth_type == "oauth" {
+        // Try the move; on auth error, invalidate token and retry once.
+        // The cache is only updated when the server accepted the move
+        // (sync gap #5).
+        match self.do_move(folder_path, uid, &dest).await {
+            Ok(()) => {}
+            Err(e) if Self::is_auth_error(&e) && self.account.auth_type == "oauth" => {
                 tracing::warn!(
                     "Worker[{}]: auth error in move, refreshing token",
                     self.account.id
                 );
                 self.invalidate_token();
-                if self.ensure_session().await.is_ok() {
-                    let _ = self.do_move(folder_path, uid, &dest).await;
+                if self.ensure_session().await.is_err() {
+                    return;
                 }
+                if let Err(e) = self.do_move(folder_path, uid, &dest).await {
+                    tracing::warn!(
+                        "Worker[{}]: move retry for {}/{} failed: {}",
+                        self.account.id,
+                        folder_path,
+                        uid,
+                        e
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Worker[{}]: move for {}/{} failed: {}",
+                    self.account.id,
+                    folder_path,
+                    uid,
+                    e
+                );
+                return;
             }
         }
 
@@ -297,7 +339,6 @@ impl Worker {
                 e
             );
         }
-        return;
     }
 
     async fn do_move(&mut self, folder_path: &str, uid: i64, dest: &str) -> Result<(), String> {
@@ -331,6 +372,25 @@ impl Worker {
         Ok(())
     }
 
+    /// Internal helper: select folder, mark \Deleted, and EXPUNGE (may fail).
+    async fn do_expunge(&mut self, folder_path: &str, uid: i64) -> Result<(), String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "no session".to_string())?;
+        session
+            .select(folder_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        imap::store_flags(session, uid, &["\\Deleted"], &[])
+            .await
+            .map_err(|e| e.to_string())?;
+        let expunge = session.expunge().await.map_err(|e| e.to_string())?;
+        futures::pin_mut!(expunge);
+        while expunge.next().await.is_some() {}
+        Ok(())
+    }
+
     /// Delete a message: if already in a Trash folder, permanently remove it
     /// (flag \Deleted + EXPUNGE); otherwise move it to Trash as a soft delete.
     async fn handle_delete_message(&mut self, folder_path: &str, uid: i64) {
@@ -347,15 +407,18 @@ impl Worker {
             .await;
 
         if in_trash {
-            // Permanently delete: \Deleted + EXPUNGE
-            let session = self.session.as_mut();
-            if let Some(s) = session {
-                let _ = s.select(folder_path).await;
-                let _ = imap::store_flags(s, uid, &["\\Deleted"], &[]).await;
-                if let Ok(expunge) = s.expunge().await {
-                    futures::pin_mut!(expunge);
-                    while expunge.next().await.is_some() {}
-                }
+            // Permanently delete: \Deleted + EXPUNGE. Only drop the cached row
+            // when the server actually expunged — a rejected STORE/EXPUNGE must
+            // not be recorded locally (sync gap #5).
+            if let Err(e) = self.do_expunge(folder_path, uid).await {
+                tracing::warn!(
+                    "Worker[{}]: delete (expunge) for {}/{} failed: {}",
+                    self.account.id,
+                    folder_path,
+                    uid,
+                    e
+                );
+                return;
             }
             let cache = self.cache.lock().await;
             let _ = cache.delete_message(self.account.id, folder_path, uid);
@@ -378,14 +441,22 @@ impl Worker {
                     return;
                 }
             };
-            if self.do_move(folder_path, uid, &trash).await.is_ok() {
-                let cache = self.cache.lock().await;
-                let _ = cache.move_message(self.account.id, folder_path, uid, &trash);
-                let unread = cache
-                    .count_unread(self.account.id, folder_path)
-                    .unwrap_or(0);
-                let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+            if let Err(e) = self.do_move(folder_path, uid, &trash).await {
+                tracing::warn!(
+                    "Worker[{}]: delete (move to trash) for {}/{} failed: {}",
+                    self.account.id,
+                    folder_path,
+                    uid,
+                    e
+                );
+                return;
             }
+            let cache = self.cache.lock().await;
+            let _ = cache.move_message(self.account.id, folder_path, uid, &trash);
+            let unread = cache
+                .count_unread(self.account.id, folder_path)
+                .unwrap_or(0);
+            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
         }
     }
 

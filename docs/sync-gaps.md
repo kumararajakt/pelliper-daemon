@@ -17,7 +17,7 @@ not raw feature parity. Each is independently shippable.
 | 2 | ~~No persisted sync cursor~~ ✅ done | Repeated full `UID SEARCH ALL` + newest-page refetch | M | M |
 | 3 | ~~No expunge/flag reconciliation~~ ✅ done | Stale rows; server-side changes never applied locally | M | M |
 | 4 | No durable action ledger (non-send) | Offline/failed flags, moves, deletes silently diverge | L | M |
-| 5 | Cache mutated even when IMAP op fails | Local state claims success that server rejected | S | L |
+| 5 | ~~Cache mutated even when IMAP op fails~~ ✅ done | Local state claims success that server rejected | S | L |
 | 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
 | 7 | Trigger-driven FTS fragility | A failed trigger silently drops body indexing | M | M |
 | 8 | No migration runner | Schema changes are silent no-ops on existing DBs | S | L |
@@ -185,8 +185,21 @@ cache test that a claimed action is not returned again.
 
 ## 5. Don't mutate the cache when the IMAP op failed
 
-**Current.** `handle_set_flags` (`src/worker/handlers.rs`) calls `do_set_flags`,
-then unconditionally runs `cache.update_message_flags` and
+**Status: implemented.** `handle_set_flags`, `handle_move_message`, and
+`handle_delete_message` now gate every local cache write on the IMAP result:
+the STORE/MOVE/EXPUNGE must return `Ok`, otherwise a warning is logged and the
+handler returns without touching the cache. Each mutation keeps its existing
+one-shot OAuth token refresh + retry, but a failed retry no longer falls
+through to the cache write. The expunge branch was extracted into a
+`do_expunge` helper (mirroring `do_set_flags`/`do_move`) so the
+STORE+EXPUNGE sequence is a single `Result` to gate on; previously `select`
+and `store_flags` errors were discarded with `let _ =`. No new unit test —
+the gating is control flow over a live IMAP session, so it is only reachable
+with a mock server; the pure `is_auth_error` classifier remains the testable
+seam.
+
+**Original analysis.** `handle_set_flags` (`src/worker/handlers.rs`) calls
+`do_set_flags`, then unconditionally runs `cache.update_message_flags` and
 `update_folder_unread`. `handle_move_message` and `handle_delete_message` do the
 same with `cache.move_message` / `cache.delete_message`. On a non-auth server
 error the local cache records a change the server rejected.
@@ -195,16 +208,11 @@ error the local cache records a change the server rejected.
 `mark_failed_and_rollback` reverses an optimistic move when the action
 permanently fails.
 
-**Proposed change.** Until item 4 lands, at minimum gate the cache write on the
-IMAP result: only update local state when the STORE/MOVE/EXPUNGE returned `Ok`,
-and emit a warning (or a D-Bus error) otherwise. This is a small change but must
-be paired with the retry semantics so offline is not simply "lost" — hence it
-pairs with item 4.
+**Remaining work.** The cache no longer *lies*, but a failed mutation is still
+simply dropped (no durable retry) — that is item 4. Gating is the stopgap;
+`pending_actions` is the fix.
 
 **Files.** `src/worker/handlers.rs`.
-
-**Test.** Hard to reach without a mock server; start with a unit-testable helper
-that maps `Result` to "should apply local mutation".
 
 ---
 
@@ -323,8 +331,8 @@ expose counts via D-Bus.
    wrong behavior.
 3. **2 (cursors)** then **3 (reconcile)** — the core sync-quality fix, best done
    together.
-4. **5 (don't write on failure)** immediately, as a stopgap, before **4
-   (durable actions)** lands.
+4. **5 (don't write on failure)** ✅ done — the stopgap landed before **4
+   (durable actions)**, which is still open.
 5. **10 (failure ledger)**, then **7 (FTS)** and **9 (threading)** as follow-ups.
 
 ## Deliberately not proposed
