@@ -137,6 +137,50 @@ pub struct PendingAction {
     pub attempts: i32,
 }
 
+/// Which stage of a message's sync failed, persisted as `sync_failures.stage`.
+///
+/// Deliberately separate from [`ActionKind`]: those are user mutations carrying
+/// a durable intent with rollback semantics, while these are background fetch
+/// retries that only ever heal a missing header/body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStage {
+    /// The message's header block could not be fetched or stored.
+    Header,
+    /// The message's body could not be fetched.
+    Body,
+}
+
+impl SyncStage {
+    /// Stable lowercase string stored in the database and embedded in logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SyncStage::Header => "header",
+            SyncStage::Body => "body",
+        }
+    }
+
+    /// Parse the persisted form. `None` for an unknown stage, which the cache
+    /// treats as an error rather than guessing.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "header" => Some(SyncStage::Header),
+            "body" => Some(SyncStage::Body),
+            _ => None,
+        }
+    }
+}
+
+/// One message that failed a sync stage and is queued for background retry, as
+/// read from `sync_failures`.
+#[derive(Debug, Clone)]
+pub struct SyncFailure {
+    pub folder_path: String,
+    pub uid: i64,
+    pub stage: SyncStage,
+    /// Attempts made so far, before the one about to run.
+    pub attempts: i32,
+}
+
 /// Information about a discovered IMAP folder.
 pub struct ImapFolder {
     pub path: String,

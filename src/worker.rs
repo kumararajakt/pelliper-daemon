@@ -5,10 +5,11 @@
 //!
 //! 1. **User requests** — LoadMessages / LoadBody are served immediately.
 //! 2. **Queued actions** — durable flags/move/delete retries (the action ledger).
-//! 3. **Body prefetch** — recent message bodies cached so opening is instant.
-//! 4. **Attachment prefetch** — attachments for older messages cached on disk.
-//! 5. **Backfill** — remaining folder messages indexed in chunks.
-//! 6. **IDLE** — blocks for server push; re-syncs on mailbox change.
+//! 3. **Sync-failure retry** — durable header/body fetch retries.
+//! 4. **Body prefetch** — recent message bodies cached so opening is instant.
+//! 5. **Attachment prefetch** — attachments for older messages cached on disk.
+//! 6. **Backfill** — remaining folder messages indexed in chunks.
+//! 7. **IDLE** — blocks for server push; re-syncs on mailbox change.
 //!
 //! This replaces the separate SyncEngine + IdleRouter architecture with a
 //! single task per account that never lets background work starve the user.
@@ -28,6 +29,7 @@ mod backfill;
 mod handlers;
 mod idle;
 mod prefetch;
+mod sync_failures;
 
 /// First page of messages fetched instantly when a folder is opened for the
 /// first time (cold cache) — seeds the UI's message list.
@@ -196,12 +198,21 @@ impl Worker {
 
         // Recover actions left in-flight by a previous run (crash/restart) so
         // they are retried rather than stranded. New actions are only enqueued
-        // after this point, so nothing live is disturbed.
+        // after this point, so nothing live is disturbed. Also report how many
+        // header/body fetch retries are still queued.
         {
             let cache = self.cache.lock().await;
             match cache.reset_in_flight_actions(self.account.id) {
                 Ok(n) if n > 0 => tracing::info!(
                     "Worker[{}]: recovered {} in-flight action(s) from a previous run",
+                    id,
+                    n
+                ),
+                _ => {}
+            }
+            match cache.count_sync_failures(self.account.id) {
+                Ok(n) if n > 0 => tracing::info!(
+                    "Worker[{}]: {} failed header/body fetch(es) queued for retry",
                     id,
                     n
                 ),
@@ -235,6 +246,14 @@ impl Worker {
             // reconnect's backlog of flags/moves/deletes clears promptly
             // without evicting interactive work.
             if self.drain_one_action().await {
+                continue;
+            }
+
+            // ---- Step 0.6: retry one due header/body fetch (sync-failure
+            // ledger). Also after user requests, so a transient fetch failure
+            // heals in the background instead of waiting for an unrelated
+            // re-sync to happen to include the message.
+            if self.retry_one_sync_failure().await {
                 continue;
             }
 
@@ -613,7 +632,8 @@ impl Worker {
                     let uid_set: Vec<String> = window.iter().map(|u| u.to_string()).collect();
                     match self.fetch_uid_set(folder_path, &uid_set.join(",")).await {
                         Ok(part) => {
-                            self.write_summaries_to_cache(folder_path, &part).await;
+                            let failures = self.write_summaries_to_cache(folder_path, &part).await;
+                            self.note_header_write_failures(folder_path, failures).await;
                             summaries.extend(part);
                         }
                         Err(e) => {
@@ -723,7 +743,17 @@ impl Worker {
 
     /// Upsert a batch of summaries (message row, autocomplete address, header
     /// block) and refresh the folder's unread count from the whole cache.
-    async fn write_summaries_to_cache(&self, folder_path: &str, summaries: &[ImapMessageSummary]) {
+    ///
+    /// Returns the `(uid, error)` of any message whose header block could not be
+    /// persisted, so the caller can record it in the sync-failure ledger. The
+    /// writes are best-effort and do not abort the batch: a single bad row must
+    /// not discard the rest of the page.
+    async fn write_summaries_to_cache(
+        &self,
+        folder_path: &str,
+        summaries: &[ImapMessageSummary],
+    ) -> Vec<(i64, String)> {
+        let mut failures = Vec::new();
         let cache = self.cache.lock().await;
         for msg in summaries {
             // Record sender address for autocomplete. The From list is
@@ -746,6 +776,7 @@ impl Worker {
                     folder_path,
                     msg.uid
                 );
+                failures.push((msg.uid, e.to_string()));
                 continue;
             }
             // Full header block + ENVELOPE. Must follow upsert_message:
@@ -760,6 +791,7 @@ impl Worker {
                     folder_path,
                     msg.uid
                 );
+                failures.push((msg.uid, e.to_string()));
             }
         }
         // Use the whole-cache unread count, not just this batch, so re-opens
@@ -768,6 +800,7 @@ impl Worker {
             .count_unread(self.account.id, folder_path)
             .unwrap_or(0);
         let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+        failures
     }
     /// Periodic poll fired when the worker is not actively IDLE-watching a
     /// folder (no folder selected yet, or no live session). Tries to

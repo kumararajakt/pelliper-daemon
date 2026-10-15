@@ -6,6 +6,7 @@ mod oauth;
 mod outbox;
 mod secrets;
 mod smtp;
+mod sync_failures;
 mod types;
 mod worker;
 

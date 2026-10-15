@@ -6,7 +6,7 @@
 //! not a copy of the DDL.
 
 use super::*;
-use crate::types::{ActionKind, MessageHeaders};
+use crate::types::{ActionKind, MessageHeaders, SyncStage};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A fresh cache in a throwaway data dir, with the schema and the search
@@ -929,4 +929,161 @@ fn an_unknown_action_kind_is_rejected_not_guessed() {
 
     // Misreading a destructive intent is worse than surfacing the error.
     assert!(cache.claim_due_action(1, 100).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Per-message sync-failure ledger
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_due_sync_failure_is_claimed_once_and_cleared_on_success() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    let attempts = cache
+        .record_sync_failure(1, "INBOX", 7, SyncStage::Body, 100, "timeout")
+        .expect("record");
+    assert_eq!(attempts, 1);
+
+    // Not due until `retry_at`.
+    assert!(cache
+        .claim_due_sync_failure(1, 99, 160)
+        .expect("early")
+        .is_none());
+
+    let claimed = cache
+        .claim_due_sync_failure(1, 100, 160)
+        .expect("claim")
+        .expect("due");
+    assert_eq!(claimed.folder_path, "INBOX");
+    assert_eq!(claimed.uid, 7);
+    assert_eq!(claimed.stage, SyncStage::Body);
+    assert_eq!(claimed.attempts, 1);
+
+    // Claiming pushes the retry time out, so it is not handed out again now.
+    assert!(cache
+        .claim_due_sync_failure(1, 100, 160)
+        .expect("reclaim")
+        .is_none());
+
+    // A successful retry clears the row entirely.
+    cache
+        .clear_sync_failure(1, "INBOX", 7, SyncStage::Body)
+        .expect("clear");
+    assert_eq!(cache.count_sync_failures(1).expect("count"), 0);
+    assert!(cache
+        .claim_due_sync_failure(1, 200, 260)
+        .expect("after")
+        .is_none());
+}
+
+#[test]
+fn re_recording_a_failure_accumulates_attempts_instead_of_duplicating() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    assert_eq!(
+        cache
+            .record_sync_failure(1, "INBOX", 7, SyncStage::Header, 100, "boom")
+            .expect("first"),
+        1
+    );
+    assert_eq!(
+        cache
+            .record_sync_failure(1, "INBOX", 7, SyncStage::Header, 400, "boom again")
+            .expect("second"),
+        2
+    );
+    // One row keyed on (account, folder, uid, stage), not two.
+    assert_eq!(cache.count_sync_failures(1).expect("count"), 1);
+
+    // The later `retry_at` wins.
+    assert!(cache
+        .claim_due_sync_failure(1, 399, 460)
+        .expect("early")
+        .is_none());
+    let claimed = cache
+        .claim_due_sync_failure(1, 400, 460)
+        .expect("claim")
+        .expect("due");
+    assert_eq!(claimed.attempts, 2);
+    assert_eq!(claimed.stage, SyncStage::Header);
+}
+
+#[test]
+fn header_and_body_failures_for_one_message_are_separate_rows() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .record_sync_failure(1, "INBOX", 7, SyncStage::Header, 100, "h")
+        .expect("header");
+    cache
+        .record_sync_failure(1, "INBOX", 7, SyncStage::Body, 100, "b")
+        .expect("body");
+    assert_eq!(cache.count_sync_failures(1).expect("count"), 2);
+
+    let a = cache
+        .claim_due_sync_failure(1, 100, 160)
+        .expect("claim a")
+        .expect("due a");
+    let b = cache
+        .claim_due_sync_failure(1, 100, 160)
+        .expect("claim b")
+        .expect("due b");
+    let mut stages = vec![a.stage.as_str(), b.stage.as_str()];
+    stages.sort_unstable();
+    assert_eq!(stages, vec!["body", "header"]);
+    assert!(cache
+        .claim_due_sync_failure(1, 100, 160)
+        .expect("third")
+        .is_none());
+}
+
+#[test]
+fn clearing_a_folder_drops_its_queued_fetch_failures() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    add_message(&cache, 7);
+    cache
+        .record_sync_failure(1, "INBOX", 7, SyncStage::Body, 100, "timeout")
+        .expect("record");
+    assert_eq!(cache.count_sync_failures(1).expect("count"), 1);
+
+    // A UIDVALIDITY reset invalidates the UIDs the failure names.
+    cache
+        .clear_folder_messages(1, "INBOX")
+        .expect("clear folder");
+    assert_eq!(cache.count_sync_failures(1).expect("count"), 0);
+    assert!(cache
+        .claim_due_sync_failure(1, 100, 160)
+        .expect("claim")
+        .is_none());
+}
+
+#[test]
+fn removing_an_account_cascades_its_sync_failures() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .record_sync_failure(1, "INBOX", 1, SyncStage::Body, 100, "x")
+        .expect("record");
+    assert_eq!(cache.count_sync_failures(1).expect("count"), 1);
+
+    cache.remove_account(1).expect("remove account");
+    assert_eq!(cache.count_sync_failures(1).expect("count"), 0);
+}
+
+#[test]
+fn an_unknown_sync_stage_is_rejected_not_guessed() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .conn
+        .execute(
+            "INSERT INTO sync_failures (account_id, folder_path, uid, stage, retry_at)
+             VALUES (1, 'INBOX', 1, 'sideways', 100)",
+            [],
+        )
+        .expect("insert bogus stage");
+
+    // An unrecognised stage must not be silently treated as a fetch to retry.
+    assert!(cache.claim_due_sync_failure(1, 100, 160).is_err());
 }

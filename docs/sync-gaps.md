@@ -22,7 +22,7 @@ not raw feature parity. Each is independently shippable.
 | 7 | ~~Trigger-driven FTS fragility~~ ✅ done | A failed trigger silently drops body indexing | M | M |
 | 8 | No migration runner | Schema changes are silent no-ops on existing DBs | S | L |
 | 9 | Threading owned implicitly by UI | No threads table; contract undocumented | L | L |
-| 10 | `sync_failures` ledger absent | Failed header/body fetches are lost for the session | S | L |
+| 10 | ~~`sync_failures` ledger absent~~ ✅ done | Failed header/body fetches are lost for the session | S | L |
 
 Effort: S = hours, M = a day or two, L = multi-day. Risk = chance of
 regressing sync correctness if done carelessly.
@@ -375,23 +375,70 @@ denormalized counts are recomputed on every change.
 
 ## 10. Retry ledger for failed header/content fetches
 
-**Current.** A failed `fetch_summaries_by_uids` / `fetch_body` is logged and
-dropped; the UID will be retried only if a later backfill diff or page fetch
-happens to include it. There is no record of which messages still lack headers
-or bodies.
+**Status: implemented.** A failed per-message fetch is now recorded in a
+`sync_failures` table and retried by the worker's priority loop instead of being
+logged and forgotten.
+
+- **Storage** (`src/cache.rs`): `sync_failures(account_id, folder_path, uid,
+  stage, attempts, retry_at, last_error)` keyed on
+  `(account_id, folder_path, uid, stage)`, with an `(account_id, retry_at)`
+  index and an `ON DELETE CASCADE` FK to `accounts`. `record_sync_failure`
+  upserts (bumping `attempts`), `claim_due_sync_failure` claims the most overdue
+  due row and pushes its `retry_at` out so a retry that errors before it can be
+  rescheduled is not re-claimed immediately, `clear_sync_failure` drops it on
+  success, and `count_sync_failures` backs the startup log.
+  `clear_folder_messages` clears a folder's rows on a UIDVALIDITY change (their
+  UIDs no longer name the same messages).
+- **Policy** (`src/sync_failures.rs`, +`.test.rs`): a flat 60 s retry
+  (`RETRY_DELAY_SECS`, matching Flectar) and `MAX_SYNC_FAILURE_ATTEMPTS = 8`
+  with `retry_decision`.
+- **Execution** (`src/worker/sync_failures.rs`): `retry_one_sync_failure` claims
+  and retries one due row per loop iteration; a `body` retry re-fetches the
+  body, a `header` retry re-fetches the single UID's summary. Success clears the
+  row; failure reschedules, or drops it once the cap is reached.
+  `note_sync_failure` / `note_header_write_failures` are the recording entry
+  points shared by all call sites.
+- **Recording sites**: `run_one_body_prefetch` (covers attachment prefetch too)
+  and the final failed attempt in `handle_load_body` record `body`;
+  `write_summaries_to_cache` returns the messages whose header rows failed to
+  persist and its callers (new-mail sync, backfill) record `header`.
+- **Loop placement** (`src/worker.rs`): step 0.6 retries one due fetch — after
+  user requests and queued actions, before body prefetch/backfill — so a
+  transient failure heals without waiting for an unrelated re-sync.
+
+**Scope note.** Batch header-window failures are deliberately *not* recorded
+per-UID: a failed `UID FETCH` whose cursor is not advanced is already retried by
+the next sync (item 2), so recording each UID would be redundant. The `header`
+stage therefore covers the per-message case — a message whose header row could
+not be persisted — which is what actually leaves a message headerless.
+
+**Tests.** `src/sync_failures.test.rs` covers the retry/drop boundary.
+`src/cache.test.rs` covers: a due row is claimed once and cleared on success;
+re-recording accumulates attempts instead of duplicating; header and body
+failures for one message are separate rows; clearing a folder drops its queued
+failures; removing an account cascades them; and an unknown `stage` is rejected
+rather than guessed.
+
+**Original analysis.** A failed `fetch_summaries_by_uids` / `fetch_body` is
+logged and dropped; the UID will be retried only if a later backfill diff or
+page fetch happens to include it. There is no record of which messages still
+lack headers or bodies.
 
 **Flectar reference.** A durable `sync_failures` table stores `stage`
 (header/content) + `retry_at` (60 s) and a background pass
 (`retry_one_header_failure`, `record_content_failure_details`) retries them;
 `status_for_account` surfaces a `retrying` phase.
 
-**Proposed change.** Add a `sync_failures(account_id, folder_path, uid, stage,
-attempts, retry_at, last_error)` table; record on fetch/parse failure; retry due
-rows at the top of the worker loop (after user requests), capped. Optionally
-expose counts via D-Bus.
+**Files.** `src/cache.rs` (table + repo fns + `row_to_sync_failure`),
+`src/sync_failures.rs` (+ `.test.rs`, new), `src/worker/sync_failures.rs` (new),
+`src/worker.rs` (loop step + `write_summaries_to_cache` failure return),
+`src/worker/prefetch.rs` (`fetch_and_store_body`), `src/worker/handlers.rs`,
+`src/worker/backfill.rs`, `src/types.rs`, `src/main.rs`.
 
-**Files.** `src/cache.rs`, `src/worker.rs`, `src/worker/backfill.rs`,
-`src/dbus.rs` (optional status method).
+**Not done (deliberately).** No D-Bus status method exposes the failure count;
+the startup log and per-retry tracing are enough for now, and the UI has no
+`retrying` phase wired up. A `status_for_account`-style method is the natural
+follow-up if the UI wants it.
 
 ---
 
@@ -407,7 +454,7 @@ expose counts via D-Bus.
    (durable actions)** ✅ done. Together they make flags/moves/deletes
    server-authoritative: cache writes only happen on success, and failures are
    queued and retried instead of lost.
-5. **10 (failure ledger)**, then **9 (threading)** as a follow-up.
+5. **10 (failure ledger)** ✅ done, then **9 (threading)** as a follow-up.
    **7 (FTS)** ✅ done — the trigger-driven index was replaced by explicit,
    testable indexing; it was moved ahead of #10 because it touched every writer
    and was worth landing while that code was fresh.

@@ -3,7 +3,7 @@
 
 use super::{Worker, WorkerRequest};
 use crate::imap;
-use crate::types::{ActionKind, MovePayload, SetFlagsPayload};
+use crate::types::{ActionKind, MovePayload, SetFlagsPayload, SyncStage};
 use futures::StreamExt;
 
 impl Worker {
@@ -116,7 +116,15 @@ impl Worker {
                         );
                         html
                     }
-                    Err(e) => format!("<p>Failed to load message: {}</p>", e),
+                    Err(e) => {
+                        let err = e.to_string();
+                        // Both attempts failed: record it so the body is
+                        // fetched in the background even if the UI never
+                        // re-opens the message.
+                        self.note_sync_failure(folder_path, uid, SyncStage::Body, &err)
+                            .await;
+                        format!("<p>Failed to load message: {err}</p>")
+                    }
                 }
             }
         }

@@ -132,7 +132,8 @@ impl Worker {
             }
         };
 
-        self.write_summaries_to_cache(folder_path, &summaries).await;
+        let failures = self.write_summaries_to_cache(folder_path, &summaries).await;
+        self.note_header_write_failures(folder_path, failures).await;
         let next = (lo - 1).max(0);
         {
             let cache = self.cache.lock().await;

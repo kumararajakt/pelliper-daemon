@@ -1,6 +1,6 @@
 use crate::types::{
     Account, ActionKind, AttachmentRecord, Folder, Message, MessageHeaders, OutboxItem,
-    PendingAction,
+    PendingAction, SyncFailure, SyncStage,
 };
 use rusqlite::{Connection, OptionalExtension, Result};
 use std::path::PathBuf;
@@ -239,6 +239,32 @@ impl Cache {
 
             CREATE INDEX IF NOT EXISTS pending_actions_due
                 ON pending_actions (account_id, state, not_before);
+
+            -- Durable ledger for per-message header/body fetch failures. A
+            -- failed fetch is recorded here and retried by the worker's loop
+            -- instead of being logged and forgotten: the prefetch queues live
+            -- in memory, so an older message is otherwise never retried. The
+            -- row is keyed so a message accumulates attempts rather than
+            -- piling up duplicates.
+            --
+            -- `stage` is 'header' or 'body'. `retry_at` gates the retry (a due
+            -- row has `retry_at <= now`). Unlike `pending_actions` there is no
+            -- `state`: the retry runs synchronously in the single worker task,
+            -- so a crash just leaves the row due rather than in flight.
+            CREATE TABLE IF NOT EXISTS sync_failures (
+                account_id INTEGER NOT NULL,
+                folder_path TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                stage TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                retry_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                PRIMARY KEY (account_id, folder_path, uid, stage),
+                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS sync_failures_due
+                ON sync_failures (account_id, retry_at);
             ",
         )?;
 
@@ -655,7 +681,8 @@ impl Cache {
     /// trusted. Message headers and bodies cascade; attachment rows are keyed
     /// without a foreign key, so they are removed explicitly. Search-index rows
     /// are removed first (there are no triggers). The sync cursors are reset
-    /// too — they are meaningless once the UID space is invalidated.
+    /// too — they are meaningless once the UID space is invalidated, as are any
+    /// queued fetch retries for the old UIDs.
     /// Returns the number of messages removed.
     pub fn clear_folder_messages(&self, account_id: i64, folder_path: &str) -> Result<usize> {
         self.deindex_folder(account_id, folder_path)?;
@@ -665,6 +692,10 @@ impl Cache {
         )?;
         self.conn.execute(
             "DELETE FROM attachments WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, folder_path],
+        )?;
+        self.conn.execute(
+            "DELETE FROM sync_failures WHERE account_id = ?1 AND folder_path = ?2",
             rusqlite::params![account_id, folder_path],
         )?;
         self.conn.execute(
@@ -1291,6 +1322,116 @@ impl Cache {
         Ok(recovered)
     }
 
+    // -----------------------------------------------------------------------
+    // Per-message sync-failure ledger (header / body fetch retries)
+    // -----------------------------------------------------------------------
+
+    /// Record a failed header/body fetch for one message, bumping its attempt
+    /// count and scheduling the next retry. Upserts on the
+    /// `(account, folder, uid, stage)` key, so a message that keeps failing
+    /// accumulates attempts instead of creating duplicate rows. `retry_at` is
+    /// the next eligible time, computed by the caller from the retry policy.
+    /// Returns the new attempt count.
+    pub fn record_sync_failure(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        stage: SyncStage,
+        retry_at: i64,
+        last_error: &str,
+    ) -> Result<i32> {
+        self.conn.execute(
+            "INSERT INTO sync_failures
+                (account_id, folder_path, uid, stage, attempts, retry_at, last_error)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)
+             ON CONFLICT(account_id, folder_path, uid, stage)
+             DO UPDATE SET attempts = attempts + 1, retry_at = ?5, last_error = ?6",
+            rusqlite::params![
+                account_id,
+                folder_path,
+                uid,
+                stage.as_str(),
+                retry_at,
+                last_error
+            ],
+        )?;
+        let attempts: i32 = self.conn.query_row(
+            "SELECT attempts FROM sync_failures
+             WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3 AND stage = ?4",
+            rusqlite::params![account_id, folder_path, uid, stage.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(attempts)
+    }
+
+    /// Claim the most overdue due sync failure for an account, pushing its retry
+    /// time out to `push_to` so a retry that fails before it can be rescheduled
+    /// is not picked up again immediately. Unlike the action ledger there is no
+    /// `in_flight` state: the retry is synchronous in the single worker task, so
+    /// a crash mid-retry simply leaves the row to be retried after `push_to`.
+    pub fn claim_due_sync_failure(
+        &self,
+        account_id: i64,
+        now: i64,
+        push_to: i64,
+    ) -> Result<Option<SyncFailure>> {
+        let failure = {
+            let mut stmt = self.conn.prepare(
+                "SELECT folder_path, uid, stage, attempts
+                 FROM sync_failures
+                 WHERE account_id = ?1 AND retry_at <= ?2
+                 ORDER BY retry_at ASC
+                 LIMIT 1",
+            )?;
+            let mut rows =
+                stmt.query_map(rusqlite::params![account_id, now], row_to_sync_failure)?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+        if let Some(ref failure) = failure {
+            self.conn.execute(
+                "UPDATE sync_failures SET retry_at = ?5
+                 WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3 AND stage = ?4",
+                rusqlite::params![
+                    account_id,
+                    failure.folder_path,
+                    failure.uid,
+                    failure.stage.as_str(),
+                    push_to
+                ],
+            )?;
+        }
+        Ok(failure)
+    }
+
+    /// Drop a sync-failure row: the retry succeeded, or it is being abandoned.
+    pub fn clear_sync_failure(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        stage: SyncStage,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sync_failures
+             WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3 AND stage = ?4",
+            rusqlite::params![account_id, folder_path, uid, stage.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Outstanding sync failures for an account (for status and tests).
+    pub fn count_sync_failures(&self, account_id: i64) -> Result<i64> {
+        self.conn.query_row(
+            "SELECT count(*) FROM sync_failures WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |row| row.get(0),
+        )
+    }
+
     /// Load a single account by id (None if it no longer exists).
     pub fn load_account(&self, account_id: i64) -> Result<Option<Account>> {
         let mut stmt = self.conn.prepare(
@@ -1436,6 +1577,21 @@ fn row_to_action(row: &rusqlite::Row) -> Result<PendingAction> {
         kind,
         payload: row.get(5)?,
         attempts: row.get(6)?,
+    })
+}
+
+/// Map a `sync_failures` row to a [`SyncFailure`]. An unknown `stage` is an
+/// error rather than a guess, matching [`row_to_action`].
+fn row_to_sync_failure(row: &rusqlite::Row) -> Result<SyncFailure> {
+    let stage_raw: String = row.get(2)?;
+    let stage = SyncStage::from_str(&stage_raw).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnName(format!("unknown sync stage: {stage_raw}"))
+    })?;
+    Ok(SyncFailure {
+        folder_path: row.get(0)?,
+        uid: row.get(1)?,
+        stage,
+        attempts: row.get(3)?,
     })
 }
 

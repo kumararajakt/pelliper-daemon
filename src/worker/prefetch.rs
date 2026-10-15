@@ -3,7 +3,7 @@
 
 use super::Worker;
 use crate::imap;
-use crate::types::ImapMessageSummary;
+use crate::types::{ImapMessageSummary, SyncStage};
 
 /// Pre-download bodies for this many of the most recent messages so opening
 /// them is instant.  Older messages load on demand.
@@ -13,18 +13,22 @@ const PREFETCH_BODY_LIMIT: usize = 50;
 /// saving them is instant. Older ones load on demand via LoadBody.
 const PREFETCH_ATTACHMENT_LIMIT: usize = 100;
 impl Worker {
-    /// Fetch a single message body from IMAP.
-    pub(super) async fn fetch_single_body(
+    /// Fetch, parse, and cache one message body, returning `(html,
+    /// has_attachments)`. The `Err` carries the IMAP error (as text) so callers
+    /// can record a durable retry; cache-write failures inside `persist_parsed`
+    /// are logged there and do not fail the fetch.
+    pub(super) async fn fetch_and_store_body(
         &mut self,
         folder_path: &str,
         uid: i64,
-    ) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
-        self.ensure_session()
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-        let session = self.session.as_mut().ok_or("no session")?;
-
-        let raw = imap::fetch_body(session, folder_path, uid).await?;
+    ) -> Result<(String, bool), String> {
+        self.ensure_session().await?;
+        let raw = {
+            let session = self.session.as_mut().ok_or("no session")?;
+            imap::fetch_body(session, folder_path, uid)
+                .await
+                .map_err(|e| e.to_string())?
+        };
 
         let parsed = imap::parse_message_body(&raw);
         let html = if parsed.html.is_empty() {
@@ -38,6 +42,17 @@ impl Worker {
             .await;
 
         Ok((html, parsed.has_attachments))
+    }
+
+    /// Fetch a single message body from IMAP.
+    pub(super) async fn fetch_single_body(
+        &mut self,
+        folder_path: &str,
+        uid: i64,
+    ) -> Result<(String, bool), Box<dyn std::error::Error + Send + Sync>> {
+        self.fetch_and_store_body(folder_path, uid)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
     }
 
     /// Save the parsed body HTML and any attachment files for a message, then
@@ -186,24 +201,8 @@ impl Worker {
     }
 
     pub(super) async fn run_one_body_prefetch(&mut self, folder_path: &str, uid: i64) {
-        if self.ensure_session().await.is_err() {
-            return;
-        }
-        let session = match self.session.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-
-        match imap::fetch_body(session, folder_path, uid).await {
-            Ok(raw) => {
-                let parsed = imap::parse_message_body(&raw);
-                let html = if parsed.html.is_empty() {
-                    format!("<pre>{}</pre>", parsed.text)
-                } else {
-                    parsed.html.clone()
-                };
-                self.persist_parsed(folder_path, uid, &html, &parsed, &raw)
-                    .await;
+        match self.fetch_and_store_body(folder_path, uid).await {
+            Ok(_) => {
                 tracing::debug!(
                     "Worker[{}]: prefetched body for {} uid={}",
                     self.account.id,
@@ -213,11 +212,17 @@ impl Worker {
             }
             Err(e) => {
                 tracing::warn!(
-                    "Worker[{}]: body prefetch failed for uid={}: {}",
+                    "Worker[{}]: body prefetch failed for {} uid={}: {}",
                     self.account.id,
+                    folder_path,
                     uid,
                     e
                 );
+                // Record it so the failure is retried in the background instead
+                // of being lost: the in-memory prefetch queue will not revisit
+                // this message, and older ones are never re-queued.
+                self.note_sync_failure(folder_path, uid, SyncStage::Body, &e)
+                    .await;
             }
         }
     }
