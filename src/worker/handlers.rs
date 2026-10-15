@@ -3,6 +3,7 @@
 
 use super::{Worker, WorkerRequest};
 use crate::imap;
+use crate::types::{ActionKind, MovePayload, SetFlagsPayload};
 use futures::StreamExt;
 
 impl Worker {
@@ -156,6 +157,39 @@ impl Worker {
         }
     }
 
+    /// Record a mutation as a durable intent and try it immediately. On success
+    /// that is the end of it; on failure the row stays queued and the worker's
+    /// drain loop retries it with backoff (`worker/actions.rs`).
+    ///
+    /// Enqueue-before-attempt is the point: a crash or disconnect between the
+    /// two leaves a recoverable row rather than a lost user action.
+    async fn enqueue_and_process(
+        &mut self,
+        folder_path: &str,
+        uid: i64,
+        kind: ActionKind,
+        payload: String,
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        let action = {
+            let cache = self.cache.lock().await;
+            match cache.enqueue_action(self.account.id, folder_path, uid, kind, &payload, now) {
+                Ok(action) => action,
+                Err(e) => {
+                    tracing::error!(
+                        "Worker[{}]: failed to enqueue {} action for {}/{}: {e}",
+                        self.account.id,
+                        kind.as_str(),
+                        folder_path,
+                        uid
+                    );
+                    return;
+                }
+            }
+        };
+        self.process_action(action).await;
+    }
+
     /// Apply read/starred flag changes to a message (STORE + local cache),
     /// then refresh the folder's unread count.
     async fn handle_set_flags(
@@ -165,76 +199,17 @@ impl Worker {
         is_read: Option<bool>,
         is_starred: Option<bool>,
     ) {
-        let mut add: Vec<&str> = Vec::new();
-        let mut remove: Vec<&str> = Vec::new();
-        if let Some(read) = is_read {
-            if read {
-                add.push("\\Seen");
-            } else {
-                remove.push("\\Seen");
-            }
-        }
-        if let Some(starred) = is_starred {
-            if starred {
-                add.push("\\Flagged");
-            } else {
-                remove.push("\\Flagged");
-            }
-        }
-
-        if self.ensure_session().await.is_err() {
-            return;
-        }
-        // Try the operation; on auth error, invalidate token and retry once.
-        // The cache is only updated when the server accepted the STORE — a
-        // rejected mutation must not be recorded locally (sync gap #5).
-        match self.do_set_flags(folder_path, uid, &add, &remove).await {
-            Ok(()) => {}
-            Err(e) if Self::is_auth_error(&e) && self.account.auth_type == "oauth" => {
-                tracing::warn!(
-                    "Worker[{}]: auth error in set_flags, refreshing token",
-                    self.account.id
-                );
-                self.invalidate_token();
-                if self.ensure_session().await.is_err() {
-                    return;
-                }
-                if let Err(e) = self.do_set_flags(folder_path, uid, &add, &remove).await {
-                    tracing::warn!(
-                        "Worker[{}]: set_flags retry for {}/{} failed: {}",
-                        self.account.id,
-                        folder_path,
-                        uid,
-                        e
-                    );
-                    return;
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Worker[{}]: set_flags for {}/{} failed: {}",
-                    self.account.id,
-                    folder_path,
-                    uid,
-                    e
-                );
-                return;
-            }
-        }
-
-        {
-            let cache = self.cache.lock().await;
-            let _ =
-                cache.update_message_flags(self.account.id, folder_path, uid, is_read, is_starred);
-            let unread = cache
-                .count_unread(self.account.id, folder_path)
-                .unwrap_or(0);
-            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
-        }
+        let payload = serde_json::to_string(&SetFlagsPayload {
+            is_read,
+            is_starred,
+        })
+        .unwrap_or_else(|_| "{}".to_string());
+        self.enqueue_and_process(folder_path, uid, ActionKind::SetFlags, payload)
+            .await;
     }
 
     /// Internal helper: select folder and store flags (may fail with auth error).
-    async fn do_set_flags(
+    pub(super) async fn do_set_flags(
         &mut self,
         folder_path: &str,
         uid: i64,
@@ -263,9 +238,11 @@ impl Worker {
         uid: i64,
         dest_folder: Option<String>,
     ) {
-        if self.ensure_session().await.is_err() {
-            return;
-        }
+        // Best-effort folder-list refresh: role resolution reads the cache, and
+        // an offline account must still get its intent queued for retry, so a
+        // failed connect here is not fatal (it will be attempted again by
+        // `process_action`).
+        let _ = self.ensure_session().await;
 
         let dest = match dest_folder {
             Some(d) if !d.is_empty() => d,
@@ -284,64 +261,31 @@ impl Worker {
             },
         };
 
-        // Try the move; on auth error, invalidate token and retry once.
-        // The cache is only updated when the server accepted the move
-        // (sync gap #5).
-        match self.do_move(folder_path, uid, &dest).await {
-            Ok(()) => {}
-            Err(e) if Self::is_auth_error(&e) && self.account.auth_type == "oauth" => {
-                tracing::warn!(
-                    "Worker[{}]: auth error in move, refreshing token",
-                    self.account.id
-                );
-                self.invalidate_token();
-                if self.ensure_session().await.is_err() {
-                    return;
-                }
-                if let Err(e) = self.do_move(folder_path, uid, &dest).await {
-                    tracing::warn!(
-                        "Worker[{}]: move retry for {}/{} failed: {}",
-                        self.account.id,
-                        folder_path,
-                        uid,
-                        e
-                    );
-                    return;
-                }
-            }
+        let payload = match serde_json::to_string(&MovePayload {
+            dest,
+            refresh_dest: true,
+        }) {
+            Ok(p) => p,
             Err(e) => {
-                tracing::warn!(
-                    "Worker[{}]: move for {}/{} failed: {}",
+                tracing::error!(
+                    "Worker[{}]: failed to encode move payload for {}/{}: {e}",
                     self.account.id,
                     folder_path,
-                    uid,
-                    e
+                    uid
                 );
                 return;
             }
-        }
-
-        {
-            let cache = self.cache.lock().await;
-            let _ = cache.move_message(self.account.id, folder_path, uid, &dest);
-            let unread = cache
-                .count_unread(self.account.id, folder_path)
-                .unwrap_or(0);
-            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
-        }
-
-        // Make sure the destination shows the moved message.
-        if let Err(e) = self.sync_folder_first_page(&dest).await {
-            tracing::error!(
-                "Worker[{}]: refresh {} after move failed: {}",
-                self.account.id,
-                dest,
-                e
-            );
-        }
+        };
+        self.enqueue_and_process(folder_path, uid, ActionKind::Move, payload)
+            .await;
     }
 
-    async fn do_move(&mut self, folder_path: &str, uid: i64, dest: &str) -> Result<(), String> {
+    pub(super) async fn do_move(
+        &mut self,
+        folder_path: &str,
+        uid: i64,
+        dest: &str,
+    ) -> Result<(), String> {
         let session = self
             .session
             .as_mut()
@@ -373,7 +317,7 @@ impl Worker {
     }
 
     /// Internal helper: select folder, mark \Deleted, and EXPUNGE (may fail).
-    async fn do_expunge(&mut self, folder_path: &str, uid: i64) -> Result<(), String> {
+    pub(super) async fn do_expunge(&mut self, folder_path: &str, uid: i64) -> Result<(), String> {
         let session = self
             .session
             .as_mut()
@@ -394,9 +338,10 @@ impl Worker {
     /// Delete a message: if already in a Trash folder, permanently remove it
     /// (flag \Deleted + EXPUNGE); otherwise move it to Trash as a soft delete.
     async fn handle_delete_message(&mut self, folder_path: &str, uid: i64) {
-        if self.ensure_session().await.is_err() {
-            return;
-        }
+        // Best-effort folder-list refresh only: role resolution reads the cache,
+        // and an offline account must still get its intent queued for retry
+        // (see the durable action ledger).
+        let _ = self.ensure_session().await;
 
         // Consult the classified folder list, not the folder's name. `list_folders`
         // demotes name-matched impostors when the server exposes a real SPECIAL-USE
@@ -407,27 +352,13 @@ impl Worker {
             .await;
 
         if in_trash {
-            // Permanently delete: \Deleted + EXPUNGE. Only drop the cached row
-            // when the server actually expunged — a rejected STORE/EXPUNGE must
-            // not be recorded locally (sync gap #5).
-            if let Err(e) = self.do_expunge(folder_path, uid).await {
-                tracing::warn!(
-                    "Worker[{}]: delete (expunge) for {}/{} failed: {}",
-                    self.account.id,
-                    folder_path,
-                    uid,
-                    e
-                );
-                return;
-            }
-            let cache = self.cache.lock().await;
-            let _ = cache.delete_message(self.account.id, folder_path, uid);
-            let unread = cache
-                .count_unread(self.account.id, folder_path)
-                .unwrap_or(0);
-            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+            // Permanently delete: \Deleted + EXPUNGE.
+            self.enqueue_and_process(folder_path, uid, ActionKind::Delete, "{}".to_string())
+                .await;
         } else {
-            // Soft delete: move to Trash
+            // Soft delete: move to Trash. The destination is resolved now and
+            // captured in the payload, so a retry after a restart does not
+            // depend on the folder list still classifying the same way.
             let trash = match self
                 .resolve_role_folder(crate::types::FolderKind::Trash)
                 .await
@@ -441,22 +372,23 @@ impl Worker {
                     return;
                 }
             };
-            if let Err(e) = self.do_move(folder_path, uid, &trash).await {
-                tracing::warn!(
-                    "Worker[{}]: delete (move to trash) for {}/{} failed: {}",
-                    self.account.id,
-                    folder_path,
-                    uid,
-                    e
-                );
-                return;
-            }
-            let cache = self.cache.lock().await;
-            let _ = cache.move_message(self.account.id, folder_path, uid, &trash);
-            let unread = cache
-                .count_unread(self.account.id, folder_path)
-                .unwrap_or(0);
-            let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+            let payload = match serde_json::to_string(&MovePayload {
+                dest: trash,
+                refresh_dest: false,
+            }) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        "Worker[{}]: failed to encode delete payload for {}/{}: {e}",
+                        self.account.id,
+                        folder_path,
+                        uid
+                    );
+                    return;
+                }
+            };
+            self.enqueue_and_process(folder_path, uid, ActionKind::Move, payload)
+                .await;
         }
     }
 

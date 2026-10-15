@@ -1,4 +1,7 @@
-use crate::types::{Account, AttachmentRecord, Folder, Message, MessageHeaders, OutboxItem};
+use crate::types::{
+    Account, ActionKind, AttachmentRecord, Folder, Message, MessageHeaders, OutboxItem,
+    PendingAction,
+};
 use rusqlite::{Connection, Result};
 use std::path::PathBuf;
 
@@ -165,6 +168,34 @@ impl Cache {
                 attempts INTEGER DEFAULT 0,
                 created_at INTEGER NOT NULL
             );
+
+            -- Durable ledger for non-send mutations (flags/move/delete). The
+            -- user's intent is written here BEFORE the server is touched, so an
+            -- offline or rejected operation survives a restart and is retried by
+            -- the worker's drain loop instead of being lost. Sends keep their
+            -- own `outbox` table above: different transport, different budget.
+            --
+            -- `state` is 'pending' (eligible for claiming) or 'in_flight' (a
+            -- worker has claimed it). `not_before` gates retries/backoff.
+            -- `payload` is kind-specific JSON. Unknown kinds are rejected on
+            -- read rather than guessed at.
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                folder_path TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                state TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                not_before INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                last_error TEXT,
+                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS pending_actions_due
+                ON pending_actions (account_id, state, not_before);
             ",
         )?;
 
@@ -1106,6 +1137,111 @@ impl Cache {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Durable non-send action ledger (flags / move / delete)
+    // -----------------------------------------------------------------------
+
+    /// Record a non-send mutation as a durable intent **before** the server is
+    /// touched, returning the stored row so the caller can try it immediately.
+    ///
+    /// `now` is the `created_at`/initial `not_before`: a freshly enqueued action
+    /// is due at once. If the process dies before the attempt, the row stays
+    /// `pending` and the worker's drain loop picks it up on the next start.
+    pub fn enqueue_action(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        kind: ActionKind,
+        payload: &str,
+        now: i64,
+    ) -> Result<PendingAction> {
+        self.conn.execute(
+            "INSERT INTO pending_actions
+                (account_id, folder_path, uid, kind, payload, state, attempts, not_before, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?6)",
+            rusqlite::params![account_id, folder_path, uid, kind.as_str(), payload, now],
+        )?;
+        Ok(PendingAction {
+            id: self.conn.last_insert_rowid(),
+            folder_path: folder_path.to_string(),
+            uid,
+            kind,
+            payload: payload.to_string(),
+            attempts: 0,
+        })
+    }
+
+    /// Atomically claim the oldest due action for an account, marking it
+    /// `in_flight` so a later claim cannot return it again. Returns `None` when
+    /// nothing is due.
+    ///
+    /// `Cache` is serialized behind a single mutex, so the select-then-update is
+    /// atomic with respect to other claims; the state column still matters for
+    /// crash recovery (see [`Cache::reset_in_flight_actions`]).
+    pub fn claim_due_action(&self, account_id: i64, now: i64) -> Result<Option<PendingAction>> {
+        let action = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, account_id, folder_path, uid, kind, payload, attempts, not_before, created_at, last_error
+                 FROM pending_actions
+                 WHERE account_id = ?1 AND state = 'pending' AND not_before <= ?2
+                 ORDER BY id ASC
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(rusqlite::params![account_id, now], row_to_action)?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+        if let Some(ref action) = action {
+            self.conn.execute(
+                "UPDATE pending_actions SET state = 'in_flight' WHERE id = ?1",
+                rusqlite::params![action.id],
+            )?;
+        }
+        Ok(action)
+    }
+
+    /// Drop an action: it either succeeded or is being abandoned.
+    pub fn complete_action(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_actions WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Record a failed attempt: bump the counter, schedule the retry, and return
+    /// the action to the `pending` pool. Returns the new attempt count.
+    pub fn reschedule_action(&self, id: i64, not_before: i64, last_error: &str) -> Result<i32> {
+        self.conn.execute(
+            "UPDATE pending_actions
+             SET state = 'pending', attempts = attempts + 1, not_before = ?2, last_error = ?3
+             WHERE id = ?1",
+            rusqlite::params![id, not_before, last_error],
+        )?;
+        let attempts: i32 = self.conn.query_row(
+            "SELECT attempts FROM pending_actions WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )?;
+        Ok(attempts)
+    }
+
+    /// Return an account's `in_flight` actions to the `pending` pool. Called
+    /// when a worker (re)starts so actions interrupted by a crash or restart are
+    /// retried instead of being stranded as `in_flight` forever. Returns the
+    /// number recovered.
+    pub fn reset_in_flight_actions(&self, account_id: i64) -> Result<usize> {
+        let recovered = self.conn.execute(
+            "UPDATE pending_actions SET state = 'pending'
+             WHERE account_id = ?1 AND state = 'in_flight'",
+            rusqlite::params![account_id],
+        )?;
+        Ok(recovered)
+    }
+
     /// Load a single account by id (None if it no longer exists).
     pub fn load_account(&self, account_id: i64) -> Result<Option<Account>> {
         let mut stmt = self.conn.prepare(
@@ -1234,6 +1370,24 @@ impl Cache {
         })?;
         rows.collect::<Result<Vec<_>>>()
     }
+}
+
+/// Map a `pending_actions` row to a [`PendingAction`]. An unknown `kind` is an
+/// error rather than a guess: silently misreading a destructive intent is worse
+/// than surfacing it.
+fn row_to_action(row: &rusqlite::Row) -> Result<PendingAction> {
+    let kind_raw: String = row.get(4)?;
+    let kind = ActionKind::from_str(&kind_raw).ok_or_else(|| {
+        rusqlite::Error::InvalidColumnName(format!("unknown action kind: {kind_raw}"))
+    })?;
+    Ok(PendingAction {
+        id: row.get(0)?,
+        folder_path: row.get(2)?,
+        uid: row.get(3)?,
+        kind,
+        payload: row.get(5)?,
+        attempts: row.get(6)?,
+    })
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@
 //! not a copy of the DDL.
 
 use super::*;
-use crate::types::MessageHeaders;
+use crate::types::{ActionKind, MessageHeaders};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A fresh cache in a throwaway data dir, with the schema and the search
@@ -740,4 +740,102 @@ fn clearing_a_folder_resets_its_sync_cursors() {
         (0, None)
     );
     assert_eq!(cache.min_cached_uid(1, "INBOX").expect("min"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Durable action ledger
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_claimed_action_is_not_claimed_again() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    let action = cache
+        .enqueue_action(1, "INBOX", 7, ActionKind::SetFlags, "{}", 100)
+        .expect("enqueue");
+
+    let claimed = cache.claim_due_action(1, 100).expect("claim").expect("due");
+    assert_eq!(claimed.id, action.id);
+    assert_eq!(claimed.uid, 7);
+    assert_eq!(claimed.attempts, 0);
+
+    // While it is claimed (in-flight) it must not be handed out again.
+    assert!(cache.claim_due_action(1, 100).expect("reclaim").is_none());
+
+    // Once completed it is gone entirely.
+    cache.complete_action(action.id).expect("complete");
+    assert!(cache.claim_due_action(1, 100).expect("after").is_none());
+}
+
+#[test]
+fn an_action_is_not_due_before_not_before() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .enqueue_action(1, "INBOX", 1, ActionKind::Delete, "{}", 100)
+        .expect("enqueue");
+
+    assert!(cache.claim_due_action(1, 99).expect("early").is_none());
+    assert!(cache.claim_due_action(1, 100).expect("due").is_some());
+}
+
+#[test]
+fn rescheduling_returns_an_action_to_the_queue_with_a_bumped_count() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    let action = cache
+        .enqueue_action(
+            1,
+            "INBOX",
+            1,
+            ActionKind::Move,
+            r#"{"dest":"Trash","refresh_dest":true}"#,
+            100,
+        )
+        .expect("enqueue");
+    let claimed = cache.claim_due_action(1, 100).expect("claim").expect("due");
+    assert_eq!(claimed.id, action.id);
+
+    let attempts = cache
+        .reschedule_action(action.id, 500, "offline")
+        .expect("reschedule");
+    assert_eq!(attempts, 1);
+
+    // Backed off until `not_before`...
+    assert!(cache.claim_due_action(1, 499).expect("early").is_none());
+    // ...then claimable again, carrying the bumped attempt count.
+    let again = cache.claim_due_action(1, 500).expect("due").expect("due");
+    assert_eq!(again.attempts, 1);
+}
+
+#[test]
+fn resetting_in_flight_reclaims_stranded_actions() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .enqueue_action(1, "INBOX", 1, ActionKind::SetFlags, "{}", 100)
+        .expect("enqueue");
+    assert!(cache.claim_due_action(1, 100).expect("claim").is_some());
+    assert!(cache.claim_due_action(1, 100).expect("in flight").is_none());
+
+    // A worker restart recovers the stranded action.
+    assert_eq!(cache.reset_in_flight_actions(1).expect("reset"), 1);
+    assert!(cache.claim_due_action(1, 100).expect("after").is_some());
+}
+
+#[test]
+fn an_unknown_action_kind_is_rejected_not_guessed() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .conn
+        .execute(
+            "INSERT INTO pending_actions (account_id, folder_path, uid, kind, created_at)
+             VALUES (1, 'INBOX', 1, 'explode', 100)",
+            [],
+        )
+        .expect("insert bogus kind");
+
+    // Misreading a destructive intent is worse than surfacing the error.
+    assert!(cache.claim_due_action(1, 100).is_err());
 }

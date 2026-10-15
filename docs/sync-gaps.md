@@ -16,7 +16,7 @@ not raw feature parity. Each is independently shippable.
 | 1 | ~~No UIDVALIDITY tracking~~ ✅ done | Data corruption/mis-association on server UID reset | S | M |
 | 2 | ~~No persisted sync cursor~~ ✅ done | Repeated full `UID SEARCH ALL` + newest-page refetch | M | M |
 | 3 | ~~No expunge/flag reconciliation~~ ✅ done | Stale rows; server-side changes never applied locally | M | M |
-| 4 | No durable action ledger (non-send) | Offline/failed flags, moves, deletes silently diverge | L | M |
+| 4 | ~~No durable action ledger (non-send)~~ ✅ done | Offline/failed flags, moves, deletes silently diverge | L | M |
 | 5 | ~~Cache mutated even when IMAP op fails~~ ✅ done | Local state claims success that server rejected | S | L |
 | 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
 | 7 | Trigger-driven FTS fragility | A failed trigger silently drops body indexing | M | M |
@@ -150,11 +150,58 @@ survivors remain and FTS no longer matches the removed ones.
 
 ## 4. Durable action ledger for non-send mutations
 
-**Current.** `Send` failures are durably queued (`outbox` table, retried every
-30 s, capped at 10 attempts — `src/outbox.rs`). Flags, move, delete and folder
-ops are **not**: `src/worker/handlers.rs` calls `do_set_flags` / `do_move` once,
-retries only on an auth error, and then moves on. Offline or rejected mutations
-are lost.
+**Status: implemented.** Flags, moves and deletes are now written to a
+`pending_actions` table *before* the server is touched, so an offline or
+rejected mutation survives a restart and is retried instead of being lost.
+
+- **Storage** (`src/cache.rs`): `pending_actions(id, account_id, folder_path,
+  uid, kind, payload, state, attempts, not_before, created_at, last_error)` with
+  an `(account_id, state, not_before)` index and an `ON DELETE CASCADE` FK to
+  `accounts`. `enqueue_action` / `claim_due_action` / `complete_action` /
+  `reschedule_action` / `reset_in_flight_actions` are the repo fns.
+- **Policy** (`src/actions.rs`): pure, unit-tested backoff
+  (`backoff_secs` / `backoff_secs_jittered`, base 5 s doubling to a 30 min cap),
+  permanent-vs-transient classification (`is_permanent_error`), and the
+  retry/drop decision (`retry_decision`, `MAX_ACTION_ATTEMPTS = 8`).
+- **Execution** (`src/worker/actions.rs`): `process_action` runs the IMAP op
+  (keeping the one-shot OAuth refresh + retry), applies the local cache effect
+  only on success, then drops the row; on failure it reschedules with backoff or
+  drops the row when the error is permanent / attempts are exhausted.
+  `drain_one_action` claims one due action per loop iteration.
+- **Enqueue-first** (`src/worker/handlers.rs`): `handle_set_flags`,
+  `handle_move_message` and `handle_delete_message` record the intent, then call
+  `process_action` for immediate feedback. The move/delete handlers no longer
+  bail out when `ensure_session` fails — role resolution reads the cache, so an
+  offline account still queues its intent. Delete-to-trash is stored as a
+  `move` action with `refresh_dest = false`; delete-in-trash as a permanent
+  `delete`.
+- **Loop placement** (`src/worker.rs`): step 0.5 drains one due action — after
+  user requests, before body prefetch/backfill — and worker startup calls
+  `reset_in_flight_actions` to recover actions stranded by a crash.
+
+Sends keep the dedicated `outbox` + SMTP flusher; only non-send mutations move
+to the ledger.
+
+**Not done (deliberately).** The local cache is updated only *after* the server
+accepts the action, so there is no optimistic mutation and therefore no
+rollback. This is consistent with gap #5 and avoids the UI briefly showing a
+change the server later rejects; `mark_failed_and_rollback` from Flectar is
+unnecessary under this model. Bounded slices (Flectar's
+`MAX_ACTIONS_PER_SLICE`) are not needed either — one action per loop iteration
+already keeps the loop responsive.
+
+**Tests.** `src/actions.test.rs` covers backoff growth/saturation, jitter
+bounds, permanent-vs-transient classification, and the bounded retry/drop
+decision. `src/cache.test.rs` covers: a claimed action is not returned again and
+is gone after completion; `not_before` gates claims; rescheduling bumps the
+attempt count and returns it to the queue; `reset_in_flight_actions` recovers
+stranded rows; and an unknown `kind` is rejected rather than guessed at.
+
+**Original analysis.** `Send` failures are durably queued (`outbox` table,
+retried every 30 s, capped at 10 attempts — `src/outbox.rs`). Flags, move,
+delete and folder ops were **not**: `src/worker/handlers.rs` called
+`do_set_flags` / `do_move` once, retried only on an auth error, and then moved
+on. Offline or rejected mutations were lost.
 
 **Flectar reference.** `queue/mod.rs` + `db/repo/actions.rs` implement
 `pending_actions`: optimistic local mutation first, durable intent row, atomic
@@ -163,23 +210,14 @@ backoff + jitter, `MAX_ATTEMPTS = 8`, transient vs permanent classification
 (`is_permanent`), and `mark_failed_and_rollback` which undoes an optimistic move
 only if it is still the newest intent for that message.
 
-**Proposed change.**
-- Generalize the existing `outbox` pattern into a `pending_actions` table:
-  `id, account_id, message_id/uid, folder_path, kind, payload(json), state,
-  attempts, not_before, created_at, last_error`.
-- Enqueue the intent before mutating the server; apply the local cache update
-  only when the action succeeds (or explicitly mark it optimistic and roll back
-  on permanent failure).
-- Drain due actions at the top of the worker loop (already the priority-0 slot),
-  before background prefetch/backfill.
-- Keep sends on the existing dedicated path; the `payload` can reuse
-  `EmailAttachment`/outbox fields.
+**Files.** `src/cache.rs` (table + repo fns), `src/actions.rs` (+ `.test.rs`,
+new), `src/worker/actions.rs` (new), `src/worker/handlers.rs`, `src/worker.rs`,
+`src/types.rs`, `src/main.rs`.
 
-**Files.** `src/cache.rs` (new table + repo fns), `src/worker/handlers.rs`,
-`src/outbox.rs` (or a new `src/actions.rs`), `src/worker.rs`.
+**Note.** Folder create/rename/delete are still *not* in the ledger — they are
+rarer, usually interactive, and their failure is surfaced directly. Extending
+`ActionKind` with folder ops is the natural follow-up if that changes.
 
-**Test.** Pure-state tests for attempt/backoff/permanent classification, plus a
-cache test that a claimed action is not returned again.
 
 ---
 
@@ -208,9 +246,10 @@ error the local cache records a change the server rejected.
 `mark_failed_and_rollback` reverses an optimistic move when the action
 permanently fails.
 
-**Remaining work.** The cache no longer *lies*, but a failed mutation is still
-simply dropped (no durable retry) — that is item 4. Gating is the stopgap;
-`pending_actions` is the fix.
+**Remaining work.** None — the durable retry that this gating deferred to is
+item 4, now implemented (`pending_actions`). A failed mutation is enqueued and
+retried with backoff instead of being dropped; the cache is still written only
+after the server accepts the action.
 
 **Files.** `src/worker/handlers.rs`.
 
@@ -331,8 +370,10 @@ expose counts via D-Bus.
    wrong behavior.
 3. **2 (cursors)** then **3 (reconcile)** — the core sync-quality fix, best done
    together.
-4. **5 (don't write on failure)** ✅ done — the stopgap landed before **4
-   (durable actions)**, which is still open.
+4. **5 (don't write on failure)** ✅ done — the stopgap that landed before **4
+   (durable actions)** ✅ done. Together they make flags/moves/deletes
+   server-authoritative: cache writes only happen on success, and failures are
+   queued and retried instead of lost.
 5. **10 (failure ledger)**, then **7 (FTS)** and **9 (threading)** as follow-ups.
 
 ## Deliberately not proposed

@@ -4,10 +4,11 @@
 //! account and always processes the most important work first:
 //!
 //! 1. **User requests** — LoadMessages / LoadBody are served immediately.
-//! 2. **Body prefetch** — recent message bodies cached so opening is instant.
-//! 3. **Attachment prefetch** — attachments for older messages cached on disk.
-//! 4. **Backfill** — remaining folder messages indexed in chunks.
-//! 5. **IDLE** — blocks for server push; re-syncs on mailbox change.
+//! 2. **Queued actions** — durable flags/move/delete retries (the action ledger).
+//! 3. **Body prefetch** — recent message bodies cached so opening is instant.
+//! 4. **Attachment prefetch** — attachments for older messages cached on disk.
+//! 5. **Backfill** — remaining folder messages indexed in chunks.
+//! 6. **IDLE** — blocks for server push; re-syncs on mailbox change.
 //!
 //! This replaces the separate SyncEngine + IdleRouter architecture with a
 //! single task per account that never lets background work starve the user.
@@ -22,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+mod actions;
 mod backfill;
 mod handlers;
 mod idle;
@@ -192,6 +194,21 @@ impl Worker {
             tracing::error!("Worker[{}]: bootstrap connect failed: {}", id, e);
         }
 
+        // Recover actions left in-flight by a previous run (crash/restart) so
+        // they are retried rather than stranded. New actions are only enqueued
+        // after this point, so nothing live is disturbed.
+        {
+            let cache = self.cache.lock().await;
+            match cache.reset_in_flight_actions(self.account.id) {
+                Ok(n) if n > 0 => tracing::info!(
+                    "Worker[{}]: recovered {} in-flight action(s) from a previous run",
+                    id,
+                    n
+                ),
+                _ => {}
+            }
+        }
+
         'outer: loop {
             if self.shutdown {
                 break;
@@ -211,6 +228,14 @@ impl Worker {
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                 }
+            }
+
+            // ---- Step 0.5: drain one due queued action (durable retry)
+            // Runs before background work but after user requests, so a
+            // reconnect's backlog of flags/moves/deletes clears promptly
+            // without evicting interactive work.
+            if self.drain_one_action().await {
+                continue;
             }
 
             // ---- Step 1: body prefetch (one per iteration)

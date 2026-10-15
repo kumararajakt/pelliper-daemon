@@ -63,6 +63,80 @@ pub struct OutboxItem {
     pub attempts: i32,
 }
 
+/// The kind of a queued non-send mutation, persisted as `pending_actions.kind`.
+///
+/// Sends are *not* here — they keep their own `outbox` table and SMTP flusher,
+/// because they need a different transport and a longer attempt budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    /// Set read/starred flags; payload is a [`SetFlagsPayload`].
+    SetFlags,
+    /// Move to another folder; payload is a [`MovePayload`].
+    Move,
+    /// Permanently delete (flag `\Deleted` + EXPUNGE); payload is empty.
+    Delete,
+}
+
+impl ActionKind {
+    /// Stable lowercase string stored in the database and embedded in logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ActionKind::SetFlags => "set_flags",
+            ActionKind::Move => "move",
+            ActionKind::Delete => "delete",
+        }
+    }
+
+    /// Parse the persisted form. `None` for an unknown kind, which the cache
+    /// treats as an error rather than guessing at a destructive operation.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "set_flags" => Some(ActionKind::SetFlags),
+            "move" => Some(ActionKind::Move),
+            "delete" => Some(ActionKind::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// Payload for [`ActionKind::SetFlags`]. `None` leaves a flag unchanged, matching
+/// the D-Bus `set_message_read` / `set_message_starred` contract.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SetFlagsPayload {
+    pub is_read: Option<bool>,
+    pub is_starred: Option<bool>,
+}
+
+/// Payload for [`ActionKind::Move`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MovePayload {
+    /// Destination folder path.
+    pub dest: String,
+    /// Whether to re-sync the destination afterwards so the moved message shows
+    /// up immediately. An explicit move refreshes the destination; a
+    /// delete-to-trash does not (the UI is leaving the folder anyway).
+    pub refresh_dest: bool,
+}
+
+/// One durable, retryable non-send mutation, as read from `pending_actions`.
+///
+/// The intent is written there *before* the server is touched, so an offline or
+/// crashed operation survives a restart and is retried by the worker's drain
+/// loop instead of being lost. Scheduling metadata (`state`, `not_before`,
+/// `created_at`, `last_error`) is owned by the cache and not carried here.
+#[derive(Debug, Clone)]
+pub struct PendingAction {
+    pub id: i64,
+    pub folder_path: String,
+    pub uid: i64,
+    pub kind: ActionKind,
+    /// Kind-specific JSON (see [`SetFlagsPayload`] / [`MovePayload`]).
+    pub payload: String,
+    /// Attempts made so far, before the one about to run.
+    pub attempts: i32,
+}
+
 /// Information about a discovered IMAP folder.
 pub struct ImapFolder {
     pub path: String,
