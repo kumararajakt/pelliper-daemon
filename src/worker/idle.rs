@@ -85,8 +85,10 @@ impl Worker {
 
         let result = tokio::time::timeout(idle_timeout, async {
             loop {
-                // Check for commands (non-blocking) during IDLE.
-                while let Ok(cmd) = self.rx.try_recv() {
+                // Check for commands (non-blocking) during IDLE. Every arm
+                // below returns, so this handles at most one command — an
+                // `if let`, not a `while let`.
+                if let Ok(cmd) = self.rx.try_recv() {
                     match cmd {
                         WorkerRequest::SetIdleFolder { folder_path } => {
                             return IdleResult::FolderSwitch(folder_path);
