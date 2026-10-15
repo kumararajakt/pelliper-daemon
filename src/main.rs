@@ -2,6 +2,7 @@ mod actions;
 mod cache;
 mod dbus;
 mod imap;
+mod migrations;
 mod oauth;
 mod outbox;
 mod secrets;
@@ -81,7 +82,7 @@ async fn main() {
     std::fs::create_dir_all(&data_dir).ok();
 
     let cache = Cache::open(&data_dir).expect("Failed to open cache");
-    cache.create_tables().expect("Failed to create tables");
+    cache.migrate().expect("Failed to migrate schema");
     cache.fts_init().expect("Failed to init search index");
     let cache = Arc::new(Mutex::new(cache));
 

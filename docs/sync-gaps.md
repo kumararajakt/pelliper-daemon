@@ -20,7 +20,7 @@ not raw feature parity. Each is independently shippable.
 | 5 | ~~Cache mutated even when IMAP op fails~~ ✅ done | Local state claims success that server rejected | S | L |
 | 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
 | 7 | ~~Trigger-driven FTS fragility~~ ✅ done | A failed trigger silently drops body indexing | M | M |
-| 8 | No migration runner | Schema changes are silent no-ops on existing DBs | S | L |
+| 8 | ~~No migration runner~~ ✅ done | Schema changes are silent no-ops on existing DBs | S | L |
 | 9 | Threading owned implicitly by UI | No threads table; contract undocumented | L | L |
 | 10 | ~~`sync_failures` ledger absent~~ ✅ done | Failed header/body fetches are lost for the session | S | L |
 
@@ -32,7 +32,7 @@ regressing sync correctness if done carelessly.
 ## 1. Track UIDVALIDITY per folder
 
 **Status: implemented.** `folders.uidvalidity` is now persisted (with an
-additive `ALTER TABLE` migration in `create_tables` for existing databases).
+additive column repair in `src/migrations.rs` for pre-migration databases).
 `imap::folder_uidvalidity` reads it via EXAMINE; `Worker::sync_folder_first_page`
 clears the folder's cached messages and queued background work when the value
 changes, then re-seeds; `BackfillJob` carries the UIDVALIDITY it was planned
@@ -63,7 +63,7 @@ body-worker guards). The persisted state lives on the folder row.
 - Because backfill chunks are queued in memory, also tag each `BackfillJob` with
   the UIDVALIDITY it was planned under and drop it if the folder's changed.
 
-**Files.** `src/cache.rs` (`create_tables`, `upsert_folder`, new
+**Files.** `src/cache.rs` (`upsert_folder`, new
 `set_folder_uidvalidity` / `clear_folder_messages`), `src/imap.rs`,
 `src/worker.rs` (`sync_folder_first_page`), `src/worker/backfill.rs`.
 
@@ -77,7 +77,7 @@ old messages.
 
 **Status: implemented.** `folders.last_seen_uid` (forward high-water) and
 `folders.backfill_cursor` (history walk position) are persisted with additive
-migrations in `create_tables`. Cold folders seed from a sequence-range page and
+column repairs in `src/migrations.rs`. Cold folders seed from a sequence-range page and
 snapshot the server high-water; warm folders fetch only `imap::uid_search_after`
 (`UID SEARCH UID (last+1):*`, client-side filtered) in `BACKFILL_CHUNK`-wide
 windows. History backfill walks the UID space downward from a persisted cursor
@@ -326,7 +326,40 @@ consts), `src/cache.test.rs`.
 
 ## 8. Add a real migration runner
 
-**Current.** `Cache::open` sets `PRAGMA user_version=1` but nothing reads it;
+**Status: implemented.** Schema changes now go through an ordered,
+transactional migration runner instead of `CREATE TABLE IF NOT EXISTS`.
+
+- **Module** (`src/migrations.rs`): `MIGRATIONS: &[&str]` with the SQL inline
+  (`M001_INIT` is the whole relational baseline) and `latest_version()`.
+  `run(conn)` reads `PRAGMA user_version` — the count of migrations applied so
+  far — applies `MIGRATIONS[version..]`, and refuses a database whose
+  `user_version` is greater than `latest_version()`. Each migration runs in its
+  own transaction *together with* the `user_version` bump, so a failed migration
+  leaves the database exactly at its previous version rather than half-migrated.
+- **Call sites** (`src/cache.rs`, `src/main.rs`): `Cache::create_tables` is
+  replaced by `Cache::migrate`, and `Cache::open` no longer stamps the
+  unconditional `PRAGMA user_version = 1` — that stamp wrote a version nobody
+  read, which is why the counter could never be trusted. Startup is
+  `open → migrate → fts_init`.
+- **Legacy databases**: every database written before this change carries that
+  unreliable `user_version = 1`, so it *skips* `M001_INIT`. Those databases were
+  kept at the current shape by startup probes, and the one way they can still lag
+  is a `folders` column added by a historical probe; `run` repairs that through
+  `ensure_legacy_columns` (idempotent, `PRAGMA table_info`-guarded). New columns
+  must go through a numbered migration instead.
+- **FTS is deliberately not a migration.** Migrating `messages_fts` means
+  detecting the old contentful shape, dropping legacy triggers, and rebuilding
+  from `messages` — logic no plain SQL statement can express — so it stays in
+  `Cache::fts_init`. The original proposal to fold `fts_init` into `001_init.sql`
+  was not done, and `fts_init`'s create/migrate/reindex logic was left untouched.
+
+**Tests.** Three cases in `src/cache.test.rs`: a version-0 database migrates to
+latest and really creates the schema (not just stamps a version); re-running is a
+no-op across startups; a newer `user_version` is rejected *before* any migration
+runs, leaving the stamp untouched and no tables created. The two `folders`
+column-repair tests were retargeted from `create_tables` to `migrate`.
+
+**Original analysis.** `Cache::open` sets `PRAGMA user_version=1` but nothing reads it;
 `create_tables` is all `CREATE TABLE IF NOT EXISTS` (`src/cache.rs`). Adding a
 column to a released schema will silently not apply.
 
@@ -334,17 +367,8 @@ column to a released schema will silently not apply.
 `include_str!` migration array, `LATEST_VERSION = len`, applies each pending
 migration in its own transaction, and rejects a profile written by a newer app.
 
-**Proposed change.** Introduce a small `migrations` module: `MIGRATIONS: &[&str]`
-with `001_init.sql`, `002_*.sql`, …; `run(conn)` applies `user_version + 1..` in
-transactions and updates `user_version`; reject `user_version > LATEST`. Fold the
-current `create_tables` + `fts_init` into `001_init.sql`. This unblocks items 1,
-2, 4, and 10, whose schema additions would otherwise be no-ops on existing DBs.
-
-**Files.** `src/cache.rs`, new `src/db/migrations.rs` + `src/db/migrations/*.sql`
-(or keep SQL inline if preferred).
-
-**Test.** A test that opens a v0 DB and migrates to latest, and that a newer
-`user_version` is rejected without mutation.
+**Files.** new `src/migrations.rs`, `src/cache.rs` (`create_tables` → `migrate`,
+`open` drops the version stamp), `src/main.rs`, `src/cache.test.rs`.
 
 ---
 
@@ -444,8 +468,10 @@ follow-up if the UI wants it.
 
 ## Suggested order
 
-1. **8 (migrations)** first — everything else needs schema changes that apply
-   cleanly to existing databases.
+1. **8 (migrations)** ✅ done — everything else needs schema changes that apply
+   cleanly to existing databases. In practice it landed *after* 1/2/4/10: those
+   shipped through the `CREATE TABLE IF NOT EXISTS` + probe workaround first, and
+   the runner absorbed that work as its `M001_INIT` baseline.
 2. **1 (UIDVALIDITY)** and **6 (IDLE probe)** — small and directly prevent
    wrong behavior.
 3. **2 (cursors)** then **3 (reconcile)** — the core sync-quality fix, best done

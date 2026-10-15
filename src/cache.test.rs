@@ -19,7 +19,7 @@ fn scratch() -> (Cache, PathBuf) {
         N.fetch_add(1, Ordering::SeqCst)
     ));
     let cache = Cache::open(&dir).expect("open");
-    cache.create_tables().expect("create_tables");
+    cache.migrate().expect("migrate");
     cache.fts_init().expect("fts_init");
     (cache, dir)
 }
@@ -59,7 +59,7 @@ fn sample_headers() -> MessageHeaders {
 }
 
 #[test]
-fn create_tables_adds_message_headers() {
+fn migrate_creates_message_headers() {
     let (cache, _dir) = scratch();
     let found: i64 = cache
         .conn
@@ -69,7 +69,7 @@ fn create_tables_adds_message_headers() {
             |r| r.get(0),
         )
         .expect("query");
-    assert_eq!(found, 1, "message_headers must exist after create_tables");
+    assert_eq!(found, 1, "message_headers must exist after migrate");
 }
 
 #[test]
@@ -522,10 +522,10 @@ fn folder_uidvalidity_defaults_to_zero_and_round_trips() {
 }
 
 #[test]
-fn create_tables_adds_uidvalidity_to_a_pre_existing_folders_table() {
+fn migrate_adds_uidvalidity_to_a_pre_existing_folders_table() {
     // `CREATE TABLE IF NOT EXISTS` cannot evolve a table, so databases written
-    // before UIDVALIDITY tracking get the column via a targeted ALTER during
-    // create_tables. Recreate the old shape and re-run it.
+    // before UIDVALIDITY tracking get the column from the migration's legacy
+    // column repair. Recreate the old shape and re-run.
     let (cache, _dir) = scratch();
     cache
         .conn
@@ -543,7 +543,7 @@ fn create_tables_adds_uidvalidity_to_a_pre_existing_folders_table() {
         )
         .expect("legacy folders table");
 
-    cache.create_tables().expect("re-run create_tables");
+    cache.migrate().expect("re-run migrate");
     add_account(&cache);
     cache
         .upsert_folder(1, "INBOX", 0, false, "inbox")
@@ -710,7 +710,7 @@ fn fts_init_rebuilds_a_legacy_triggered_index() {
 }
 
 #[test]
-fn create_tables_adds_sync_cursor_columns_to_a_pre_existing_folders_table() {
+fn migrate_adds_sync_cursor_columns_to_a_pre_existing_folders_table() {
     // Same story as uidvalidity: an old-format DB has no cursor columns, and
     // `CREATE TABLE IF NOT EXISTS` won't evolve it. Recreate the pre-cursor
     // shape (with uidvalidity, as after the gap #1 migration) and re-run.
@@ -732,7 +732,7 @@ fn create_tables_adds_sync_cursor_columns_to_a_pre_existing_folders_table() {
         )
         .expect("pre-cursor folders table");
 
-    cache.create_tables().expect("re-run create_tables");
+    cache.migrate().expect("re-run migrate");
     add_account(&cache);
     cache
         .upsert_folder(1, "INBOX", 0, false, "inbox")
@@ -1086,4 +1086,98 @@ fn an_unknown_sync_stage_is_rejected_not_guessed() {
 
     // An unrecognised stage must not be silently treated as a fetch to retry.
     assert!(cache.claim_due_sync_failure(1, 100, 160).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Schema migrations
+// ---------------------------------------------------------------------------
+
+/// A cache whose database exists but has had no migrations applied — what
+/// `Cache::open` produces for a brand-new install. The old unconditional
+/// `user_version = 1` stamp is gone, so a fresh database really is version 0.
+fn unmigrated() -> (Cache, PathBuf) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "pelliper-migration-test-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let cache = Cache::open(&dir).expect("open");
+    (cache, dir)
+}
+
+fn schema_version(cache: &Cache) -> i64 {
+    cache
+        .conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version")
+}
+
+#[test]
+fn a_version_zero_database_migrates_to_latest() {
+    let (cache, _dir) = unmigrated();
+    assert_eq!(
+        schema_version(&cache),
+        0,
+        "fresh database starts at version 0"
+    );
+
+    cache.migrate().expect("migrate");
+
+    assert_eq!(schema_version(&cache), crate::migrations::latest_version());
+    // The baseline must be really created, not merely stamped.
+    let found: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='message_headers'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query");
+    assert_eq!(
+        found, 1,
+        "message_headers must be created by the baseline migration"
+    );
+}
+
+#[test]
+fn rerunning_migrations_on_a_current_database_changes_nothing() {
+    let (cache, _dir) = scratch(); // already migrated by scratch()
+    let before = schema_version(&cache);
+    assert_eq!(before, crate::migrations::latest_version());
+
+    cache.migrate().expect("re-run");
+
+    assert_eq!(schema_version(&cache), before, "idempotent across startups");
+}
+
+#[test]
+fn a_database_newer_than_this_build_is_rejected_before_any_work() {
+    let (cache, _dir) = unmigrated();
+    let newer = crate::migrations::latest_version() + 1;
+    cache
+        .conn
+        .pragma_update(None, "user_version", newer)
+        .expect("stamp newer version");
+
+    let err = cache
+        .migrate()
+        .expect_err("a newer schema must be rejected");
+    assert!(
+        err.to_string().contains("newer than this build"),
+        "got: {err}"
+    );
+
+    // Rejected before any migration ran: the stamp is untouched and no tables
+    // were created.
+    assert_eq!(schema_version(&cache), newer);
+    let found: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='accounts'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query");
+    assert_eq!(found, 0, "nothing must be created for a rejected database");
 }
