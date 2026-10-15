@@ -272,8 +272,8 @@ fn fts_hits(cache: &Cache, term: &str) -> i64 {
 
 #[test]
 fn headers_are_searchable_even_though_they_no_longer_live_in_messages() {
-    // The indexed columns moved to `message_headers`, so the FTS triggers had
-    // to move with them.
+    // The indexed columns live in `message_headers`, so reindexing had to move
+    // there too (there are no triggers now — the writers index explicitly).
     let (cache, _dir) = scratch();
     add_account(&cache);
     add_message(&cache, 7);
@@ -314,12 +314,12 @@ fn saving_a_body_indexes_it_instead_of_rolling_the_insert_back() {
         .conn
         .query_row("SELECT COUNT(*) FROM bodies", [], |r| r.get(0))
         .expect("count");
-    assert_eq!(stored, 1, "the body row must survive the FTS trigger");
+    assert_eq!(stored, 1, "the body row must survive indexing");
 
     assert_eq!(
         fts_hits(&cache, "snow"),
         1,
-        "body text must be searchable — the whole point of the trigger"
+        "body text must be searchable — the whole point of indexing"
     );
     assert_eq!(
         fts_hits(&cache, "hi"),
@@ -372,10 +372,11 @@ fn deleting_a_message_removes_its_index_entry() {
 
 #[test]
 fn flag_updates_do_not_wipe_the_search_index() {
-    // There is deliberately no trigger on `messages` UPDATE. Flag changes fire
-    // it constantly, and reindexing on every read toggle is waste — but if one
-    // were added naively it would DELETE the whole FTS row and reinsert only
-    // the (empty) preview, destroying the subject/sender index.
+    // Flag changes do not reindex: `update_message_flags` touches `messages`
+    // only, and the index is rebuilt solely from `message_headers`/`bodies`
+    // writes. A naive reindex here would rebuild the row from the (empty)
+    // preview and destroy the subject/sender index, so this guards the
+    // invariant that toggling a flag leaves search untouched.
     let (cache, _dir) = scratch();
     add_account(&cache);
     add_message(&cache, 7);
@@ -616,6 +617,96 @@ fn clearing_a_folder_after_a_uidvalidity_change_drops_only_that_folder() {
     // Other folders keep their mail.
     assert_eq!(cache.count_messages(1, "Archive").expect("count"), 1);
     assert_eq!(fts_hits(&cache, "archived"), 1);
+}
+
+#[test]
+fn moving_a_message_rekeys_its_index_row_to_the_destination() {
+    // The index row is keyed on `messages.rowid`, which changes on a move, so a
+    // count alone is not enough: the surviving hit must join back to the
+    // destination row (and not merely be a stale row under the old rowid).
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    add_message(&cache, 7);
+    cache
+        .save_message_headers(1, "INBOX", 7, &sample_headers())
+        .expect("headers");
+
+    cache.move_message(1, "INBOX", 7, "Archive").expect("move");
+
+    let joined: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
+             WHERE m.account_id = 1 AND m.folder_path = 'Archive' AND m.uid = 7
+               AND messages_fts MATCH 'hi'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("join");
+    assert_eq!(joined, 1, "the hit must resolve to the destination row");
+    assert_eq!(
+        fts_hits(&cache, "hi"),
+        1,
+        "the source hit must not linger alongside it"
+    );
+}
+
+#[test]
+fn fts_init_rebuilds_a_legacy_triggered_index() {
+    // An upgraded database still holds the old contentful table and its
+    // triggers. `fts_init` must drop the triggers, convert the table to the
+    // contentless shape, and reindex the existing mail.
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    add_message(&cache, 7);
+    cache
+        .save_message_headers(1, "INBOX", 7, &sample_headers())
+        .expect("headers");
+    cache
+        .save_body(1, "INBOX", 7, "<p>legacy wording</p>")
+        .expect("body");
+
+    // Recreate the pre-#7 shape: contentful, with a whole-row trigger.
+    cache
+        .conn
+        .execute_batch(
+            "DROP TABLE messages_fts;
+             CREATE VIRTUAL TABLE messages_fts USING fts5(
+                 subject, sender, preview, message_id, body,
+                 account_id UNINDEXED, folder_path UNINDEXED, uid UNINDEXED);
+             CREATE TRIGGER message_headers_fts_ai AFTER INSERT ON message_headers BEGIN
+                 DELETE FROM messages_fts WHERE rowid = new.rowid;
+             END;",
+        )
+        .expect("legacy shape");
+
+    cache.fts_init().expect("rebuild");
+
+    let triggers: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE '%fts%'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count triggers");
+    assert_eq!(triggers, 0, "legacy triggers must be dropped");
+
+    let sql: String = cache
+        .conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("table sql");
+    assert!(
+        sql.replace(' ', "").contains("content=''"),
+        "the rebuilt table must be contentless"
+    );
+
+    assert_eq!(fts_hits(&cache, "hi"), 1, "headers must be reindexed");
+    assert_eq!(fts_hits(&cache, "legacy"), 1, "body must be reindexed");
 }
 
 #[test]

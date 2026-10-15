@@ -2,12 +2,54 @@ use crate::types::{
     Account, ActionKind, AttachmentRecord, Folder, Message, MessageHeaders, OutboxItem,
     PendingAction,
 };
-use rusqlite::{Connection, Result};
+use rusqlite::{Connection, OptionalExtension, Result};
 use std::path::PathBuf;
 
 pub struct Cache {
     conn: Connection,
 }
+
+/// Build the search-index row for one message. `LEFT JOIN bodies` so a message
+/// whose body has not been fetched yet is still searchable by its headers. The
+/// rowid is `messages.rowid`, which is what a search hit joins back on.
+const INDEX_FTS_SQL: &str = "\
+INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body)
+SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html
+FROM messages m
+JOIN message_headers h
+  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+LEFT JOIN bodies b
+  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
+WHERE m.account_id = ?1 AND m.folder_path = ?2 AND m.uid = ?3";
+
+/// Rebuild every index row: [`INDEX_FTS_SQL`] without the per-message filter.
+/// Messages with no header row are skipped (nothing to index).
+const BACKFILL_FTS_SQL: &str = "\
+INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body)
+SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html
+FROM messages m
+JOIN message_headers h
+  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+LEFT JOIN bodies b
+  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid";
+
+/// Delete the index row(s) for one message. Resolves the rowid through the live
+/// `messages` row, so it must run before that row is deleted.
+const DEINDEX_MESSAGE_SQL: &str = "\
+DELETE FROM messages_fts WHERE rowid IN
+    (SELECT rowid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3)";
+
+/// Delete the index rows for a whole folder; see [`DEINDEX_MESSAGE_SQL`] on
+/// ordering.
+const DEINDEX_FOLDER_SQL: &str = "\
+DELETE FROM messages_fts WHERE rowid IN
+    (SELECT rowid FROM messages WHERE account_id = ?1 AND folder_path = ?2)";
+
+/// Delete the index rows for a whole account; see [`DEINDEX_MESSAGE_SQL`] on
+/// ordering.
+const DEINDEX_ACCOUNT_SQL: &str = "\
+DELETE FROM messages_fts WHERE rowid IN
+    (SELECT rowid FROM messages WHERE account_id = ?1)";
 
 impl Cache {
     pub fn open(data_dir: &PathBuf) -> Result<Self> {
@@ -103,8 +145,9 @@ impl Cache {
             -- purely to fill it. Threading reads it.
             --
             -- FK to `messages` is what forces write order: a header row cannot
-            -- be inserted before its message, which is also why the FTS
-            -- triggers fire from this table rather than from `messages`.
+            -- be inserted before its message, which is also why the search index
+            -- is rebuilt explicitly after a header write rather than from a
+            -- trigger (see `Cache::index_message`).
             CREATE TABLE IF NOT EXISTS message_headers (
                 account_id INTEGER NOT NULL,
                 folder_path TEXT NOT NULL,
@@ -226,138 +269,121 @@ impl Cache {
         Ok(())
     }
 
-    /// Create the full-text search index (FTS5) and keep it in sync with the
-    /// messages/bodies tables via triggers. Backfills existing rows on first run.
+    /// Create the full-text search index (FTS5).
+    ///
+    /// The index is **contentless** (`content=''`): the text is tokenized but
+    /// not stored a second time, and there are **no triggers**. Instead the
+    /// writers that change searchable content call [`Cache::index_message`] /
+    /// [`Cache::deindex_message`] explicitly. That is deliberate: the old
+    /// whole-row-rebuild triggers were fragile — a partial-column INSERT
+    /// against an existing FTS5 rowid fails and rolls back the *enclosing*
+    /// statement, which once silently discarded every cached body (see
+    /// `saving_a_body_indexes_it_instead_of_rolling_the_insert_back`).
+    ///
+    /// A contentless table cannot be updated in place, so `index_message`
+    /// deletes then re-inserts; `contentless_delete=1` (SQLite 3.43+) is what
+    /// makes that DELETE legal. Rows are keyed on `messages.rowid`, so a search
+    /// hit joins straight back to the message.
+    ///
+    /// Databases written before this change still hold the contentful table and
+    /// its triggers. `fts_init` drops the triggers and, when it finds the old
+    /// shape, rebuilds the table and reindexes from `messages`.
     pub fn fts_init(&self) -> Result<()> {
+        // The triggers are the thing being removed; drop them unconditionally
+        // so an upgraded database cannot keep firing them.
         self.conn.execute_batch(
-            "
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-                subject, sender, preview, message_id, body,
-                account_id UNINDEXED, folder_path UNINDEXED, uid UNINDEXED
-            );
-
-            -- Search index maintenance.
-            --
-            -- Rows are keyed on `messages.rowid` and maintained from
-            -- `message_headers`, which is where the indexed columns now live.
-            -- Every trigger rebuilds the WHOLE row rather than issuing a
-            -- partial column insert: FTS5 rejects a partial INSERT against an
-            -- existing rowid ('constraint failed'), and that error rolls back
-            -- the enclosing statement — which is why the old bodies_fts_ai,
-            -- doing `INSERT INTO messages_fts(body, rowid)`, silently
-            -- discarded every cached body.
-            --
-            -- There is deliberately NO trigger on `messages` UPDATE. Flag
-            -- changes fire it constantly, and reindexing on every read toggle
-            -- is pure waste; `preview` is not reindexed either (it is always
-            -- empty — see SUMMARY_FETCH_QUERY).
-
-            CREATE TRIGGER IF NOT EXISTS message_headers_fts_ai AFTER INSERT ON message_headers BEGIN
-                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
-                    WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid);
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
-                                         account_id, folder_path, uid)
-                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
-                       m.account_id, m.folder_path, m.uid
-                FROM messages m
-                JOIN message_headers h
-                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
-                LEFT JOIN bodies b
-                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
-                WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS message_headers_fts_au AFTER UPDATE ON message_headers BEGIN
-                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
-                    WHERE m.account_id = old.account_id AND m.folder_path = old.folder_path AND m.uid = old.uid);
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
-                                         account_id, folder_path, uid)
-                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
-                       m.account_id, m.folder_path, m.uid
-                FROM messages m
-                JOIN message_headers h
-                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
-                LEFT JOIN bodies b
-                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
-                WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS message_headers_fts_ad AFTER DELETE ON message_headers BEGIN
-                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
-                    WHERE m.account_id = old.account_id AND m.folder_path = old.folder_path AND m.uid = old.uid);
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS bodies_fts_ai AFTER INSERT ON bodies BEGIN
-                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
-                    WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid);
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
-                                         account_id, folder_path, uid)
-                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
-                       m.account_id, m.folder_path, m.uid
-                FROM messages m
-                JOIN message_headers h
-                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
-                JOIN bodies b
-                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
-                WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS bodies_fts_au AFTER UPDATE ON bodies BEGIN
-                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
-                    WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid);
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
-                                         account_id, folder_path, uid)
-                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
-                       m.account_id, m.folder_path, m.uid
-                FROM messages m
-                JOIN message_headers h
-                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
-                JOIN bodies b
-                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
-                WHERE m.account_id = new.account_id AND m.folder_path = new.folder_path AND m.uid = new.uid;
-            END;
-
-            CREATE TRIGGER IF NOT EXISTS bodies_fts_ad AFTER DELETE ON bodies BEGIN
-                DELETE FROM messages_fts WHERE rowid = (SELECT m.rowid FROM messages m
-                    WHERE m.account_id = old.account_id AND m.folder_path = old.folder_path AND m.uid = old.uid);
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
-                                         account_id, folder_path, uid)
-                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, NULL,
-                       m.account_id, m.folder_path, m.uid
-                FROM messages m
-                JOIN message_headers h
-                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
-                WHERE m.account_id = old.account_id AND m.folder_path = old.folder_path AND m.uid = old.uid;
-            END;
-
-            -- Deleting a message cascades to its header row, whose trigger
-            -- already removed the FTS row; this covers a message that has no
-            -- header row at all.
-            CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
-                DELETE FROM messages_fts WHERE rowid = old.rowid;
-            END;
-            ",
+            "DROP TRIGGER IF EXISTS message_headers_fts_ai;
+             DROP TRIGGER IF EXISTS message_headers_fts_au;
+             DROP TRIGGER IF EXISTS message_headers_fts_ad;
+             DROP TRIGGER IF EXISTS bodies_fts_ai;
+             DROP TRIGGER IF EXISTS bodies_fts_au;
+             DROP TRIGGER IF EXISTS bodies_fts_ad;
+             DROP TRIGGER IF EXISTS messages_fts_ad;",
         )?;
 
+        if !self.fts_is_current()? {
+            // Old contentful table (or none): drop and recreate. The index is
+            // rebuilt from `messages` by the backfill below, so nothing is lost.
+            self.conn
+                .execute_batch("DROP TABLE IF EXISTS messages_fts;")?;
+        }
+        self.conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                 subject, sender, preview, message_id, body,
+                 content='', contentless_delete=1
+             );",
+        )?;
+
+        self.backfill_fts()
+    }
+
+    /// Whether `messages_fts` already exists in the current (contentless)
+    /// shape. A table written by an older build stores its content and must be
+    /// rebuilt.
+    fn fts_is_current(&self) -> Result<bool> {
+        let sql: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(sql
+            .map(|s| s.replace(' ', "").contains("content=''"))
+            .unwrap_or(false))
+    }
+
+    /// Rebuild the whole index from `messages` + `message_headers` + `bodies`,
+    /// but only when it is empty — so an existing cache is indexed on the first
+    /// run (or after a shape rebuild) without doing work every startup.
+    fn backfill_fts(&self) -> Result<()> {
         let count: i64 = self
             .conn
             .query_row("SELECT count(*) FROM messages_fts", [], |r| r.get(0))?;
         if count == 0 {
-            self.conn.execute_batch(
-                "
-                INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body,
-                                         account_id, folder_path, uid)
-                SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html,
-                       m.account_id, m.folder_path, m.uid
-                FROM messages m
-                JOIN message_headers h
-                  ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
-                LEFT JOIN bodies b
-                  ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid;
-                ",
-            )?;
+            self.conn.execute_batch(BACKFILL_FTS_SQL)?;
         }
+        Ok(())
+    }
 
+    /// (Re)build one message's search-index row. Contentless FTS5 cannot update
+    /// in place, so the row is deleted first (a no-op if it was never indexed).
+    /// A message with no header row is left out — there is nothing to index.
+    fn index_message(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<()> {
+        self.deindex_message(account_id, folder_path, uid)?;
+        self.conn.execute(
+            INDEX_FTS_SQL,
+            rusqlite::params![account_id, folder_path, uid],
+        )?;
+        Ok(())
+    }
+
+    /// Drop one message's search-index row. The rowid is resolved through the
+    /// live `messages` row, so this must run before the message is deleted.
+    fn deindex_message(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<()> {
+        self.conn.execute(
+            DEINDEX_MESSAGE_SQL,
+            rusqlite::params![account_id, folder_path, uid],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the index rows for every message in a folder. Must run before the
+    /// folder's `messages` rows are deleted.
+    fn deindex_folder(&self, account_id: i64, folder_path: &str) -> Result<()> {
+        self.conn.execute(
+            DEINDEX_FOLDER_SQL,
+            rusqlite::params![account_id, folder_path],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the index rows for every message in an account. Must run before the
+    /// account's `messages` rows are deleted.
+    fn deindex_account(&self, account_id: i64) -> Result<()> {
+        self.conn
+            .execute(DEINDEX_ACCOUNT_SQL, rusqlite::params![account_id])?;
         Ok(())
     }
 
@@ -430,7 +456,9 @@ impl Cache {
 
     /// Delete an account and all its folders, messages, bodies, and attachments.
     pub fn remove_account(&self, account_id: i64) -> Result<()> {
-        // Foreign keys with ON DELETE CASCADE handle messages/bodies/folders
+        // Foreign keys with ON DELETE CASCADE handle messages/bodies/folders.
+        // The search index has no FK, so clear it before the messages go.
+        self.deindex_account(account_id)?;
         self.conn.execute(
             "DELETE FROM attachments WHERE account_id = ?1",
             rusqlite::params![account_id],
@@ -528,6 +556,8 @@ impl Cache {
     /// Move a message (and its cached headers and body) from one folder to
     /// another.  All three tables are keyed by the same composite key, so each
     /// is copied before the source row is deleted (which cascades the rest).
+    /// The search-index row is re-keyed from the source rowid to the
+    /// destination's while both rows exist.
     pub fn move_message(
         &self,
         account_id: i64,
@@ -560,6 +590,10 @@ impl Cache {
              WHERE account_id = ?1 AND folder_path = ?3 AND uid = ?4",
             rusqlite::params![account_id, to_folder, from_folder, uid],
         )?;
+        // Reindex under the destination before the source row disappears; the
+        // source's index row is keyed on its old `messages.rowid`.
+        self.index_message(account_id, to_folder, uid)?;
+        self.deindex_message(account_id, from_folder, uid)?;
         self.conn.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
             rusqlite::params![account_id, from_folder, uid],
@@ -567,8 +601,10 @@ impl Cache {
         Ok(())
     }
 
-    /// Remove a message row (and its cascade-deleted body).
+    /// Remove a message row (and its cascade-deleted body), and its search-index
+    /// row.
     pub fn delete_message(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<()> {
+        self.deindex_message(account_id, folder_path, uid)?;
         self.conn.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
             rusqlite::params![account_id, folder_path, uid],
@@ -617,11 +653,12 @@ impl Cache {
     /// Drop every cached message in a folder, used when the server reassigns
     /// UIDs (a UIDVALIDITY change) and `(folder, uid)` can no longer be
     /// trusted. Message headers and bodies cascade; attachment rows are keyed
-    /// without a foreign key, so they are removed explicitly. FTS rows go
-    /// through the `message_headers` delete triggers. The sync cursors are
-    /// reset too — they are meaningless once the UID space is invalidated.
+    /// without a foreign key, so they are removed explicitly. Search-index rows
+    /// are removed first (there are no triggers). The sync cursors are reset
+    /// too — they are meaningless once the UID space is invalidated.
     /// Returns the number of messages removed.
     pub fn clear_folder_messages(&self, account_id: i64, folder_path: &str) -> Result<usize> {
+        self.deindex_folder(account_id, folder_path)?;
         let removed = self.conn.execute(
             "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2",
             rusqlite::params![account_id, folder_path],
@@ -702,6 +739,12 @@ impl Cache {
         let mut removed = 0;
         let tx = self.conn.transaction()?;
         for uid in uids {
+            // Deindex before the message row goes, so the rowid subquery
+            // resolves; the transaction keeps the two in step.
+            tx.execute(
+                DEINDEX_MESSAGE_SQL,
+                rusqlite::params![account_id, folder_path, uid],
+            )?;
             removed += tx.execute(
                 "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
                 rusqlite::params![account_id, folder_path, uid],
@@ -894,8 +937,9 @@ impl Cache {
     /// itself first — a header row with no parent would fail the foreign key.
     /// Empty input is skipped rather than stored as an empty shell.
     ///
-    /// This write is also what indexes the message for search: the FTS triggers
-    /// fire from this table, because it owns the indexed header columns.
+    /// This write also (re)builds the message's search-index row, because
+    /// `message_headers` owns the indexed header columns (there are no FTS
+    /// triggers now — the index is maintained explicitly).
     pub fn save_message_headers(
         &self,
         account_id: i64,
@@ -936,6 +980,7 @@ impl Cache {
                 headers.message_id,
             ],
         )?;
+        self.index_message(account_id, folder_path, uid)?;
         Ok(())
     }
 
@@ -952,6 +997,10 @@ impl Cache {
              ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET html = ?4",
             rusqlite::params![account_id, folder_path, uid, html],
         )?;
+        // The body is the last indexed column; reindex so the new text is
+        // searchable without dropping the header columns (contentless FTS5
+        // cannot update in place, so `index_message` rebuilds the whole row).
+        self.index_message(account_id, folder_path, uid)?;
         Ok(())
     }
 

@@ -19,7 +19,7 @@ not raw feature parity. Each is independently shippable.
 | 4 | ~~No durable action ledger (non-send)~~ ✅ done | Offline/failed flags, moves, deletes silently diverge | L | M |
 | 5 | ~~Cache mutated even when IMAP op fails~~ ✅ done | Local state claims success that server rejected | S | L |
 | 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
-| 7 | Trigger-driven FTS fragility | A failed trigger silently drops body indexing | M | M |
+| 7 | ~~Trigger-driven FTS fragility~~ ✅ done | A failed trigger silently drops body indexing | M | M |
 | 8 | No migration runner | Schema changes are silent no-ops on existing DBs | S | L |
 | 9 | Threading owned implicitly by UI | No threads table; contract undocumented | L | L |
 | 10 | `sync_failures` ledger absent | Failed header/body fetches are lost for the session | S | L |
@@ -267,27 +267,60 @@ interleaving request checks) remains unchanged.
 
 ---
 
-## 7. Contentless, manually maintained FTS (optional hardening)
+## 7. Contentless, manually maintained FTS
 
-**Current.** `messages_fts` is kept in sync by triggers that rebuild the whole
-row on every header/body insert (`src/cache.rs::fts_init`). The comments record
-that a partial-column insert used to silently roll back every cached body; the
-design remains fragile to future trigger edits.
+**Status: implemented.** `messages_fts` is now contentless (`content=''`,
+`contentless_delete=1`) with **no triggers**, and is maintained explicitly by
+`Cache::index_message` / `Cache::deindex_message`.
+
+- **Schema** (`src/cache.rs::fts_init`): the table is created contentless with
+  the `contentless_delete=1` option (SQLite 3.43+; the bundled build is 3.45),
+  which is what makes `DELETE`/`UPDATE` legal on a contentless table. Rows are
+  keyed on `messages.rowid`, so a search hit joins straight back to the message.
+- **Indexing**: `index_message` deletes then re-inserts (contentless tables
+  cannot update in place), pulling `subject`/`sender` from `message_headers`,
+  `preview` from `messages`, and `body` from `bodies` via a `LEFT JOIN` so a
+  message with no body yet is still searchable by its headers. It runs from
+  `save_message_headers` and `save_body`.
+- **Deindexing**: `delete_message`, `delete_messages`, `clear_folder_messages`,
+  `move_message` and `remove_account` all remove the index row(s) before the
+  `messages` row goes (the rowid is resolved through `messages`, so order
+  matters). `move_message` re-keys the row from the source rowid to the
+  destination's.
+- **Upgrade path**: `fts_init` drops the seven legacy triggers unconditionally
+  and, when it finds the old contentful shape (`PRAGMA`-free probe via
+  `sqlite_master.sql`), drops the table and reindexes from `messages`. It only
+  backfills when the index is empty, so a correct database pays nothing on
+  startup.
+
+**Behaviour note for search consumers.** The daemon itself never queries
+`messages_fts` (there is no search D-Bus method), so a client that reads the DB
+must join on `messages_fts.rowid = messages.rowid`; the old `UNINDEXED`
+`account_id`/`folder_path`/`uid` columns are gone because a contentless table
+does not store column values.
+
+**Original analysis.** `messages_fts` was kept in sync by triggers that rebuilt
+the whole row on every header/body insert (`src/cache.rs::fts_init`). The
+comments record that a partial-column insert used to silently roll back every
+cached body; the design remained fragile to future trigger edits.
 
 **Flectar reference.** `messages_fts` is contentless (`content=''`,
 `contentless_delete=1`) with **no triggers**; `repo::search::index_message`
 explicitly deletes + reinserts, and `repo::messages::delete` removes the index
 row. Callers index at known points (store_headers, body save, move, delete).
 
-**Proposed change.** Only if FTS keeps causing trouble: drop the triggers, make
-`messages_fts` contentless, and call an explicit `index_message` from
-`save_message_headers`, `save_body`, `move_message`, and `delete_message`.
-This is a larger change with its own ordering rules, so treat as a follow-up.
+**Tests.** The pre-existing FTS cases all still pass and now exercise the
+explicit path: headers/body indexed on write, body re-save reindexes instead of
+duplicating, flag flips leave the index untouched, delete removes the entry, and
+a move reindexes at the destination. Two were added:
+`moving_a_message_rekeys_its_index_row_to_the_destination` (the surviving hit
+joins back to the destination row, and the source hit does not linger) and
+`fts_init_rebuilds_a_legacy_triggered_index` (drops triggers, converts to
+contentless, reindexes existing mail).
 
-**Files.** `src/cache.rs` (`fts_init` → schema + index fn), all FTS writers.
+**Files.** `src/cache.rs` (`fts_init` + `index_message`/`deindex_*` + SQL
+consts), `src/cache.test.rs`.
 
-**Test.** Existing `src/cache.test.rs` FTS cases should keep passing; add one for
-move and one for delete.
 
 ---
 
@@ -374,7 +407,10 @@ expose counts via D-Bus.
    (durable actions)** ✅ done. Together they make flags/moves/deletes
    server-authoritative: cache writes only happen on success, and failures are
    queued and retried instead of lost.
-5. **10 (failure ledger)**, then **7 (FTS)** and **9 (threading)** as follow-ups.
+5. **10 (failure ledger)**, then **9 (threading)** as a follow-up.
+   **7 (FTS)** ✅ done — the trigger-driven index was replaced by explicit,
+   testable indexing; it was moved ahead of #10 because it touched every writer
+   and was worth landing while that code was fresh.
 
 ## Deliberately not proposed
 
