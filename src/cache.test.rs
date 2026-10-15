@@ -455,6 +455,43 @@ fn a_message_without_headers_is_still_listed() {
 }
 
 #[test]
+fn load_messages_ships_the_threading_fields_the_ui_threads_on() {
+    // Gap #9: threading belongs to the UI, so the daemon's whole obligation is
+    // to pass the three JWZ inputs through intact. If one drops out of this
+    // payload the other repo cannot thread at all and would fail silently, so
+    // pin the contract here.
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    add_message(&cache, 7);
+
+    let mut h = sample_headers();
+    h.in_reply_to = "<root@example.com>".to_string();
+    h.references = "<root@example.com> <mid@example.com>".to_string();
+    cache
+        .save_message_headers(1, "INBOX", 7, &h)
+        .expect("headers");
+
+    let rows = cache.load_messages(1, "INBOX", 0, 10).expect("load");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].message_id.as_deref(), Some("<m1@example.com>"));
+    assert_eq!(rows[0].in_reply_to.as_deref(), Some("<root@example.com>"));
+    assert_eq!(
+        rows[0].references.as_deref(),
+        Some("<root@example.com> <mid@example.com>")
+    );
+
+    // The wire format is the real contract: a renamed field reaches the UI as
+    // null rather than as an error, so assert on key presence directly.
+    let wire = serde_json::to_string(&rows).expect("serialize");
+    for key in ["in_reply_to", "message_id", "references"] {
+        assert!(
+            wire.contains(&format!("\"{key}\"")),
+            "payload lost the `{key}` threading field: {wire}"
+        );
+    }
+}
+
+#[test]
 fn move_message_carries_the_headers_across() {
     let (cache, _dir) = scratch();
     add_account(&cache);

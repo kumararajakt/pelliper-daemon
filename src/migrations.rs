@@ -105,6 +105,15 @@ const M001_INIT: &str = "
     -- `HEADER.FIELDS (REFERENCES IN-REPLY-TO)` alongside the envelope purely to
     -- fill it. Threading reads it.
     --
+    -- **Threading is UI-owned** (gap #9). This table stores `message_id`,
+    -- `in_reply_to`, and `references_` exactly as the server sent them and
+    -- nothing more: no `threads` table, no union-find, no subject fallback, and
+    -- no recompute on flag/move/delete. The UI runs JWZ threading over those
+    -- three fields, which `Cache::load_messages` already returns to it (see
+    -- `types::Message`). `Cache::message_refs` is the only other reader and
+    -- exists to build one reply's header chain. Adding thread tables would be a
+    -- one-way contract change — only do it if a second client needs the cache.
+    --
     -- FK to `messages` is what forces write order: a header row cannot be
     -- inserted before its message, which is also why the search index is rebuilt
     -- explicitly after a header write rather than from a trigger (see

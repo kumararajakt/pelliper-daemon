@@ -27,14 +27,25 @@ pub struct Folder {
     pub kind: String,
 }
 
+/// One message as the UI sees it, straight off `get_messages`.
+///
+/// Threading is **UI-owned** (gap #9): `in_reply_to`, `message_id`, and
+/// `references` are passed through verbatim and the daemon never resolves them
+/// into threads — there is no `threads` table and no union-find here. The UI
+/// runs JWZ threading over these three fields. Dropping them would strand the
+/// other repo, so they are part of the D-Bus contract, not internal state.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Message {
     pub uid: i64,
     pub subject: Option<String>,
     pub sender: Option<String>,
     pub date: i64,
+    /// `In-Reply-To` of this message: the parent's `Message-ID`, or none.
     pub in_reply_to: Option<String>,
+    /// This message's own `Message-ID`, the key thread grouping runs on.
     pub message_id: Option<String>,
+    /// The `References` chain, root-first: ancestors for this message. The UI
+    /// uses it to attach orphaned messages under their real parent.
     pub references: Option<String>,
     pub has_attachments: bool,
     pub is_read: bool,

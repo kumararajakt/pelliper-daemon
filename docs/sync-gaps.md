@@ -21,7 +21,7 @@ not raw feature parity. Each is independently shippable.
 | 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
 | 7 | ~~Trigger-driven FTS fragility~~ ✅ done | A failed trigger silently drops body indexing | M | M |
 | 8 | ~~No migration runner~~ ✅ done | Schema changes are silent no-ops on existing DBs | S | L |
-| 9 | Threading owned implicitly by UI | No threads table; contract undocumented | L | L |
+| 9 | ~~Threading owned implicitly by UI~~ ✅ done | No threads table; contract undocumented | L | L |
 | 10 | ~~`sync_failures` ledger absent~~ ✅ done | Failed header/body fetches are lost for the session | S | L |
 
 Effort: S = hours, M = a day or two, L = multi-day. Risk = chance of
@@ -374,26 +374,39 @@ migration in its own transaction, and rejects a profile written by a newer app.
 
 ## 9. Decide and document threading ownership
 
-**Current.** `message_headers` stores `in_reply_to`/`references_` and
-a `message_refs` helper, but there is no thread table and no thread
-resolution in the daemon. Comments imply a separate UI repo does the JWZ
-union-find. The contract is undocumented in-repo.
+**Status: decided — the UI owns threading.** No schema change; the whole gap
+was "the contract is undocumented in-repo", so it is now written down where the
+next reader will hit it:
+
+- **The payload is the contract** (`src/types.rs`): `types::Message` — what
+  `get_messages` serializes to the other repo — carries `in_reply_to`,
+  `message_id`, and `references`, each documented as a UI threading input. The
+  UI runs JWZ over those three fields; the daemon just passes them through
+  verbatim. Verified: `Cache::load_messages` selects all three and
+  `dbus::get_messages` serializes them, so nothing was missing — only the
+  wording was.
+- **The schema says so too** (`src/migrations.rs`): the `message_headers`
+  comment states there is no `threads` table, no union-find, no subject
+  fallback, and no aggregate recompute on flag/move/delete, and that adding one
+  would be a one-way contract change worth taking only if a second client needs
+  the cache.
+- **`Cache::message_refs` is scoped** (`src/cache.rs`): documented as reply
+  construction rather than thread resolution, pointing callers that want a whole
+  conversation at `load_messages` instead.
+
+**Chosen over the daemon-owned option** (`threads` + `message_refs` tables, a
+`resolve_thread` JWZ-lite pass after `save_message_headers`, aggregates
+recomputed on flag/move/delete) because the cache has exactly one consumer
+today, and the daemon would then have to re-run that work on every mutation
+just to maintain counts the UI can derive cheaply from the payload it already
+gets.
 
 **Flectar reference.** `sync/threading.rs::resolve_thread` does JWZ-lite
 (references match, then a 14-day subject fallback), with a `threads` table whose
-denormalized counts are recomputed on every change.
+denormalized counts are recomputed on every change. That is the shape to follow
+if the daemon-owned option is ever taken.
 
-**Options.**
-- **Keep UI-owned (cheapest):** add an explicit note to `AGENTS.md` and a
-  doc-comment on `message_headers`, and make sure the D-Bus `get_messages`
-  payload carries the fields the UI needs (`in_reply_to`, `references_`,
-  `message_id`) — it already does.
-- **Daemon-owned:** add `threads` + `message_refs` tables and call
-  `resolve_thread` after `save_message_headers`, recomputing aggregates on
-  flag/move/delete. This is the larger option and only worth it if a second
-  client will consume the cache.
-
-**Files.** `AGENTS.md` (contract) or `src/cache.rs` + a new `src/threading.rs`.
+**Files.** `src/types.rs`, `src/migrations.rs`, `src/cache.rs`, this document.
 
 ---
 
@@ -480,7 +493,9 @@ follow-up if the UI wants it.
    (durable actions)** ✅ done. Together they make flags/moves/deletes
    server-authoritative: cache writes only happen on success, and failures are
    queued and retried instead of lost.
-5. **10 (failure ledger)** ✅ done, then **9 (threading)** as a follow-up.
+5. **10 (failure ledger)** ✅ done, then **9 (threading)** ✅ done — the UI keeps
+   ownership; the contract is now written down in the payload, the schema
+   comment, and `message_refs`.
    **7 (FTS)** ✅ done — the trigger-driven index was replaced by explicit,
    testable indexing; it was moved ahead of #10 because it touched every writer
    and was worth landing while that code was fresh.

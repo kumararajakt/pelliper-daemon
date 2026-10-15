@@ -711,12 +711,17 @@ impl Cache {
         }
     }
 
-    /// Load the threading headers needed to reply: (message_id, references).
-    /// The threading headers of one message, for building a reply.
+    /// The threading headers of one message — `(message_id, references_)` — for
+    /// building a reply.
     ///
     /// Reads from `message_headers`, which is where they live. Returns `None`
     /// when the message has no header row at all, and `None` fields when the
     /// message predates header caching.
+    ///
+    /// This is reply construction, *not* thread resolution: the daemon never
+    /// groups messages into threads (gap #9, threading is UI-owned). Callers
+    /// wanting a whole conversation should read `Cache::load_messages` and let
+    /// the UI do the JWZ pass.
     pub fn message_refs(
         &self,
         account_id: i64,
