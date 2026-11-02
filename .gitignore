@@ -24,3 +24,5 @@ rustc-ice-*.txt
 #.idea/
 
 .env
+
+AGENTS.md

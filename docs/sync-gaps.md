@@ -15,7 +15,7 @@ not raw feature parity. Each is independently shippable.
 |---|-----|--------|--------|------|
 | 1 | ~~No UIDVALIDITY tracking~~ ✅ done | Data corruption/mis-association on server UID reset | S | M |
 | 2 | ~~No persisted sync cursor~~ ✅ done | Repeated full `UID SEARCH ALL` + newest-page refetch | M | M |
-| 3 | ~~No expunge/flag reconciliation~~ ✅ done | Stale rows; server-side changes never applied locally | M | M |
+| 3 | No expunge/flag reconciliation ⚠️ in progress | Stale rows; server-side changes never applied locally | M | M |
 | 4 | ~~No durable action ledger (non-send)~~ ✅ done | Offline/failed flags, moves, deletes silently diverge | L | M |
 | 5 | ~~Cache mutated even when IMAP op fails~~ ✅ done | Local state claims success that server rejected | S | L |
 | 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
@@ -23,6 +23,15 @@ not raw feature parity. Each is independently shippable.
 | 8 | ~~No migration runner~~ ✅ done | Schema changes are silent no-ops on existing DBs | S | L |
 | 9 | ~~Threading owned implicitly by UI~~ ✅ done | No threads table; contract undocumented | L | L |
 | 10 | ~~`sync_failures` ledger absent~~ ✅ done | Failed header/body fetches are lost for the session | S | L |
+| 11 | No D-Bus signals for real-time UI push | UI must poll daemon for new mail, status, and folder changes | S | L |
+| 12 | No D-Bus search method for FTS | `messages_fts` is maintained but unqueried via D-Bus | S | L |
+| 13 | Single connection drops INBOX push on folder switch | Viewing custom/sent folders stops real-time new mail alerts | M | M |
+| 14 | Folder operations unhedged by action ledger | Offline folder create/rename/delete drops on network glitch | S | L |
+| 15 | Corrupt MIME structure and missing filename on sent attachments | Attachments show as unnamed.dat or overwrite text body | S | L |
+| 16 | Outbox table drops attachment paths and reply headers on retry | Offline sends lose attachments and threading on retry | S | M |
+| 17 | Inline cid: images unmapped in body HTML | Embedded logos/screenshots appear broken in Qt MessageView | S | L |
+| 18 | No IMAP APPEND to Sent folder on SMTP send | Non-Gmail accounts have empty Sent folder in client | M | M |
+| 19 | Redundant dual LoadBody requests from UI | loadBody + listAttachments both trigger concurrent body fetches | S | L |
 
 Effort: S = hours, M = a day or two, L = multi-day. Risk = chance of
 regressing sync correctness if done carelessly.
@@ -123,28 +132,30 @@ without a server, mirroring Flectar's
 
 ## 3. Reconcile expunges and flags
 
-**Current.** Backfill only **adds** missing UIDs; a message deleted from another
-client stays in the local cache forever. Newest-page sync upserts flags only for
-the newest page, so flag changes on older mail are never picked up. Only
-user-initiated deletes call `cache.delete_message`.
+**Status: partially implemented.** The cache-level bulk deletion primitive
+(`Cache::delete_messages`) was added to `src/cache.rs` with FTS de-indexing, but
+the worker reconciliation pass is not yet wired up into `sync_folder_first_page`
+or `src/worker/backfill.rs` (generating a `dead_code` warning). As a result,
+messages expunged or moved on the server from other clients remain in the local
+cache as ghost messages. Additionally, flag reconciliation is limited to the
+newest 50 messages (`REOPEN_PAGE_SIZE`), so flag changes on older mail are not
+reconciled.
 
 **Flectar reference.** `run_cycle` reconciles flags (a bounded `FLAG_WINDOW`) and
 expunges each cycle; `reconcile_flags` skips rows with a pending intent, and
 `reconcile_expunges` skips in-flight moves.
 
 **Proposed change.**
-- After a full UID diff (item 2), delete cached UIDs for the folder that are no
-  longer present on the server. With a persisted cursor this becomes:
-  reconcile only the affected window rather than diffing all UIDs.
-- Refresh flags for the selected window (`UID FETCH <range> FLAGS`) and update
-  `messages.is_read`/`is_starred` in bulk.
-- Once item 4 (pending actions) exists, skip rows with an in-flight local intent.
+- In `Worker::sync_folder_first_page` and backfill, diff server UIDs against
+  cached UIDs in the examined window and call `Cache::delete_messages` on
+  missing UIDs (skipping UIDs with an in-flight pending action from gap #4).
+- Refresh flags across an active window (`UID FETCH <range> FLAGS`) and update
+  `messages.is_read`/`is_starred` in bulk without rewriting whole headers.
 
-**Files.** `src/worker.rs`, `src/worker/backfill.rs`, `src/cache.rs`
-(new bulk `cached_uids_in_range`/`delete_messages`/`update_message_flags`).
+**Files.** `src/worker.rs`, `src/worker/backfill.rs`, `src/cache.rs`.
 
-**Test.** Cache-level test: seed rows, delete some server-side, assert only the
-survivors remain and FTS no longer matches the removed ones.
+**Test.** Cache & worker tests: seed cached rows, simulate server expunges,
+assert survivors remain and FTS no longer matches purged entries.
 
 ---
 
@@ -479,6 +490,189 @@ follow-up if the UI wants it.
 
 ---
 
+## 11. Emit D-Bus signals for real-time UI updates
+
+**Status: proposed.** Currently, `src/dbus.rs` provides only request-reply RPC
+methods. When IMAP IDLE receives new mail, or the outbox flusher completes a
+delayed send, or a folder's unread count changes, the desktop UI has no way of
+knowing without polling.
+
+**Flectar reference.** An event bus broadcasts state transitions to frontends.
+
+**Proposed change.**
+- Define and emit `zbus` D-Bus signals on `app.pelliper.Daemon`:
+  - `NewMailReceived(account_id: i64, folder_path: String, count: i32)`
+  - `FolderUnreadChanged(account_id: i64, folder_path: String, unread_count: i32)`
+  - `MessageFlagsChanged(account_id: i64, folder_path: String, uid: i64, is_read: bool, is_starred: bool)`
+  - `OutboxItemSent(account_id: i64, item_id: i64)`
+- Emit signals directly from worker IDLE handlers, action completion, and the
+  outbox flusher.
+
+**Files.** `src/dbus.rs`, `src/worker.rs`, `src/worker/idle.rs`, `src/outbox.rs`.
+
+---
+
+## 12. Expose Full-Text Search over D-Bus
+
+**Status: proposed.** Gap #7 implemented a fast, triggerless contentless FTS5
+index (`messages_fts`) indexing subjects, senders, previews, and bodies. However,
+there is no D-Bus method to query it, requiring a client to read SQLite directly.
+
+**Proposed change.**
+- Add a D-Bus method `search_messages(account_id: i64, query: &str) -> String`
+  returning JSON-serialized `Vec<Message>` matching the FTS query, ranked by bm25.
+- Add `Cache::search_messages(account_id, query)`.
+
+**Files.** `src/cache.rs`, `src/dbus.rs`.
+
+---
+
+## 13. Dual-connection architecture for INBOX IDLE and background folder tracking
+
+**Status: proposed.** Currently, the worker maintains exactly one stateful IMAP
+connection per account. Because IMAP limits an `IDLE` session to the single
+currently selected folder, when the user opens or backfills another folder (e.g.
+`Archive`, `Sent`, or a custom label), the connection leaves `INBOX`. While
+servicing or watching another folder, push notifications for newly arriving
+`INBOX` mail are completely dormant and only caught by the 120s fallback poll.
+
+Opening an open connection per folder to IDLE across all folders is infeasible
+due to server connection caps (e.g., Gmail limits accounts to 15 connections;
+Yahoo, iCloud, and Dovecot often enforce 5–10 per IP).
+
+**Flectar reference.** A separate connection is dedicated to INBOX push vs
+background sync and worker tasks.
+
+**Proposed change.**
+- **Connection 1 (Dedicated Push)**: Stays permanently locked to `INBOX` via
+  `IDLE`. It never navigates away, guaranteeing zero-latency desktop notifications
+  for incoming mail regardless of user activity.
+- **Connection 2 (Worker)**: Handles active user views, lazy body downloads,
+  action ledger draining, and global history backfill.
+- **Background Folder Tracking (Lightweight STATUS polling)**: To detect mail
+  routed to non-inbox folders by server-side rules without opening a connection
+  per folder, Connection 2 periodically issues lightweight IMAP `STATUS` commands
+  (`STATUS "<folder>" (UNSEEN UIDNEXT)`) on background folders every few minutes.
+  If `UIDNEXT` has advanced beyond the local cursor, it fetches the new messages.
+- **Global Folder Backfill**: When backfill completes on the active folder,
+  Connection 2 advances through remaining account folders to ensure historical
+  headers are fully cached offline across all folders.
+
+**Files.** `src/worker.rs`, `src/worker/idle.rs`, `src/worker/backfill.rs`.
+
+---
+
+## 14. Durable action ledger for folder operations
+
+**Status: proposed.** Flags, moves, and deletes are protected by the durable
+`pending_actions` ledger (Gap #4). Folder create, rename, and delete are
+currently executed immediately without ledger backup, so network interruptions
+or crashes drop the user's intent.
+
+**Proposed change.**
+- Extend `ActionKind` with `CreateFolder`, `RenameFolder`, and `DeleteFolder`.
+- Route folder mutations through `enqueue_action` and the drain loop.
+
+**Files.** `src/types.rs`, `src/actions.rs`, `src/worker/actions.rs`, `src/worker/handlers.rs`.
+
+---
+
+## 15. Fix outgoing attachment MIME structure, filename headers, and recipient parsing
+
+**Status: proposed.** In `src/smtp.rs`, outgoing messages with attachments append
+attachment parts directly to `MultiPart::alternative()`. In RFC 2046 MIME,
+attachments must be enclosed in `MultiPart::mixed()` containing the `alternative`
+text/HTML part plus each attachment. Furthermore, the attachments currently omit
+`Content-Disposition: attachment; filename="..."`, causing recipient clients
+(such as Gmail and Outlook) to display them as `unnamed.dat` or hide them.
+
+Additionally, recipient splitting naively splits on `to.split([',', ';'])`, which
+breaks formatted display names containing commas (such as `"Doe, Jane" <jane@example.com>`).
+
+**Proposed change.**
+- In `src/smtp.rs`, wrap the `body_part` in `MultiPart::mixed()` when attachments
+  are present.
+- Set `ContentDisposition::attachment(&att.filename)` on each attachment part.
+- Use an RFC 5322-compliant address parser or split addresses only on commas
+  outside quotes.
+
+**Files.** `src/smtp.rs`.
+
+---
+
+## 16. Outbox attachment and reply-header preservation across retries
+
+**Status: proposed.** When an email fails to send via SMTP immediately (e.g.
+offline during compose), `dbus::send_email` calls
+`cache.enqueue_outbox(account_id, to, cc, "", "", subject, body)`. The `outbox`
+table stores neither attachment paths nor reply threading headers (`in_reply_to`,
+`references`). When `outbox_flusher` retries upon reconnect, it transmits the email
+with an empty attachment list (`&[]`) and `None` for reply threading, permanently
+stripping all user attachments and breaking the conversation thread chain.
+
+**Proposed change.**
+- Add `attachment_paths TEXT`, `in_reply_to TEXT`, and `references_ TEXT`
+  columns to the `outbox` table via a numbered schema migration (`src/migrations.rs`).
+- Update `cache.enqueue_outbox` and `load_pending_outbox` to store and load
+  attachments and reply headers.
+- Pass stored attachments and threading headers to `send_with_auth` in `src/outbox.rs`.
+
+**Files.** `src/migrations.rs`, `src/cache.rs`, `src/types.rs`, `src/outbox.rs`, `src/dbus.rs`.
+
+---
+
+## 17. Resolve inline `cid:` images to displayable URLs for Qt view
+
+**Status: proposed.** HTML emails often embed inline graphics (logos, avatars,
+diagrams) referencing MIME parts via Content-ID (`<img src="cid:...">`). In
+`src/imap.rs::parse_message_body`, these are parsed but the `cid:` references
+remain untouched in the HTML string. Qt's `MessageView.qml` cannot resolve
+`cid:` schemes, causing embedded graphics to render as broken image icons.
+
+**Proposed change.**
+- During `parse_message_body`, map each inline MIME part's `Content-ID` to its
+  downloaded local path or base64 data URI (`data:image/...;base64,...`).
+- Replace `src="cid:<id>"` in the sanitized HTML body before writing to the
+  `bodies` table.
+
+**Files.** `src/imap.rs`, `src/worker/prefetch.rs`.
+
+---
+
+## 18. IMAP `APPEND` to `Sent` folder on successful SMTP delivery
+
+**Status: proposed.** When an email is sent via SMTP, Gmail automatically stores
+a copy in `[Gmail]/Sent Mail`. However, standard IMAP/SMTP servers (Outlook,
+Fastmail, Dovecot, Yahoo, cPanel) do not automatically save sent SMTP messages.
+As a result, sent messages sent from Pelliper are absent from the `Sent` folder
+for non-Gmail accounts.
+
+**Proposed change.**
+- After `send_with_auth` completes successfully (in `send_email` and
+  `outbox_flusher`), issue an IMAP `APPEND` to the account's designated `Sent`
+  special-use folder with the raw MIME bytes and `\Seen` flag.
+
+**Files.** `src/imap.rs`, `src/worker.rs`, `src/outbox.rs`.
+
+---
+
+## 19. Deduplicate concurrent in-flight `LoadBody` requests
+
+**Status: proposed.** When the user selects an email in `MainWindow.qml`, the UI
+triggers `Pelliper.DaemonClient.loadBody(...)` and
+`Pelliper.DaemonClient.listAttachments(...)` in parallel. If the body is not yet
+cached, both D-Bus handlers enqueue a `WorkerRequest::LoadBody` for the exact
+same UID, causing redundant IMAP body fetches.
+
+**Proposed change.**
+- Track in-flight `LoadBody` requests in `dbus.rs` or coalesce them in the
+  worker so simultaneous calls for the same `(account, folder, uid)` share a
+  single IMAP fetch and broadcast the result to all awaiting callers.
+
+**Files.** `src/dbus.rs`, `src/worker.rs`.
+
+---
+
 ## Suggested order
 
 1. **8 (migrations)** ✅ done — everything else needs schema changes that apply
@@ -487,8 +681,8 @@ follow-up if the UI wants it.
    the runner absorbed that work as its `M001_INIT` baseline.
 2. **1 (UIDVALIDITY)** and **6 (IDLE probe)** — small and directly prevent
    wrong behavior.
-3. **2 (cursors)** then **3 (reconcile)** — the core sync-quality fix, best done
-   together.
+3. **2 (cursors)** then **3 (reconcile)** ⚠️ — core sync-quality; `delete_messages`
+   primitive is ready in cache, worker reconciliation loop needs to be wired up.
 4. **5 (don't write on failure)** ✅ done — the stopgap that landed before **4
    (durable actions)** ✅ done. Together they make flags/moves/deletes
    server-authoritative: cache writes only happen on success, and failures are
@@ -499,6 +693,16 @@ follow-up if the UI wants it.
    **7 (FTS)** ✅ done — the trigger-driven index was replaced by explicit,
    testable indexing; it was moved ahead of #10 because it touched every writer
    and was worth landing while that code was fresh.
+6. **15 (sent attachment MIME & filenames)** and **16 (outbox attachment retention)** —
+   critical outgoing mail bugfixes to ensure recipients receive valid, named attachments.
+7. **17 (cid: inline images)** and **19 (LoadBody deduplication)** — fixes broken
+   newsletter images and double-fetching when selecting emails in the desktop UI.
+8. **18 (IMAP APPEND to Sent)** — ensures outgoing emails appear in `Sent` on
+   standard non-Gmail IMAP providers.
+9. **11 (D-Bus signals)** and **12 (D-Bus FTS search)** — high-value desktop app
+   responsiveness improvements (real-time push without polling, offline search API).
+10. **14 (folder actions ledger)** and **13 (dual-connection INBOX IDLE)** —
+    extended durability and real-time alerts while browsing non-inbox folders.
 
 ## Deliberately not proposed
 
@@ -506,3 +710,10 @@ follow-up if the UI wants it.
 - Calendar / contacts / files / AI / OpenPGP — out of scope for this daemon.
 - Pulling in Flectar's separate reader/writer DB threads — the single
   `Arc<Mutex<Cache>>` is adequate until profiling shows contention.
+- Bulk download of all historical message bodies — modern desktop clients (Apple
+  Mail, Superhuman, Mailspring) sync 100% of headers for full offline list
+  browsing and metadata search, but prefetch bodies only for recent windows
+  (e.g., last 30–60 days). Indiscriminately fetching decades of old bodies and
+  attachments bloats local SQLite databases into tens of gigabytes and triggers
+  server bandwidth throttles (e.g. Gmail's 2.5 GB/day IMAP quota). Older bodies
+  remain strictly on-demand on click (`load_body`).
