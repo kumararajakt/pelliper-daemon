@@ -3,7 +3,7 @@
 
 use crate::cache::Cache;
 use crate::secrets::Secrets;
-use crate::types::{Account, EmailAttachment};
+use crate::types::{Account, DaemonSignal, EmailAttachment, SignalSender};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -76,7 +76,11 @@ const MAX_OUTBOX_ATTEMPTS: i32 = 10;
 /// Background task: periodically try to send every queued outbox message.
 /// Runs immediately at startup (so messages queued across daemon restarts are
 /// flushed on next launch), then on a fixed cadence.
-pub(crate) async fn outbox_flusher(cache: Arc<Mutex<Cache>>, secrets: Secrets) {
+pub(crate) async fn outbox_flusher(
+    cache: Arc<Mutex<Cache>>,
+    secrets: Secrets,
+    signal_tx: Option<SignalSender>,
+) {
     loop {
         let items = cache.lock().await.load_pending_outbox().unwrap_or_default();
         for item in items {
@@ -115,6 +119,12 @@ pub(crate) async fn outbox_flusher(cache: Arc<Mutex<Cache>>, secrets: Secrets) {
                 Ok(()) => {
                     tracing::info!("outbox: flushed item {} to {}", item.id, item.to_addr);
                     let _ = cache.lock().await.delete_outbox(item.id);
+                    if let Some(ref tx) = signal_tx {
+                        let _ = tx.send(DaemonSignal::OutboxItemSent {
+                            account_id: item.account_id,
+                            item_id: item.id,
+                        });
+                    }
                 }
                 Err(e) => {
                     let attempts = {

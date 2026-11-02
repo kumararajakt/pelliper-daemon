@@ -17,7 +17,7 @@
 use crate::cache::Cache;
 use crate::imap::{self, ImapSession};
 use crate::secrets::Secrets;
-use crate::types::{Account, ImapMessageSummary};
+use crate::types::{Account, DaemonSignal, ImapMessageSummary};
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -157,6 +157,8 @@ pub struct Worker {
     /// Directory where downloaded attachment files are stored (one folder per
     /// message, files prefixed with the part index).
     attachments_dir: PathBuf,
+    /// Channel for dispatching D-Bus signals.
+    signal_tx: Option<mpsc::UnboundedSender<DaemonSignal>>,
 }
 impl Worker {
     pub fn new(
@@ -165,6 +167,7 @@ impl Worker {
         secrets: Secrets,
         rx: mpsc::UnboundedReceiver<WorkerRequest>,
         attachments_dir: PathBuf,
+        signal_tx: Option<mpsc::UnboundedSender<DaemonSignal>>,
     ) -> Self {
         Self {
             account,
@@ -184,6 +187,13 @@ impl Worker {
             cached_access_token: None,
             token_expires_at: 0,
             attachments_dir,
+            signal_tx,
+        }
+    }
+
+    pub(super) fn emit_signal(&self, signal: DaemonSignal) {
+        if let Some(ref tx) = self.signal_tx {
+            let _ = tx.send(signal);
         }
     }
 
@@ -545,6 +555,11 @@ impl Worker {
                 let mut cache = self.cache.lock().await;
                 let _ = cache.delete_messages(self.account.id, folder_path, &to_delete);
                 let _ = cache.update_folder_unread(self.account.id, folder_path, 0);
+                self.emit_signal(DaemonSignal::FolderUnreadChanged {
+                    account_id: self.account.id,
+                    folder_path: folder_path.to_string(),
+                    unread_count: 0,
+                });
                 tracing::info!(
                     "Worker[{}]: folder {} is empty on server; expunged {} cached message(s)",
                     self.account.id,
@@ -647,12 +662,21 @@ impl Worker {
                 REOPEN_PAGE_SIZE
             };
             let summaries = self.fetch_recent_page(folder_path, page_size).await?;
+            let failures = self.write_summaries_to_cache(folder_path, &summaries).await;
+            self.note_header_write_failures(folder_path, failures).await;
             let cache = self.cache.lock().await;
             let _ = cache.set_folder_last_seen_uid(
                 self.account.id,
                 folder_path,
                 last_seen_uid.max(high),
             );
+            if !summaries.is_empty() {
+                self.emit_signal(DaemonSignal::NewMailReceived {
+                    account_id: self.account.id,
+                    folder_path: folder_path.to_string(),
+                    count: summaries.len() as i32,
+                });
+            }
             summaries
         } else {
             // Reconcile expunges and flags across the active window [lo, hi].
@@ -676,8 +700,12 @@ impl Worker {
                 imap::uid_search_after(session, folder_path, last_seen_uid).await?
             };
             if new_uids.is_empty() {
-                self.fetch_recent_page(folder_path, REOPEN_PAGE_SIZE)
-                    .await?
+                let summaries = self
+                    .fetch_recent_page(folder_path, REOPEN_PAGE_SIZE)
+                    .await?;
+                let failures = self.write_summaries_to_cache(folder_path, &summaries).await;
+                self.note_header_write_failures(folder_path, failures).await;
+                summaries
             } else {
                 let mut summaries = Vec::new();
                 let mut all_landed = true;
@@ -710,6 +738,13 @@ impl Worker {
                         .max(last_seen_uid);
                     let cache = self.cache.lock().await;
                     let _ = cache.set_folder_last_seen_uid(self.account.id, folder_path, next);
+                    if !summaries.is_empty() {
+                        self.emit_signal(DaemonSignal::NewMailReceived {
+                            account_id: self.account.id,
+                            folder_path: folder_path.to_string(),
+                            count: summaries.len() as i32,
+                        });
+                    }
                 }
                 summaries
             }
@@ -864,7 +899,7 @@ impl Worker {
         };
 
         let mut deleted = 0;
-        let mut flags_updated = 0;
+        let mut changed_flags = Vec::new();
 
         if !to_delete.is_empty() || !flags_to_update.is_empty() {
             let mut cache = self.cache.lock().await;
@@ -880,18 +915,33 @@ impl Worker {
                 }
             }
             if !flags_to_update.is_empty() {
-                flags_updated = cache.update_message_flags_bulk(
+                changed_flags = cache.update_message_flags_bulk(
                     self.account.id,
                     folder_path,
                     &flags_to_update,
                 )?;
             }
-            if deleted > 0 || flags_updated > 0 {
+            if deleted > 0 || !changed_flags.is_empty() {
                 let unread = cache
                     .count_unread(self.account.id, folder_path)
                     .unwrap_or(0);
                 let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+                self.emit_signal(DaemonSignal::FolderUnreadChanged {
+                    account_id: self.account.id,
+                    folder_path: folder_path.to_string(),
+                    unread_count: unread,
+                });
             }
+        }
+
+        for &(uid, is_read, is_starred) in &changed_flags {
+            self.emit_signal(DaemonSignal::MessageFlagsChanged {
+                account_id: self.account.id,
+                folder_path: folder_path.to_string(),
+                uid,
+                is_read,
+                is_starred,
+            });
         }
 
         // Clean up prefetch queues for any expunged UIDs
@@ -907,7 +957,7 @@ impl Worker {
                 .retain(|(p, u)| !(p == folder_path && del_set.contains(u)));
         }
 
-        Ok((deleted, flags_updated))
+        Ok((deleted, changed_flags.len()))
     }
 
     /// Upsert a batch of summaries (message row, autocomplete address, header
@@ -969,6 +1019,11 @@ impl Worker {
             .count_unread(self.account.id, folder_path)
             .unwrap_or(0);
         let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+        self.emit_signal(DaemonSignal::FolderUnreadChanged {
+            account_id: self.account.id,
+            folder_path: folder_path.to_string(),
+            unread_count: unread,
+        });
         failures
     }
     /// Periodic poll fired when the worker is not actively IDLE-watching a

@@ -1319,7 +1319,8 @@ fn update_message_flags_bulk_modifies_flags_and_returns_number_of_changed_rows()
         .update_message_flags_bulk(1, "INBOX", &updates)
         .expect("bulk update");
     assert_eq!(
-        count, 2,
+        count.len(),
+        2,
         "only messages with changed flags count as updated"
     );
 
@@ -1336,11 +1337,26 @@ fn update_message_flags_bulk_modifies_flags_and_returns_number_of_changed_rows()
     assert!(!m3.is_read);
     assert!(!m3.is_starred);
 
+    // message_flags helper returns current state
+    assert_eq!(
+        cache.message_flags(1, "INBOX", 1).expect("flags"),
+        Some((true, false))
+    );
+    assert_eq!(
+        cache.message_flags(1, "INBOX", 2).expect("flags"),
+        Some((false, true))
+    );
+    assert_eq!(
+        cache.message_flags(1, "INBOX", 3).expect("flags"),
+        Some((false, false))
+    );
+    assert_eq!(cache.message_flags(1, "INBOX", 999).expect("flags"), None);
+
     // Idempotent re-run returns 0 updated
     let count2 = cache
         .update_message_flags_bulk(1, "INBOX", &updates)
         .expect("re-run");
-    assert_eq!(count2, 0, "no-op updates touch zero rows");
+    assert!(count2.is_empty(), "no-op updates touch zero rows");
 }
 
 #[test]

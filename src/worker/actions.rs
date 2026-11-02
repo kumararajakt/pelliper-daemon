@@ -13,7 +13,7 @@
 
 use super::Worker;
 use crate::actions::{backoff_secs_jittered, retry_decision, RetryDecision};
-use crate::types::{ActionKind, MovePayload, PendingAction, SetFlagsPayload};
+use crate::types::{ActionKind, DaemonSignal, MovePayload, PendingAction, SetFlagsPayload};
 
 impl Worker {
     /// Claim and process one due queued action. Returns `true` when one was
@@ -140,18 +140,40 @@ impl Worker {
             ActionKind::SetFlags => {
                 let payload: SetFlagsPayload =
                     serde_json::from_str(&action.payload).unwrap_or_default();
-                let cache = self.cache.lock().await;
-                let _ = cache.update_message_flags(
-                    self.account.id,
-                    &action.folder_path,
-                    action.uid,
-                    payload.is_read,
-                    payload.is_starred,
-                );
-                let unread = cache
-                    .count_unread(self.account.id, &action.folder_path)
-                    .unwrap_or(0);
-                let _ = cache.update_folder_unread(self.account.id, &action.folder_path, unread);
+                let (flags, unread) = {
+                    let cache = self.cache.lock().await;
+                    let _ = cache.update_message_flags(
+                        self.account.id,
+                        &action.folder_path,
+                        action.uid,
+                        payload.is_read,
+                        payload.is_starred,
+                    );
+                    let unread = cache
+                        .count_unread(self.account.id, &action.folder_path)
+                        .unwrap_or(0);
+                    let _ =
+                        cache.update_folder_unread(self.account.id, &action.folder_path, unread);
+                    let flags = cache
+                        .message_flags(self.account.id, &action.folder_path, action.uid)
+                        .ok()
+                        .flatten();
+                    (flags, unread)
+                };
+                if let Some((is_read, is_starred)) = flags {
+                    self.emit_signal(DaemonSignal::MessageFlagsChanged {
+                        account_id: self.account.id,
+                        folder_path: action.folder_path.clone(),
+                        uid: action.uid,
+                        is_read,
+                        is_starred,
+                    });
+                }
+                self.emit_signal(DaemonSignal::FolderUnreadChanged {
+                    account_id: self.account.id,
+                    folder_path: action.folder_path.clone(),
+                    unread_count: unread,
+                });
             }
             ActionKind::Move => {
                 let payload: MovePayload = match serde_json::from_str(&action.payload) {
@@ -171,6 +193,11 @@ impl Worker {
                         .unwrap_or(0);
                     let _ =
                         cache.update_folder_unread(self.account.id, &action.folder_path, unread);
+                    self.emit_signal(DaemonSignal::FolderUnreadChanged {
+                        account_id: self.account.id,
+                        folder_path: action.folder_path.clone(),
+                        unread_count: unread,
+                    });
                 }
                 if payload.refresh_dest {
                     if let Err(e) = self.sync_folder_first_page(&payload.dest).await {
@@ -190,6 +217,11 @@ impl Worker {
                     .count_unread(self.account.id, &action.folder_path)
                     .unwrap_or(0);
                 let _ = cache.update_folder_unread(self.account.id, &action.folder_path, unread);
+                self.emit_signal(DaemonSignal::FolderUnreadChanged {
+                    account_id: self.account.id,
+                    folder_path: action.folder_path.clone(),
+                    unread_count: unread,
+                });
             }
         }
     }

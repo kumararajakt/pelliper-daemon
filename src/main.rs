@@ -17,8 +17,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use types::Account;
+use types::{Account, DaemonSignal, SignalSender};
 use zbus::connection::Builder;
+use zbus::object_server::SignalEmitter;
 
 /// Spawn a background worker for one account and return its handle.
 /// Handles are stored in a map so the D-Bus layer can route requests.
@@ -27,6 +28,7 @@ fn spawn_worker(
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,
     attachments_dir: PathBuf,
+    signal_tx: Option<SignalSender>,
 ) -> worker::WorkerHandle {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let cache_clone = cache.clone();
@@ -40,6 +42,7 @@ fn spawn_worker(
             secrets_clone,
             rx,
             attachments_dir,
+            signal_tx,
         );
         w.run().await;
     });
@@ -52,6 +55,7 @@ struct Daemon {
     secrets: Secrets,
     workers: Arc<std::sync::Mutex<HashMap<i64, worker::WorkerHandle>>>,
     attachments_dir: PathBuf,
+    signal_tx: Option<SignalSender>,
 }
 
 #[tokio::main]
@@ -88,6 +92,8 @@ async fn main() {
 
     let secrets = Secrets::new();
 
+    let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonSignal>();
+
     // Spawn a background worker per enabled account. Each worker owns an IMAP
     // session and runs the priority-ordered sync/backfill/prefetch/IDLE loop.
     let workers: Arc<std::sync::Mutex<HashMap<i64, worker::WorkerHandle>>> =
@@ -106,6 +112,7 @@ async fn main() {
                 cache.clone(),
                 secrets.clone(),
                 data_dir.join("attachments"),
+                Some(signal_tx.clone()),
             );
             handle.send(worker::WorkerRequest::SyncAll);
             workers.lock().unwrap().insert(account.id, handle);
@@ -122,14 +129,19 @@ async fn main() {
         secrets: secrets.clone(),
         workers,
         attachments_dir: data_dir.join("attachments"),
+        signal_tx: Some(signal_tx.clone()),
     };
 
     // Background outbox flusher: retries messages that failed to send until
     // the connection recovers (also flushes anything queued before startup).
-    tokio::spawn(crate::outbox::outbox_flusher(cache.clone(), secrets));
+    tokio::spawn(crate::outbox::outbox_flusher(
+        cache.clone(),
+        secrets,
+        Some(signal_tx),
+    ));
 
     // Register on D-Bus session bus
-    let _conn = Builder::session()
+    let conn = Builder::session()
         .expect("Failed to connect to D-Bus session bus")
         .name("app.pelliper.Daemon")
         .expect("Failed to claim D-Bus name")
@@ -140,6 +152,52 @@ async fn main() {
         .expect("Failed to start D-Bus server");
 
     tracing::info!("D-Bus server running as app.pelliper.Daemon");
+
+    let emitter = SignalEmitter::new(&conn, "/app/pelliper/Daemon")
+        .expect("Failed to create D-Bus signal emitter");
+    tokio::spawn(async move {
+        while let Some(sig) = signal_rx.recv().await {
+            let res = match sig {
+                DaemonSignal::NewMailReceived {
+                    account_id,
+                    folder_path,
+                    count,
+                } => Daemon::new_mail_received(&emitter, account_id, &folder_path, count).await,
+                DaemonSignal::FolderUnreadChanged {
+                    account_id,
+                    folder_path,
+                    unread_count,
+                } => {
+                    Daemon::folder_unread_changed(&emitter, account_id, &folder_path, unread_count)
+                        .await
+                }
+                DaemonSignal::MessageFlagsChanged {
+                    account_id,
+                    folder_path,
+                    uid,
+                    is_read,
+                    is_starred,
+                } => {
+                    Daemon::message_flags_changed(
+                        &emitter,
+                        account_id,
+                        &folder_path,
+                        uid,
+                        is_read,
+                        is_starred,
+                    )
+                    .await
+                }
+                DaemonSignal::OutboxItemSent {
+                    account_id,
+                    item_id,
+                } => Daemon::outbox_item_sent(&emitter, account_id, item_id).await,
+            };
+            if let Err(e) = res {
+                tracing::warn!("Failed to emit D-Bus signal: {e}");
+            }
+        }
+    });
 
     // Keep the daemon running
     std::future::pending::<()>().await;

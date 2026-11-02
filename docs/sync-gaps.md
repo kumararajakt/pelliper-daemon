@@ -23,7 +23,7 @@ not raw feature parity. Each is independently shippable.
 | 8 | ~~No migration runner~~ ✅ done | Schema changes are silent no-ops on existing DBs | S | L |
 | 9 | ~~Threading owned implicitly by UI~~ ✅ done | No threads table; contract undocumented | L | L |
 | 10 | ~~`sync_failures` ledger absent~~ ✅ done | Failed header/body fetches are lost for the session | S | L |
-| 11 | No D-Bus signals for real-time UI push | UI must poll daemon for new mail, status, and folder changes | S | L |
+| 11 | ~~No D-Bus signals for real-time UI push~~ ✅ done | UI must poll daemon for new mail, status, and folder changes | S | L |
 | 12 | No D-Bus search method for FTS | `messages_fts` is maintained but unqueried via D-Bus | S | L |
 | 13 | Single connection drops INBOX push on folder switch | Viewing custom/sent folders stops real-time new mail alerts | M | M |
 | 14 | Folder operations unhedged by action ledger | Offline folder create/rename/delete drops on network glitch | S | L |
@@ -505,23 +505,30 @@ follow-up if the UI wants it.
 
 ## 11. Emit D-Bus signals for real-time UI updates
 
-**Status: proposed.** Currently, `src/dbus.rs` provides only request-reply RPC
-methods. When IMAP IDLE receives new mail, or the outbox flusher completes a
-delayed send, or a folder's unread count changes, the desktop UI has no way of
-knowing without polling.
+**Status: implemented.** Real-time push signals are emitted over D-Bus (`app.pelliper.Daemon`
+at `/app/pelliper/Daemon`), eliminating the need for frontends to poll for new mail, flag
+mutations, unread counter changes, or background outbox delivery.
 
-**Flectar reference.** An event bus broadcasts state transitions to frontends.
-
-**Proposed change.**
-- Define and emit `zbus` D-Bus signals on `app.pelliper.Daemon`:
-  - `NewMailReceived(account_id: i64, folder_path: String, count: i32)`
-  - `FolderUnreadChanged(account_id: i64, folder_path: String, unread_count: i32)`
-  - `MessageFlagsChanged(account_id: i64, folder_path: String, uid: i64, is_read: bool, is_starred: bool)`
+- **D-Bus Signal Definitions** (`src/dbus.rs`):
+  - `NewMailReceived(account_id: i64, folder_path: &str, count: i32)`
+  - `FolderUnreadChanged(account_id: i64, folder_path: &str, unread_count: i32)`
+  - `MessageFlagsChanged(account_id: i64, folder_path: &str, uid: i64, is_read: bool, is_starred: bool)`
   - `OutboxItemSent(account_id: i64, item_id: i64)`
-- Emit signals directly from worker IDLE handlers, action completion, and the
-  outbox flusher.
-
-**Files.** `src/dbus.rs`, `src/worker.rs`, `src/worker/idle.rs`, `src/outbox.rs`.
+- **Signal Bus & Dispatcher** (`src/types.rs`, `src/main.rs`):
+  - `DaemonSignal` enum and `tokio::sync::mpsc::unbounded_channel` event channel decoupled
+    from the D-Bus connection lifecycle so workers and tests run safely without a D-Bus bus.
+  - Asynchronous forwarder loop in `src/main.rs` consumes internal `DaemonSignal` events and
+    broadcasts them via `zbus::object_server::SignalEmitter`.
+- **Emitters**:
+  - `NewMailReceived`: Emitted when new mail arrives via IDLE push notifications or
+    incremental folder sync (`sync_folder_first_page`).
+  - `FolderUnreadChanged`: Emitted whenever folder unread counts are recomputed in
+    `write_summaries_to_cache`, `reconcile_window`, `run_backfill_chunk`, empty mailbox purge,
+    or local action application.
+  - `MessageFlagsChanged`: Emitted for every modified message flag in `reconcile_window`
+    (server changes) and `apply_local_effect` for `ActionKind::SetFlags` (client changes).
+  - `OutboxItemSent`: Emitted by `outbox_flusher` when an offline message is successfully
+    delivered via SMTP.
 
 ---
 

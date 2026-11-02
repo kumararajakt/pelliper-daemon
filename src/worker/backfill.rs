@@ -3,6 +3,7 @@
 
 use super::{BackfillJob, Worker};
 use crate::imap;
+use crate::types::DaemonSignal;
 use std::collections::HashSet;
 
 impl Worker {
@@ -157,6 +158,11 @@ impl Worker {
                         .count_unread(self.account.id, folder_path)
                         .unwrap_or(0);
                     let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+                    self.emit_signal(DaemonSignal::FolderUnreadChanged {
+                        account_id: self.account.id,
+                        folder_path: folder_path.to_string(),
+                        unread_count: unread,
+                    });
                     tracing::info!(
                         "Worker[{}]: backfill expunged {} message(s) in {} (window {uid_set})",
                         self.account.id,

@@ -7,6 +7,7 @@ use crate::types::{Account, EmailAttachment};
 use crate::worker;
 use crate::Daemon;
 use zbus::interface;
+use zbus::object_server::SignalEmitter;
 
 impl Daemon {
     fn get_worker(&self, account_id: i64) -> Option<worker::WorkerHandle> {
@@ -25,6 +26,7 @@ impl Daemon {
             self.cache.clone(),
             self.secrets.clone(),
             self.attachments_dir.clone(),
+            self.signal_tx.clone(),
         );
         handle.send(worker::WorkerRequest::SyncAll);
         self.workers.lock().unwrap().insert(account.id, handle);
@@ -33,6 +35,43 @@ impl Daemon {
 
 #[interface(name = "app.pelliper.Daemon")]
 impl Daemon {
+    /// Emitted when new mail arrives in a folder (via IMAP IDLE push or poll).
+    #[zbus(signal, name = "NewMailReceived")]
+    pub async fn new_mail_received(
+        signal_ctxt: &SignalEmitter<'_>,
+        account_id: i64,
+        folder_path: &str,
+        count: i32,
+    ) -> zbus::Result<()>;
+
+    /// Emitted when a folder's unread count changes.
+    #[zbus(signal, name = "FolderUnreadChanged")]
+    pub async fn folder_unread_changed(
+        signal_ctxt: &SignalEmitter<'_>,
+        account_id: i64,
+        folder_path: &str,
+        unread_count: i32,
+    ) -> zbus::Result<()>;
+
+    /// Emitted when a message's read or starred flag changes.
+    #[zbus(signal, name = "MessageFlagsChanged")]
+    pub async fn message_flags_changed(
+        signal_ctxt: &SignalEmitter<'_>,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        is_read: bool,
+        is_starred: bool,
+    ) -> zbus::Result<()>;
+
+    /// Emitted when a pending outbox email is successfully delivered via SMTP.
+    #[zbus(signal, name = "OutboxItemSent")]
+    pub async fn outbox_item_sent(
+        signal_ctxt: &SignalEmitter<'_>,
+        account_id: i64,
+        item_id: i64,
+    ) -> zbus::Result<()>;
+
     /// Check if any accounts exist in the database.
     async fn has_accounts(&self) -> bool {
         let cache = self.cache.lock().await;

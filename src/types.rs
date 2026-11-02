@@ -346,3 +346,32 @@ pub struct EmailAttachment {
     pub path: String,
     pub filename: String,
 }
+
+/// Signals emitted over D-Bus (`app.pelliper.Daemon`) to notify frontends
+/// of state transitions in real time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonSignal {
+    NewMailReceived {
+        account_id: i64,
+        folder_path: String,
+        count: i32,
+    },
+    FolderUnreadChanged {
+        account_id: i64,
+        folder_path: String,
+        unread_count: i32,
+    },
+    MessageFlagsChanged {
+        account_id: i64,
+        folder_path: String,
+        uid: i64,
+        is_read: bool,
+        is_starred: bool,
+    },
+    OutboxItemSent {
+        account_id: i64,
+        item_id: i64,
+    },
+}
+
+pub type SignalSender = tokio::sync::mpsc::UnboundedSender<DaemonSignal>;

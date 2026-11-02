@@ -362,18 +362,19 @@ impl Cache {
     /// Update the read/starred flags of multiple messages in bulk.
     ///
     /// Skips rows whose flags already match the target values to avoid
-    /// redundant disk writes. Returns the number of messages actually modified.
+    /// redundant disk writes. Returns the `(uid, is_read, is_starred)` of
+    /// rows actually modified.
     pub fn update_message_flags_bulk(
         &mut self,
         account_id: i64,
         folder_path: &str,
         flags: &[(i64, bool, bool)],
-    ) -> Result<usize> {
+    ) -> Result<Vec<(i64, bool, bool)>> {
         if flags.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let tx = self.conn.transaction()?;
-        let mut updated = 0;
+        let mut updated = Vec::new();
         {
             let mut stmt = tx.prepare(
                 "UPDATE messages SET is_read = ?1, is_starred = ?2
@@ -381,17 +382,39 @@ impl Cache {
                    AND (is_read != ?1 OR is_starred != ?2)",
             )?;
             for &(uid, is_read, is_starred) in flags {
-                updated += stmt.execute(rusqlite::params![
+                let count = stmt.execute(rusqlite::params![
                     is_read as i32,
                     is_starred as i32,
                     account_id,
                     folder_path,
                     uid,
                 ])?;
+                if count > 0 {
+                    updated.push((uid, is_read, is_starred));
+                }
             }
         }
         tx.commit()?;
         Ok(updated)
+    }
+
+    /// Read the (is_read, is_starred) flags of a cached message.
+    pub fn message_flags(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+    ) -> Result<Option<(bool, bool)>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT is_read, is_starred FROM messages
+                 WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+                rusqlite::params![account_id, folder_path, uid],
+                |row| Ok((row.get::<_, i32>(0)? != 0, row.get::<_, i32>(1)? != 0)),
+            )
+            .optional()?;
+        Ok(result)
     }
 
     /// Move a message (and its cached headers and body) from one folder to
