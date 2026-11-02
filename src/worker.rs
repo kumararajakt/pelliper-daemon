@@ -1,19 +1,3 @@
-//! Per-account background worker with a priority-ordered event loop.
-//!
-//! IMAP sessions are stateful and async; the worker owns one session per
-//! account and always processes the most important work first:
-//!
-//! 1. **User requests** — LoadMessages / LoadBody are served immediately.
-//! 2. **Queued actions** — durable flags/move/delete retries (the action ledger).
-//! 3. **Sync-failure retry** — durable header/body fetch retries.
-//! 4. **Body prefetch** — recent message bodies cached so opening is instant.
-//! 5. **Attachment prefetch** — attachments for older messages cached on disk.
-//! 6. **Backfill** — remaining folder messages indexed in chunks.
-//! 7. **IDLE** — blocks for server push; re-syncs on mailbox change.
-//!
-//! This replaces the separate SyncEngine + IdleRouter architecture with a
-//! single task per account that never lets background work starve the user.
-
 use crate::cache::Cache;
 use crate::imap::{self, ImapSession};
 use crate::secrets::Secrets;
@@ -31,69 +15,64 @@ mod idle;
 mod prefetch;
 mod sync_failures;
 
-/// First page of messages fetched instantly when a folder is opened for the
-/// first time (cold cache) — seeds the UI's message list.
 const FIRST_PAGE_SIZE: usize = 200;
-/// Page size for re-opens: the cache already has most messages, so a smaller
-/// fetch of the newest messages (plus merge via upsert) is enough.
-const REOPEN_PAGE_SIZE: usize = 50;
-/// Width (in UIDs) of each history-backfill window: the walk fetches
-/// `UID FETCH lo:hi` bands descending from the persisted cursor. Bigger =
-/// fewer round-trips; smaller = more responsive to interleaved user requests.
-/// The same band size bounds incremental new-mail catch-up fetches.
-const BACKFILL_CHUNK: usize = 1_000;
-/// Width (in UIDs) of the active window checked for remote expunges and flag
-/// changes on each incremental folder sync.
-const RECONCILE_WINDOW: usize = 1_000;
-/// Fallback re-sync interval used when the worker is NOT actively IDLE-watching
-/// a folder (no folder selected yet, no session, or after a disconnect). IMAP
-/// IDLE pushes mailbox changes, but servers are not reliable about it — poll
-/// every couple of minutes so new mail is still picked up.
-const RESYNC_INTERVAL_SECS: u64 = 120;
-// ---------------------------------------------------------------------------
-// Request / response types
-// ---------------------------------------------------------------------------
 
-/// A request from the D-Bus layer (or internal scheduler) to the worker.
+const REOPEN_PAGE_SIZE: usize = 50;
+
+const BACKFILL_CHUNK: usize = 1_000;
+
+const RECONCILE_WINDOW: usize = 1_000;
+
+const RESYNC_INTERVAL_SECS: u64 = 120;
+
 #[derive(Debug)]
 pub enum WorkerRequest {
-    /// User opened a message: fetch its body (also returns from cache).
     LoadBody {
         folder_path: String,
         uid: i64,
         reply: mpsc::UnboundedSender<String>,
     },
-    /// Trigger a sync of every folder.
+
     SyncAll,
-    /// Tell the worker to watch a specific folder: sync its first page and
-    /// IDLE on it for push notifications.
-    SetIdleFolder { folder_path: String },
-    /// Change read/starred flags on one message (None leaves a flag unchanged).
+
+    SetIdleFolder {
+        folder_path: String,
+    },
+
     SetFlags {
         folder_path: String,
         uid: i64,
         is_read: Option<bool>,
         is_starred: Option<bool>,
     },
-    /// Move a message to another folder (None = move to the account's Trash).
+
     MoveMessage {
         folder_path: String,
         uid: i64,
         dest_folder: Option<String>,
     },
-    /// Delete a message: move to Trash if not already there, otherwise permanently delete.
-    DeleteMessage { folder_path: String, uid: i64 },
-    /// Create a new IMAP folder.
-    CreateFolder { name: String },
-    /// Rename an IMAP folder.
-    RenameFolder { old_name: String, new_name: String },
-    /// Delete an IMAP folder.
-    DeleteFolder { name: String },
-    /// Graceful shutdown.
+
+    DeleteMessage {
+        folder_path: String,
+        uid: i64,
+    },
+
+    CreateFolder {
+        name: String,
+    },
+
+    RenameFolder {
+        old_name: String,
+        new_name: String,
+    },
+
+    DeleteFolder {
+        name: String,
+    },
+
     Shutdown,
 }
 
-/// Handle used by the D-Bus layer to talk to a worker.
 #[derive(Clone)]
 pub struct WorkerHandle {
     tx: mpsc::UnboundedSender<WorkerRequest>,
@@ -109,27 +88,14 @@ impl WorkerHandle {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Background jobs
-// ---------------------------------------------------------------------------
-
-/// Remaining UIDs to backfill for a folder, persisted as a cursor.
 struct BackfillJob {
     folder_path: String,
-    /// The folder's UIDVALIDITY when the job was planned. If the server reports
-    /// a different value later the queued UIDs name different messages, so the
-    /// job is dropped and re-seeded by the next sync.
+
     uidvalidity: i64,
-    /// Top (highest UID) of the next window to fetch. `0` = complete.
-    /// The window walks **downward** from here in `BACKFILL_CHUNK`-wide bands,
-    /// so an interrupted run resumes without re-running `UID SEARCH ALL`.
+
     cursor: i64,
 }
-// ---------------------------------------------------------------------------
-// Worker
-// ---------------------------------------------------------------------------
 
-/// Per-account background worker.
 pub struct Worker {
     account: Account,
     cache: Arc<Mutex<Cache>>,
@@ -145,19 +111,17 @@ pub struct Worker {
     attachment_prefetch: VecDeque<(String, i64)>,
     attachment_prefetched: HashSet<(String, i64)>,
     backfill_queue: VecDeque<BackfillJob>,
-    /// A request deferred while we were inside an IDLE block, to be processed
-    /// at the top of the priority loop.
+
     pending: Option<WorkerRequest>,
-    /// Set by Shutdown; the event loop exits once set.
+
     shutdown: bool,
-    /// Cached OAuth access token (in-memory only, never persisted).
+
     cached_access_token: Option<String>,
-    /// Unix timestamp when cached_access_token expires (0 = unknown).
+
     token_expires_at: i64,
-    /// Directory where downloaded attachment files are stored (one folder per
-    /// message, files prefixed with the part index).
+
     attachments_dir: PathBuf,
-    /// Channel for dispatching D-Bus signals.
+
     signal_tx: Option<mpsc::UnboundedSender<DaemonSignal>>,
 }
 impl Worker {
@@ -197,10 +161,6 @@ impl Worker {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Priority-ordered event loop
-    // -----------------------------------------------------------------------
-
     pub async fn run(mut self) {
         let id = self.account.id;
         tracing::info!("Worker[{}]: starting ({})", id, self.account.email);
@@ -209,10 +169,6 @@ impl Worker {
             tracing::error!("Worker[{}]: bootstrap connect failed: {}", id, e);
         }
 
-        // Recover actions left in-flight by a previous run (crash/restart) so
-        // they are retried rather than stranded. New actions are only enqueued
-        // after this point, so nothing live is disturbed. Also report how many
-        // header/body fetch retries are still queued.
         {
             let cache = self.cache.lock().await;
             match cache.reset_in_flight_actions(self.account.id) {
@@ -238,7 +194,6 @@ impl Worker {
                 break;
             }
 
-            // ---- Step 0: drain every pending user request (non-blocking)
             if let Some(req) = self.pending.take() {
                 self.handle_request(req).await;
             }
@@ -254,35 +209,24 @@ impl Worker {
                 }
             }
 
-            // ---- Step 0.5: drain one due queued action (durable retry)
-            // Runs before background work but after user requests, so a
-            // reconnect's backlog of flags/moves/deletes clears promptly
-            // without evicting interactive work.
             if self.drain_one_action().await {
                 continue;
             }
 
-            // ---- Step 0.6: retry one due header/body fetch (sync-failure
-            // ledger). Also after user requests, so a transient fetch failure
-            // heals in the background instead of waiting for an unrelated
-            // re-sync to happen to include the message.
             if self.retry_one_sync_failure().await {
                 continue;
             }
 
-            // ---- Step 1: body prefetch (one per iteration)
             if let Some((path, uid)) = self.body_prefetch.pop_front() {
                 self.run_one_body_prefetch(&path, uid).await;
                 continue;
             }
 
-            // ---- Step 2: attachment prefetch (one per iteration)
             if let Some((path, uid)) = self.attachment_prefetch.pop_front() {
                 self.run_one_attachment_prefetch(&path, uid).await;
                 continue;
             }
 
-            // ---- Step 3: backfill window (one chunk per iteration)
             if let Some((path, uidvalidity, cursor)) = self
                 .backfill_queue
                 .front()
@@ -292,8 +236,7 @@ impl Worker {
                     self.backfill_queue.pop_front();
                     continue;
                 }
-                // Drop a job planned under an older UIDVALIDITY: its UIDs now
-                // name different messages. The next sync re-seeds the folder.
+
                 if !self.backfill_uidvalidity_ok(&path, uidvalidity).await {
                     tracing::warn!(
                         "Worker[{}]: dropping stale backfill job for {} (UIDVALIDITY changed)",
@@ -306,8 +249,6 @@ impl Worker {
                 let hi = cursor;
                 let lo = (hi - BACKFILL_CHUNK as i64 + 1).max(1);
                 if self.run_backfill_chunk(&path, lo, hi).await {
-                    // The chunk wrote and persisted the cursor; advance the
-                    // in-memory job so the next iteration picks up below it.
                     let next = lo - 1;
                     if next <= 0 {
                         self.backfill_queue.pop_front();
@@ -318,7 +259,6 @@ impl Worker {
                 continue;
             }
 
-            // ---- Step 4: IDLE (blocks until push notification)
             if self.session.is_some() && self.supports_idle {
                 if let Some(folder) = self.current_folder.clone() {
                     match self.idle_wait(&folder).await {
@@ -335,8 +275,7 @@ impl Worker {
                             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                             continue;
                         }
-                        // A request arrived during IDLE; it lives on self.pending
-                        // and the top of the loop processes it at priority 0.
+
                         IdleResult::Request => {
                             continue;
                         }
@@ -344,11 +283,6 @@ impl Worker {
                 }
             }
 
-            // ---- Nothing higher-priority: block for the next request, but
-            //      wake up periodically to re-sync. IDLE push is the happy
-            //      path; servers can miss notifications, and when we cannot
-            //      IDLE at all (no folder selected / no session) this timer
-            //      is the only thing that keeps the mailbox fresh.
             match tokio::time::timeout(
                 tokio::time::Duration::from_secs(RESYNC_INTERVAL_SECS),
                 self.rx.recv(),
@@ -356,7 +290,7 @@ impl Worker {
             .await
             {
                 Ok(Some(req)) => self.pending = Some(req),
-                Ok(None) => break, // channel closed — shut down
+                Ok(None) => break,
                 Err(_elapsed) => {
                     self.do_periodic_resync().await;
                 }
@@ -365,15 +299,10 @@ impl Worker {
 
         tracing::info!("Worker[{}]: shut down", id);
     }
-    // -----------------------------------------------------------------------
-    // Network operations
-    // -----------------------------------------------------------------------
 
-    /// Connect with a fresh IMAP session and refresh the cached folder list.
     async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut session = self.connect_session().await?;
 
-        // Refresh the folder list so the UI's sidebar is never empty.
         match imap::list_folders(&mut session).await {
             Ok(folders) => {
                 let cache = self.cache.lock().await;
@@ -397,13 +326,11 @@ impl Worker {
         Ok(())
     }
 
-    /// Get a valid OAuth access token, refreshing if expired or about to expire.
-    /// Refreshes 5 minutes before expiry to avoid race conditions.
     async fn get_valid_access_token(
         &mut self,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let now = chrono::Utc::now().timestamp();
-        // Refresh 5 minutes (300s) before expiry
+
         let buffer = 300;
 
         if let Some(ref token) = self.cached_access_token {
@@ -412,7 +339,6 @@ impl Worker {
             }
         }
 
-        // Token is missing or about to expire — refresh it
         let refresh_token = self
             .account
             .refresh_token
@@ -428,7 +354,6 @@ impl Worker {
         )
         .await?;
 
-        // Save the new refresh token if the provider issued one (Google rotates them)
         if let Some(ref new_rt) = token.refresh_token {
             if new_rt != refresh_token {
                 tracing::info!(
@@ -444,7 +369,6 @@ impl Worker {
                         e
                     );
                 } else {
-                    // Update the in-memory account so future refreshes use the new token
                     self.account.refresh_token = Some(new_rt.clone());
                 }
             }
@@ -484,7 +408,6 @@ impl Worker {
         }
     }
 
-    /// Ensure we have a live session, reconnecting if needed.
     async fn ensure_session(&mut self) -> Result<(), String> {
         if self.session.is_some() {
             return Ok(());
@@ -493,7 +416,6 @@ impl Worker {
         Ok(())
     }
 
-    /// Check if an error string indicates an authentication failure.
     fn is_auth_error(e: &str) -> bool {
         let lower = e.to_lowercase();
         lower.contains("auth")
@@ -505,22 +427,12 @@ impl Worker {
             || lower.contains("invalid credentials")
     }
 
-    /// Invalidate the cached token and drop the session so the next
-    /// operation triggers a fresh connect with a new token.
     fn invalidate_token(&mut self) {
         self.cached_access_token = None;
         self.token_expires_at = 0;
         self.session = None;
     }
 
-    /// Sync the top of a folder's UID space and queue background work for the
-    /// rest. Drives the persisted per-folder cursors: a cold folder (no
-    /// `last_seen_uid`) seeds with a sequence-range page and snapshots the
-    /// server high-water; a warm folder asks the server only for UIDs above
-    /// the high-water and fetches exactly those, in bounded chunks; with no
-    /// new mail it falls back to a small newest-page refresh so flag changes
-    /// still land. All writes are upserts, so overlaps merge harmlessly.
-    /// Returns the summaries fetched.
     async fn sync_folder_first_page(
         &mut self,
         folder_path: &str,
@@ -529,8 +441,6 @@ impl Worker {
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-        // EXAMINE once for the whole plan: UIDVALIDITY (reset guard), EXISTS
-        // and UIDNEXT (high-water rule).
         let (uidvalidity, exists, uid_next) = {
             let session = self.session.as_mut().ok_or("no session")?;
             imap::examine_folder(session, folder_path).await?
@@ -575,13 +485,6 @@ impl Worker {
             return Ok(Vec::new());
         }
 
-        // UIDVALIDITY guard. Everything below is keyed on `(folder, uid)`, but
-        // IMAP only guarantees those UIDs stay meaningful while the folder's
-        // UIDVALIDITY is unchanged. When the server reports a new value it has
-        // renumbered every message, so the cached rows now point at different
-        // mail: drop them (and any queued work keyed on the old UIDs) before
-        // syncing afresh. A 0 means the server did not report one — unknown,
-        // not a change.
         if uidvalidity != 0 {
             let cached = {
                 let cache = self.cache.lock().await;
@@ -604,8 +507,7 @@ impl Worker {
                     uidvalidity,
                     cleared
                 );
-                // Forget background work planned against the old UIDs. The
-                // re-sync below queues fresh work for the new numbering.
+
                 self.body_prefetch.retain(|(p, _)| p != folder_path);
                 self.body_prefetched.retain(|(p, _)| p != folder_path);
                 self.attachment_prefetch.retain(|(p, _)| p != folder_path);
@@ -627,7 +529,6 @@ impl Worker {
             }
         }
 
-        // High-water UID: UIDNEXT-1 when consistent with EXISTS, else SEARCH.
         let high = {
             let session = self.session.as_mut().ok_or("no session")?;
             imap::mailbox_highest_uid(session, folder_path, exists, uid_next).await?
@@ -640,15 +541,6 @@ impl Worker {
                 .unwrap_or((0, None))
         };
 
-        // Front-plane fetch. Three cases:
-        //  - never synced (cold/legacy): newest-page seed, then snapshot the
-        //    high-water so later cycles only ask the server for UIDs above it;
-        //  - warm with new mail: fetch exactly the UIDs above the high-water
-        //    in bounded chunks, advancing the watermark only when all land
-        //    (a post-offline catch-up cannot stall the loop forever, and a
-        //    partial failure is re-checked next cycle instead of losing mail);
-        //  - warm without new mail: cheap newest-page refresh for flag
-        //    changes, watermark untouched.
         let summaries = if last_seen_uid == 0 {
             let cached_count = {
                 let cache = self.cache.lock().await;
@@ -679,7 +571,6 @@ impl Worker {
             }
             summaries
         } else {
-            // Reconcile expunges and flags across the active window [lo, hi].
             let hi = last_seen_uid.max(high);
             let lo = (hi.saturating_sub(RECONCILE_WINDOW as i64) + 1).max(1);
             if let Err(e) = self.reconcile_window(folder_path, lo, hi).await {
@@ -750,7 +641,6 @@ impl Worker {
             }
         };
 
-        // Prefetch newest-first so the newest mail wins the body window.
         let mut newest_first = summaries;
         newest_first.sort_by_key(|a| std::cmp::Reverse(a.headers.date_ts));
         self.queue_body_prefetch(folder_path, &newest_first).await;
@@ -767,8 +657,6 @@ impl Worker {
         Ok(newest_first)
     }
 
-    /// Fetch a sequence-range page of summaries, reconnecting and retrying
-    /// once when an OAuth token turns out to be invalid mid-session.
     async fn fetch_recent_page(
         &mut self,
         folder_path: &str,
@@ -798,8 +686,6 @@ impl Worker {
         }
     }
 
-    /// Fetch summaries for an explicit UID set, retrying once on an OAuth auth
-    /// error. Shared by incremental new-mail sync and history backfill windows.
     async fn fetch_uid_set(
         &mut self,
         folder_path: &str,
@@ -829,8 +715,6 @@ impl Worker {
         }
     }
 
-    /// Fetch (UID, is_read, is_starred) flags for an explicit UID set,
-    /// retrying once on an OAuth auth error.
     async fn fetch_uid_flags(
         &mut self,
         folder_path: &str,
@@ -860,13 +744,6 @@ impl Worker {
         }
     }
 
-    /// Reconcile expunges and flags in the given UID range `[lo, hi]`.
-    ///
-    /// Fetches lightweight `(UID FLAGS)` from IMAP for the range:
-    /// - Cached UIDs missing from the response (and not pending locally) are expunged.
-    /// - Flag changes (is_read, is_starred) from other clients are updated in bulk.
-    ///
-    /// Returns `(deleted_count, flags_updated_count)`.
     pub(super) async fn reconcile_window(
         &mut self,
         folder_path: &str,
@@ -944,7 +821,6 @@ impl Worker {
             });
         }
 
-        // Clean up prefetch queues for any expunged UIDs
         if !to_delete.is_empty() {
             let del_set: HashSet<i64> = to_delete.into_iter().collect();
             self.body_prefetch
@@ -960,13 +836,6 @@ impl Worker {
         Ok((deleted, changed_flags.len()))
     }
 
-    /// Upsert a batch of summaries (message row, autocomplete address, header
-    /// block) and refresh the folder's unread count from the whole cache.
-    ///
-    /// Returns the `(uid, error)` of any message whose header block could not be
-    /// persisted, so the caller can record it in the sync-failure ledger. The
-    /// writes are best-effort and do not abort the batch: a single bad row must
-    /// not discard the rest of the page.
     async fn write_summaries_to_cache(
         &self,
         folder_path: &str,
@@ -975,8 +844,6 @@ impl Worker {
         let mut failures = Vec::new();
         let cache = self.cache.lock().await;
         for msg in summaries {
-            // Record sender address for autocomplete. The From list is
-            // JSON, so take its first entry.
             if let Some((email, name)) = imap::first_address(&msg.from) {
                 let _ = cache.upsert_address(&email, &name);
             }
@@ -998,9 +865,7 @@ impl Worker {
                 failures.push((msg.uid, e.to_string()));
                 continue;
             }
-            // Full header block + ENVELOPE. Must follow upsert_message:
-            // the row is foreign-keyed to it, so it cannot be written
-            // first. This is also what indexes the message for search.
+
             if let Err(e) =
                 cache.save_message_headers(self.account.id, folder_path, msg.uid, &msg.headers)
             {
@@ -1013,8 +878,7 @@ impl Worker {
                 failures.push((msg.uid, e.to_string()));
             }
         }
-        // Use the whole-cache unread count, not just this batch, so re-opens
-        // and IDLE re-syncs don't undercount older unread mail.
+
         let unread = cache
             .count_unread(self.account.id, folder_path)
             .unwrap_or(0);
@@ -1026,10 +890,7 @@ impl Worker {
         });
         failures
     }
-    /// Periodic poll fired when the worker is not actively IDLE-watching a
-    /// folder (no folder selected yet, or no live session). Tries to
-    /// (re)establish the session and refresh the active folder — falling back
-    /// to INBOX so per-account new mail is still picked up without IDLE push.
+
     async fn do_periodic_resync(&mut self) {
         let id = self.account.id;
         if self.session.is_none() {
@@ -1056,15 +917,6 @@ impl Worker {
         }
     }
 
-    /// Resolve a semantic role (e.g. Trash) to a concrete folder path, using the
-    /// folder list already classified and cached by `connect()`.
-    ///
-    /// Reading the cache rather than re-issuing `LIST` is deliberate: the cached
-    /// rows have already had name-matched impostors demoted, so this returns the
-    /// server's authoritative special-use folder. A fresh `LIST` would re-apply
-    /// the name heuristic and pick whichever candidate the server happened to
-    /// list first — so "delete" could file mail into a user's own `Trash` label
-    /// instead of the real trash, where it would never leave the mailbox.
     async fn resolve_role_folder(&self, kind: crate::types::FolderKind) -> Option<String> {
         let cache = self.cache.lock().await;
         let folders = cache.load_folders(self.account.id).ok()?;
@@ -1074,12 +926,6 @@ impl Worker {
             .map(|f| f.path)
     }
 
-    /// Whether the daemon's classified folder list says this path is `kind`.
-    ///
-    /// Prefers the cached classification over `FolderKind::from_path` because
-    /// the cached rows have had name-matched impostors demoted. Returns `false`
-    /// when the folder is unknown, so callers on a destructive path default to
-    /// the recoverable behaviour instead of the irreversible one.
     async fn is_role_folder(&self, path: &str, kind: crate::types::FolderKind) -> bool {
         let cache = self.cache.lock().await;
         cache
@@ -1094,14 +940,10 @@ impl Worker {
     }
 }
 
-// ---------------------------------------------------------------------------
-// IDLE event parsing (reused from the old idle.rs)
-// ---------------------------------------------------------------------------
-
 enum IdleResult {
     MailboxChange,
     FolderSwitch(String),
     Disconnected,
-    /// A request arrived during IDLE; it was stored on `self.pending`.
+
     Request,
 }

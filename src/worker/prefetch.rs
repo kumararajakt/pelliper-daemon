@@ -1,22 +1,11 @@
-//! Background body + attachment prefetch, and the on-demand single-body
-//! fetch shared by `handle_load_body`.
-
 use super::Worker;
 use crate::imap;
 use crate::types::{ImapMessageSummary, SyncStage};
 
-/// Pre-download bodies for this many of the most recent messages so opening
-/// them is instant.  Older messages load on demand.
 const PREFETCH_BODY_LIMIT: usize = 50;
-/// Beyond the body-prefetch window, still download attachments for this many
-/// of the most recent messages flagged as having attachments, so viewing or
-/// saving them is instant. Older ones load on demand via LoadBody.
+
 const PREFETCH_ATTACHMENT_LIMIT: usize = 100;
 impl Worker {
-    /// Fetch, parse, and cache one message body, returning `(html,
-    /// has_attachments)`. The `Err` carries the IMAP error (as text) so callers
-    /// can record a durable retry; cache-write failures inside `persist_parsed`
-    /// are logged there and do not fail the fetch.
     pub(super) async fn fetch_and_store_body(
         &mut self,
         folder_path: &str,
@@ -37,14 +26,12 @@ impl Worker {
             parsed.html.clone()
         };
 
-        // Persist body + attachments so both are cached for offline/viewing.
         self.persist_parsed(folder_path, uid, &html, &parsed, &raw)
             .await;
 
         Ok((html, parsed.has_attachments))
     }
 
-    /// Fetch a single message body from IMAP.
     pub(super) async fn fetch_single_body(
         &mut self,
         folder_path: &str,
@@ -55,14 +42,6 @@ impl Worker {
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
     }
 
-    /// Save the parsed body HTML and any attachment files for a message, then
-    /// refresh its `has_attachments` flag. Files land under
-    /// `attachments/<account>/<sanitized-folder>/<uid>/<index>_<name>`.
-    ///
-    /// `raw` is the complete `BODY.PEEK[]` payload, so the header block is
-    /// already in hand: it is cached into `message_headers` here at no extra
-    /// network cost, which also covers messages the header-only FETCH never
-    /// reached.
     async fn persist_parsed(
         &mut self,
         folder_path: &str,
@@ -73,8 +52,7 @@ impl Worker {
     ) {
         {
             let cache = self.cache.lock().await;
-            // Logged, not swallowed: a silently-failing body write is exactly
-            // how the broken FTS trigger hid for so long.
+
             if let Err(e) = cache.save_body(self.account.id, folder_path, uid, html) {
                 tracing::error!(
                     "Worker[{}]: save_body {}/{} failed: {e}",
@@ -173,10 +151,6 @@ impl Worker {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Background work: body prefetch
-    // -----------------------------------------------------------------------
-
     pub(super) async fn queue_body_prefetch(
         &mut self,
         folder_path: &str,
@@ -218,23 +192,13 @@ impl Worker {
                     uid,
                     e
                 );
-                // Record it so the failure is retried in the background instead
-                // of being lost: the in-memory prefetch queue will not revisit
-                // this message, and older ones are never re-queued.
+
                 self.note_sync_failure(folder_path, uid, SyncStage::Body, &e)
                     .await;
             }
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Background work: attachment prefetch
-    // -----------------------------------------------------------------------
-
-    /// Find messages flagged as having attachments that aren't stored on disk
-    /// yet and enqueue them for background download. The fetch reuses the body
-    /// fetch path (persist_parsed also writes attachment files), so messages
-    /// already queued for body prefetch are skipped to avoid double fetches.
     pub(super) async fn queue_attachment_prefetch(&mut self, folder_path: &str) {
         let uids = {
             let cache = self.cache.lock().await;
@@ -261,17 +225,11 @@ impl Worker {
         }
     }
 
-    /// Download one message's body + attachments. Same code path as body
-    /// prefetch; persist_parsed writes any attachment files found.
     pub(super) async fn run_one_attachment_prefetch(&mut self, folder_path: &str, uid: i64) {
         self.run_one_body_prefetch(folder_path, uid).await;
     }
 }
-// ---------------------------------------------------------------------------
-// Attachment filename helpers
-// ---------------------------------------------------------------------------
-/// Map a folder path to a single safe directory component (e.g.
-/// `INBOX/Custom` -> `INBOX_Custom`), avoiding nested/absolute paths.
+
 fn sanitize_path_component(path: &str) -> String {
     let clean: String = path
         .chars()
@@ -289,8 +247,7 @@ fn sanitize_path_component(path: &str) -> String {
         clean
     }
 }
-/// Map an attachment's claimed name to a safe filename; falls back to a
-/// generated `attachment_<n>.ext` name when nothing usable is provided.
+
 fn sanitize_filename(name: &str, fallback: &str) -> String {
     let clean: String = name
         .chars()
@@ -311,7 +268,7 @@ fn sanitize_filename(name: &str, fallback: &str) -> String {
         clean
     }
 }
-/// Derive a default filename from a MIME type when a part has no name.
+
 fn attachment_fallback_name(content_type: &str, index: usize) -> String {
     let lower = content_type.to_lowercase();
     let ext = match lower.split('/').nth(1) {

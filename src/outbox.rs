@@ -1,15 +1,9 @@
-//! Outbox flushing: retry email delivery for messages that failed to send
-//! (also handles startup flushes), plus the auth-resolving SMTP send helper.
-
 use crate::cache::Cache;
 use crate::secrets::Secrets;
 use crate::types::{Account, DaemonSignal, EmailAttachment, SignalSender};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-/// Send an email via SMTP, resolving the account's auth secret first: a
-/// keyring password for password auth, a freshly refreshed XOAUTH2 access
-/// token for OAuth accounts.
 pub(crate) async fn send_with_auth(
     secrets: &Secrets,
     account: &Account,
@@ -64,18 +58,10 @@ pub(crate) async fn send_with_auth(
     .map_err(|e| e.to_string())
 }
 
-/// How often the background flusher polls the outbox for messages that failed
-/// to send. This is the "flush on reconnect" mechanism: any message that could
-/// not be delivered is retried on this cadence until it goes out or hits the
-/// attempt cap.
 const OUTBOX_FLUSH_INTERVAL_SECS: u64 = 30;
 
-/// Retry attempts before a stuck queued message is dropped permanently.
 const MAX_OUTBOX_ATTEMPTS: i32 = 10;
 
-/// Background task: periodically try to send every queued outbox message.
-/// Runs immediately at startup (so messages queued across daemon restarts are
-/// flushed on next launch), then on a fixed cadence.
 pub(crate) async fn outbox_flusher(
     cache: Arc<Mutex<Cache>>,
     secrets: Secrets,

@@ -1,5 +1,3 @@
-//! Shared data types used across the daemon (cache, IMAP sync, SMTP).
-
 #[derive(Debug, Clone)]
 pub struct Account {
     pub id: i64,
@@ -23,29 +21,21 @@ pub struct Folder {
     pub path: String,
     pub unread_count: i32,
     pub noselect: bool,
-    /// SPECIAL-USE-derived classification ("inbox", "sent", ..., "custom").
+
     pub kind: String,
 }
 
-/// One message as the UI sees it, straight off `get_messages`.
-///
-/// Threading is **UI-owned** (gap #9): `in_reply_to`, `message_id`, and
-/// `references` are passed through verbatim and the daemon never resolves them
-/// into threads — there is no `threads` table and no union-find here. The UI
-/// runs JWZ threading over these three fields. Dropping them would strand the
-/// other repo, so they are part of the D-Bus contract, not internal state.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Message {
     pub uid: i64,
     pub subject: Option<String>,
     pub sender: Option<String>,
     pub date: i64,
-    /// `In-Reply-To` of this message: the parent's `Message-ID`, or none.
+
     pub in_reply_to: Option<String>,
-    /// This message's own `Message-ID`, the key thread grouping runs on.
+
     pub message_id: Option<String>,
-    /// The `References` chain, root-first: ancestors for this message. The UI
-    /// uses it to attach orphaned messages under their real parent.
+
     pub references: Option<String>,
     pub has_attachments: bool,
     pub is_read: bool,
@@ -74,22 +64,16 @@ pub struct OutboxItem {
     pub attempts: i32,
 }
 
-/// The kind of a queued non-send mutation, persisted as `pending_actions.kind`.
-///
-/// Sends are *not* here — they keep their own `outbox` table and SMTP flusher,
-/// because they need a different transport and a longer attempt budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
-    /// Set read/starred flags; payload is a [`SetFlagsPayload`].
     SetFlags,
-    /// Move to another folder; payload is a [`MovePayload`].
+
     Move,
-    /// Permanently delete (flag `\Deleted` + EXPUNGE); payload is empty.
+
     Delete,
 }
 
 impl ActionKind {
-    /// Stable lowercase string stored in the database and embedded in logs.
     pub fn as_str(&self) -> &'static str {
         match self {
             ActionKind::SetFlags => "set_flags",
@@ -98,8 +82,6 @@ impl ActionKind {
         }
     }
 
-    /// Parse the persisted form. `None` for an unknown kind, which the cache
-    /// treats as an error rather than guessing at a destructive operation.
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "set_flags" => Some(ActionKind::SetFlags),
@@ -110,8 +92,6 @@ impl ActionKind {
     }
 }
 
-/// Payload for [`ActionKind::SetFlags`]. `None` leaves a flag unchanged, matching
-/// the D-Bus `set_message_read` / `set_message_starred` contract.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SetFlagsPayload {
@@ -119,50 +99,33 @@ pub struct SetFlagsPayload {
     pub is_starred: Option<bool>,
 }
 
-/// Payload for [`ActionKind::Move`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MovePayload {
-    /// Destination folder path.
     pub dest: String,
-    /// Whether to re-sync the destination afterwards so the moved message shows
-    /// up immediately. An explicit move refreshes the destination; a
-    /// delete-to-trash does not (the UI is leaving the folder anyway).
+
     pub refresh_dest: bool,
 }
 
-/// One durable, retryable non-send mutation, as read from `pending_actions`.
-///
-/// The intent is written there *before* the server is touched, so an offline or
-/// crashed operation survives a restart and is retried by the worker's drain
-/// loop instead of being lost. Scheduling metadata (`state`, `not_before`,
-/// `created_at`, `last_error`) is owned by the cache and not carried here.
 #[derive(Debug, Clone)]
 pub struct PendingAction {
     pub id: i64,
     pub folder_path: String,
     pub uid: i64,
     pub kind: ActionKind,
-    /// Kind-specific JSON (see [`SetFlagsPayload`] / [`MovePayload`]).
+
     pub payload: String,
-    /// Attempts made so far, before the one about to run.
+
     pub attempts: i32,
 }
 
-/// Which stage of a message's sync failed, persisted as `sync_failures.stage`.
-///
-/// Deliberately separate from [`ActionKind`]: those are user mutations carrying
-/// a durable intent with rollback semantics, while these are background fetch
-/// retries that only ever heal a missing header/body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncStage {
-    /// The message's header block could not be fetched or stored.
     Header,
-    /// The message's body could not be fetched.
+
     Body,
 }
 
 impl SyncStage {
-    /// Stable lowercase string stored in the database and embedded in logs.
     pub fn as_str(&self) -> &'static str {
         match self {
             SyncStage::Header => "header",
@@ -170,8 +133,6 @@ impl SyncStage {
         }
     }
 
-    /// Parse the persisted form. `None` for an unknown stage, which the cache
-    /// treats as an error rather than guessing.
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "header" => Some(SyncStage::Header),
@@ -181,25 +142,21 @@ impl SyncStage {
     }
 }
 
-/// One message that failed a sync stage and is queued for background retry, as
-/// read from `sync_failures`.
 #[derive(Debug, Clone)]
 pub struct SyncFailure {
     pub folder_path: String,
     pub uid: i64,
     pub stage: SyncStage,
-    /// Attempts made so far, before the one about to run.
+
     pub attempts: i32,
 }
 
-/// Information about a discovered IMAP folder.
 pub struct ImapFolder {
     pub path: String,
     pub noselect: bool,
     pub kind: FolderKind,
 }
 
-/// Semantic classification of a folder based on SPECIAL-USE attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum FolderKind {
     Inbox,
@@ -213,7 +170,6 @@ pub enum FolderKind {
 }
 
 impl FolderKind {
-    /// Parse from IMAP flag string (e.g., "\\Sent" -> Sent).
     pub fn from_flag(flag: &str) -> Option<Self> {
         match flag.to_lowercase().as_str() {
             "\\inbox" | "inbox" => Some(FolderKind::Inbox),
@@ -227,8 +183,6 @@ impl FolderKind {
         }
     }
 
-    /// Stable lowercase string, persisted in the cache `folders.kind` column
-    /// and consumed by the UI model (mirror of `FolderModel::roleFromKind`).
     pub fn as_str(&self) -> &'static str {
         match self {
             FolderKind::Inbox => "inbox",
@@ -242,7 +196,6 @@ impl FolderKind {
         }
     }
 
-    /// Classify by path heuristics (fallback when no SPECIAL-USE attribute).
     pub fn from_path(path: &str) -> Self {
         let leaf = path.rsplit('/').next().unwrap_or(path);
         let lower = leaf.to_lowercase();
@@ -259,56 +212,27 @@ impl FolderKind {
     }
 }
 
-/// Every header of a message, stored in the `message_headers` cache table and
-/// cached on both FETCH paths: `ImapSession::summary_from_fetch` (from the
-/// server's `ENVELOPE`) and `headers_from_raw_message` (from a full RFC822
-/// message, which the body-fetch path already has in hand).
-///
-/// The two paths produce identical values for the same message, which is what
-/// makes it safe for either to write the row.
-///
-/// The fields mirror RFC3501's `ENVELOPE` — date, subject, from, sender,
-/// reply-to, to, cc, bcc, in-reply-to, message-id — plus `references`. That
-/// last one is the reason the summary query still fetches any header bytes at
-/// all: `ENVELOPE` has exactly ten fields and none of them is `References`, so
-/// it can only come from `HEADER.FIELDS (REFERENCES IN-REPLY-TO)`.
 #[derive(Debug, Clone, Default)]
 pub struct MessageHeaders {
     pub subject: String,
-    /// The six address headers, each a JSON array of `{"name":…,"email":…}`
-    /// objects — e.g. `[{"name":"Alice","email":"alice@example.com"}]`.
-    ///
-    /// Structured rather than a display string so recipients stay
-    /// addressable: a group entry has no addr-spec, and the UI wants the
-    /// display name and the address separately. The UI renders one of these
-    /// back to text on read (`addressDisplayString()` in `src/addressfield.h`).
+
     pub from: String,
     pub sender: String,
     pub reply_to: String,
     pub to: String,
     pub cc: String,
     pub bcc: String,
-    /// The raw `Date:` header, verbatim.
+
     pub date: String,
-    /// The `Date:` header parsed to a unix timestamp. This — not `date` — is
-    /// what every recency sort uses; ordering by the header string sorts on
-    /// the weekday name.
+
     pub date_ts: i64,
     pub in_reply_to: String,
-    /// `References:`, normalized to bare Message-IDs. ENVELOPE has no such
-    /// field, so this only ever comes from the `HEADER.FIELDS (REFERENCES
-    /// IN-REPLY-TO)` item in `SUMMARY_FETCH_QUERY`. Without it threading has
-    /// nothing to link, so that item is not optional.
+
     pub references: String,
     pub message_id: String,
 }
 
 impl MessageHeaders {
-    /// True when this carries nothing worth writing to the cache, so callers
-    /// can skip the row instead of storing an empty shell.
-    ///
-    /// The address fields are JSON arrays, so an absent header is the two-byte
-    /// string `"[]"` rather than `""` — both count as empty here.
     pub fn is_empty(&self) -> bool {
         fn blank(v: &str) -> bool {
             v.is_empty() || v == "[]"
@@ -321,23 +245,15 @@ impl MessageHeaders {
     }
 }
 
-/// What the worker needs from a FETCHed message: its identity, its cached
-/// *state* (flags, attachment flag, preview), and its headers.
-///
-/// Every header-derived field lives in `headers` rather than being flattened
-/// onto this struct — `subject`/`date`/`message_id`/`references` used to be
-/// duplicated here and in the `messages` table, and both copies are gone.
 pub struct ImapMessageSummary {
     pub uid: i64,
-    /// The `From` list, kept flattened because the daemon reads one entry from
-    /// it to feed the correspondent index (`addresses` table). Same JSON
-    /// shape as `headers.from`, so it is never a second format.
+
     pub from: String,
     pub is_read: bool,
     pub is_starred: bool,
     pub has_attachments: bool,
     pub preview: String,
-    /// Every header, and the only place subject/date/threading fields live.
+
     pub headers: MessageHeaders,
 }
 
@@ -347,8 +263,6 @@ pub struct EmailAttachment {
     pub filename: String,
 }
 
-/// Signals emitted over D-Bus (`app.pelliper.Daemon`) to notify frontends
-/// of state transitions in real time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonSignal {
     NewMailReceived {

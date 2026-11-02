@@ -1,5 +1,3 @@
-//! D-Bus interface (`app.pelliper.Daemon`) implementation.
-
 use crate::imap;
 use crate::outbox::send_with_auth;
 use crate::spawn_worker;
@@ -14,8 +12,6 @@ impl Daemon {
         self.workers.lock().unwrap().get(&account_id).cloned()
     }
 
-    /// Ensure a worker exists for the given account (used for newly-added
-    /// accounts at runtime).
     fn ensure_worker(&self, account: &Account) {
         let existing = self.workers.lock().unwrap().contains_key(&account.id);
         if existing {
@@ -35,7 +31,6 @@ impl Daemon {
 
 #[interface(name = "app.pelliper.Daemon")]
 impl Daemon {
-    /// Emitted when new mail arrives in a folder (via IMAP IDLE push or poll).
     #[zbus(signal, name = "NewMailReceived")]
     pub async fn new_mail_received(
         signal_ctxt: &SignalEmitter<'_>,
@@ -44,7 +39,6 @@ impl Daemon {
         count: i32,
     ) -> zbus::Result<()>;
 
-    /// Emitted when a folder's unread count changes.
     #[zbus(signal, name = "FolderUnreadChanged")]
     pub async fn folder_unread_changed(
         signal_ctxt: &SignalEmitter<'_>,
@@ -53,7 +47,6 @@ impl Daemon {
         unread_count: i32,
     ) -> zbus::Result<()>;
 
-    /// Emitted when a message's read or starred flag changes.
     #[zbus(signal, name = "MessageFlagsChanged")]
     pub async fn message_flags_changed(
         signal_ctxt: &SignalEmitter<'_>,
@@ -64,7 +57,6 @@ impl Daemon {
         is_starred: bool,
     ) -> zbus::Result<()>;
 
-    /// Emitted when a pending outbox email is successfully delivered via SMTP.
     #[zbus(signal, name = "OutboxItemSent")]
     pub async fn outbox_item_sent(
         signal_ctxt: &SignalEmitter<'_>,
@@ -72,7 +64,6 @@ impl Daemon {
         item_id: i64,
     ) -> zbus::Result<()>;
 
-    /// Check if any accounts exist in the database.
     async fn has_accounts(&self) -> bool {
         let cache = self.cache.lock().await;
         match cache.account_count() {
@@ -84,8 +75,6 @@ impl Daemon {
         }
     }
 
-    /// Add an account, test IMAP connection, and save to database.
-    /// Returns true on success, false on failure.
     async fn add_account(
         &self,
         email: &str,
@@ -101,7 +90,6 @@ impl Daemon {
     ) -> bool {
         tracing::info!("add_account: {} ({} {})", email, auth_type, provider);
 
-        // Check if account already exists
         {
             let cache = self.cache.lock().await;
             if let Ok(exists) = cache.account_exists(email) {
@@ -112,7 +100,6 @@ impl Daemon {
             }
         }
 
-        // Test IMAP connection
         let imap_ok = if auth_type == "oauth" {
             imap::test_connection_oauth(imap_host, imap_port as u16, email, auth_token).await
         } else {
@@ -126,7 +113,6 @@ impl Daemon {
             );
         }
 
-        // Save account to database
         let account = Account {
             id: 0,
             email: email.to_string(),
@@ -175,8 +161,6 @@ impl Daemon {
                     .and_then(|accounts| accounts.into_iter().find(|a| a.id == id))
             };
             if let Some(a) = saved_account {
-                // Start a background worker for the new account. It bootstraps
-                // (cold cache) and handles sync + IDLE.
                 self.ensure_worker(&a);
             }
         }
@@ -184,8 +168,6 @@ impl Daemon {
         saved_id.is_some()
     }
 
-    /// Remove an account and all its data (folders, messages, bodies, attachments).
-    /// Returns true on success.
     async fn remove_account(&self, account_id: i64) -> bool {
         tracing::info!("D-Bus: remove_account id={}", account_id);
 
@@ -207,7 +189,6 @@ impl Daemon {
         }
     }
 
-    /// Trigger a full sync of all enabled accounts (route to each worker).
     async fn sync_all(&self) -> bool {
         tracing::info!("D-Bus: sync_all requested");
         let workers: Vec<worker::WorkerHandle> =
@@ -218,7 +199,6 @@ impl Daemon {
         true
     }
 
-    /// Trigger a sync of a specific account by email.
     async fn sync_account(&self, email: &str) -> bool {
         tracing::info!("D-Bus: sync_account requested for {}", email);
         let account = {
@@ -249,7 +229,6 @@ impl Daemon {
         }
     }
 
-    /// Get folders for an account. Returns JSON array.
     async fn get_folders(&self, account_id: i64) -> String {
         let cache = self.cache.lock().await;
         match cache.load_folders(account_id) {
@@ -261,7 +240,6 @@ impl Daemon {
         }
     }
 
-    /// Get messages for a folder. Returns JSON array.
     async fn get_messages(
         &self,
         account_id: i64,
@@ -279,14 +257,11 @@ impl Daemon {
         }
     }
 
-    /// Get total message count for a folder.
     async fn count_messages(&self, account_id: i64, folder_path: &str) -> i64 {
         let cache = self.cache.lock().await;
         cache.count_messages(account_id, folder_path).unwrap_or(0)
     }
 
-    /// Tell the account's worker to watch a specific folder for real-time
-    /// updates (IDLE) and sync its first page.
     async fn set_idle_folder(&self, account_id: i64, folder_path: &str) {
         tracing::info!(
             "D-Bus: set_idle_folder account={} folder={}",
@@ -300,8 +275,6 @@ impl Daemon {
         }
     }
 
-    /// Search the address book for autocomplete. Returns JSON array of
-    /// `{email, name}` objects.
     async fn search_addresses(&self, query: &str) -> String {
         let cache = self.cache.lock().await;
         match cache.search_addresses(query, 10) {
@@ -316,31 +289,26 @@ impl Daemon {
         }
     }
 
-    /// Check if an email address is a known sender (exists in address book).
     async fn is_known_address(&self, email: &str) -> bool {
         let cache = self.cache.lock().await;
         cache.is_known_address(email).unwrap_or(false)
     }
 
-    /// Block a sender (remote content will be suppressed).
     async fn block_sender(&self, sender_email: &str) {
         let cache = self.cache.lock().await;
         let _ = cache.set_sender_policy(sender_email, true, false);
     }
 
-    /// Unblock a sender.
     async fn unblock_sender(&self, sender_email: &str) {
         let cache = self.cache.lock().await;
         let _ = cache.remove_sender_policy(sender_email);
     }
 
-    /// Check if a sender is blocked.
     async fn is_sender_blocked(&self, sender_email: &str) -> bool {
         let cache = self.cache.lock().await;
         cache.is_sender_blocked(sender_email).unwrap_or(false)
     }
 
-    /// Load all sender block/allow policies. Returns JSON array.
     async fn load_sender_policies(&self) -> String {
         let cache = self.cache.lock().await;
         match cache.load_sender_policies() {
@@ -357,7 +325,6 @@ impl Daemon {
         }
     }
 
-    /// Mark a message read/unread.
     async fn set_message_read(&self, account_id: i64, folder_path: &str, uid: i64, read: bool) {
         if let Some(handle) = self.get_worker(account_id) {
             handle.send(worker::WorkerRequest::SetFlags {
@@ -369,7 +336,6 @@ impl Daemon {
         }
     }
 
-    /// Star/unstar a message.
     async fn set_message_starred(
         &self,
         account_id: i64,
@@ -387,7 +353,6 @@ impl Daemon {
         }
     }
 
-    /// Move a message to a folder, or to Trash when `dest_folder` is empty.
     async fn move_message(&self, account_id: i64, folder_path: &str, uid: i64, dest_folder: &str) {
         if let Some(handle) = self.get_worker(account_id) {
             handle.send(worker::WorkerRequest::MoveMessage {
@@ -402,7 +367,6 @@ impl Daemon {
         }
     }
 
-    /// Delete a message: move to Trash if not already there, otherwise permanently delete.
     async fn delete_message(&self, account_id: i64, folder_path: &str, uid: i64) {
         if let Some(handle) = self.get_worker(account_id) {
             handle.send(worker::WorkerRequest::DeleteMessage {
@@ -412,7 +376,6 @@ impl Daemon {
         }
     }
 
-    /// Create a new IMAP folder.
     async fn create_folder(&self, account_id: i64, name: &str) {
         if let Some(handle) = self.get_worker(account_id) {
             handle.send(worker::WorkerRequest::CreateFolder {
@@ -421,7 +384,6 @@ impl Daemon {
         }
     }
 
-    /// Rename an IMAP folder.
     async fn rename_folder(&self, account_id: i64, old_name: &str, new_name: &str) {
         if let Some(handle) = self.get_worker(account_id) {
             handle.send(worker::WorkerRequest::RenameFolder {
@@ -431,7 +393,6 @@ impl Daemon {
         }
     }
 
-    /// Delete an IMAP folder.
     async fn delete_folder(&self, account_id: i64, name: &str) {
         if let Some(handle) = self.get_worker(account_id) {
             handle.send(worker::WorkerRequest::DeleteFolder {
@@ -440,11 +401,7 @@ impl Daemon {
         }
     }
 
-    /// Load the body of a message. Returns HTML.
-    /// Serves from cache when available; otherwise the worker fetches + caches
-    /// and a second call returns the cached body.
     async fn load_body(&self, account_id: i64, folder_path: &str, uid: i64) -> String {
-        // Check cache first
         {
             let cache = self.cache.lock().await;
             if let Ok(Some(html)) = cache.load_body(account_id, folder_path, uid) {
@@ -460,7 +417,6 @@ impl Daemon {
             uid
         );
 
-        // Delegate to the worker; await its response.
         if let Some(handle) = self.get_worker(account_id) {
             let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
             handle.send(worker::WorkerRequest::LoadBody {
@@ -476,12 +432,6 @@ impl Daemon {
         "<p>No worker available for account</p>".to_string()
     }
 
-    /// List downloaded attachments for a message.
-    ///
-    /// Serves from the attachments table; when nothing is stored yet but the
-    /// message was flagged as having attachments, asks the worker to fetch and
-    /// parse the body (which persists them) before re-reading the table.
-    /// Returns JSON array of `{name, file_path, content_type, size}`.
     async fn list_attachments(&self, account_id: i64, folder_path: &str, uid: i64) -> String {
         let has_attachments = {
             let cache = self.cache.lock().await;
@@ -505,8 +455,6 @@ impl Daemon {
             }
         };
 
-        // No cached attachments: if the message claims to have them, the body
-        // (and thus the attachment list) hasn't been fetched yet — pull it now.
         if has_attachments {
             if let Some(handle) = self.get_worker(account_id) {
                 let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -527,8 +475,6 @@ impl Daemon {
         }
     }
 
-    /// Send an email via the account's SMTP relay. Returns an error string on
-    /// failure (empty string on success).
     async fn send_email(
         &self,
         account_id: i64,
@@ -557,8 +503,6 @@ impl Daemon {
             None => return "Account not found".to_string(),
         };
 
-        // Resolve threading headers when replying: In-Reply-To set to the
-        // original message-id, References = original chain + this message-id.
         let (mut in_reply_to, mut references) = (None, None);
         if reply_uid > 0 {
             let refs_opt = {
@@ -581,7 +525,6 @@ impl Daemon {
         let in_reply_to = in_reply_to.as_deref();
         let references = references.as_deref();
 
-        // Parse attachment paths from JSON array: ["path1","path2"]
         let attachments: Vec<EmailAttachment> = if !attachment_paths.is_empty() {
             serde_json::from_str(attachment_paths).unwrap_or_default()
         } else {
@@ -608,8 +551,6 @@ impl Daemon {
                 String::new()
             }
             Err(e) => {
-                // Persist the message so the background flusher retries it once
-                // the connection recovers.
                 let msg = format!("SMTP send failed; queued for retry: {}", e);
                 tracing::error!("{}", msg);
                 {

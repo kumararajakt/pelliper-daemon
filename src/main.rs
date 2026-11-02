@@ -21,8 +21,6 @@ use types::{Account, DaemonSignal, SignalSender};
 use zbus::connection::Builder;
 use zbus::object_server::SignalEmitter;
 
-/// Spawn a background worker for one account and return its handle.
-/// Handles are stored in a map so the D-Bus layer can route requests.
 fn spawn_worker(
     account: &Account,
     cache: Arc<Mutex<Cache>>,
@@ -64,7 +62,6 @@ async fn main() {
         .install_default()
         .expect("Failed to install rustls crypto provider");
 
-    // Load .env file from data dir or current directory
     let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("pelliper");
@@ -94,8 +91,6 @@ async fn main() {
 
     let (signal_tx, mut signal_rx) = tokio::sync::mpsc::unbounded_channel::<DaemonSignal>();
 
-    // Spawn a background worker per enabled account. Each worker owns an IMAP
-    // session and runs the priority-ordered sync/backfill/prefetch/IDLE loop.
     let workers: Arc<std::sync::Mutex<HashMap<i64, worker::WorkerHandle>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
     {
@@ -132,15 +127,12 @@ async fn main() {
         signal_tx: Some(signal_tx.clone()),
     };
 
-    // Background outbox flusher: retries messages that failed to send until
-    // the connection recovers (also flushes anything queued before startup).
     tokio::spawn(crate::outbox::outbox_flusher(
         cache.clone(),
         secrets,
         Some(signal_tx),
     ));
 
-    // Register on D-Bus session bus
     let conn = Builder::session()
         .expect("Failed to connect to D-Bus session bus")
         .name("app.pelliper.Daemon")
@@ -199,6 +191,5 @@ async fn main() {
         }
     });
 
-    // Keep the daemon running
     std::future::pending::<()>().await;
 }

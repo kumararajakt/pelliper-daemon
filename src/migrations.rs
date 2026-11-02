@@ -1,34 +1,5 @@
-//! Ordered, transactional schema migrations.
-//!
-//! Historically the schema was created by `Cache::create_tables`: a batch of
-//! `CREATE TABLE IF NOT EXISTS` statements plus a handful of probe-guarded
-//! `ALTER TABLE`s, while `PRAGMA user_version` was written but never read. That
-//! meant a column added to a released schema silently failed to apply to an
-//! existing database (gap #8). This module replaces that with explicit,
-//! ordered, transactional steps.
-//!
-//! `PRAGMA user_version` holds the number of migrations applied so far, so a
-//! database at version `v` needs `MIGRATIONS[v..]` run. Each migration is
-//! applied in its own transaction together with the `user_version` bump, so a
-//! failure leaves the database exactly at its previous version. A database
-//! written by a newer build (a higher `user_version` than this build knows) is
-//! rejected rather than opened and mangled.
-//!
-//! The search index is *not* here: `messages_fts` has its own lifecycle
-//! (`Cache::fts_init`) because migrating it means detecting the old contentful
-//! shape, dropping legacy triggers, and rebuilding from `messages` — logic a
-//! plain SQL migration cannot express.
-
 use rusqlite::{Connection, Result};
 
-/// The schema as of the first tracked migration (version 1). Every statement is
-/// `IF NOT EXISTS`, so replaying it is harmless — it exists so a *fresh*
-/// database gets the whole baseline in one step.
-///
-/// Databases written before this module existed were stamped `user_version = 1`
-/// unconditionally and kept at the current shape by startup probes, so they
-/// skip this migration; [`ensure_legacy_columns`] covers the one case where
-/// such a database can still lag (a column added by a historical probe).
 const M001_INIT: &str = "
     CREATE TABLE IF NOT EXISTS accounts (
         id INTEGER PRIMARY KEY,
@@ -235,28 +206,17 @@ const M001_INIT: &str = "
         ON sync_failures (account_id, retry_at);
 ";
 
-/// Ordered migrations: index `i` upgrades `user_version = i` to `i + 1`.
 pub const MIGRATIONS: &[&str] = &[M001_INIT];
 
-/// Highest `user_version` this build understands.
 pub fn latest_version() -> i64 {
     MIGRATIONS.len() as i64
 }
 
-/// Bring a connection up to [`latest_version`].
-///
-/// Applies every migration the database has not seen, each in its own
-/// transaction alongside the `user_version` bump, then repairs the handful of
-/// columns that pre-migration databases added via startup probes. Errors if the
-/// database is newer than this build.
 pub fn run(conn: &Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let latest = latest_version();
 
     if version > latest {
-        // `SQLITE_NOTADB` is what SQLite itself reports for a file whose format
-        // is newer than this version understands, which is exactly the situation:
-        // the message is what the caller sees (rusqlite's `Display` prefers it).
         return Err(rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
             Some(format!(
@@ -266,8 +226,6 @@ pub fn run(conn: &Connection) -> Result<()> {
         ));
     }
 
-    // `skip(version)` is what makes this safe: a database already at `version`
-    // re-runs nothing, and a fresh one (0) runs everything in order.
     for (index, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(migration)?;
@@ -279,14 +237,6 @@ pub fn run(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add the columns that pre-migration databases used to acquire through
-/// probe-guarded `ALTER TABLE`s in `create_tables`.
-///
-/// Such a database carries the unreliable `user_version = 1` stamp and skips
-/// [`M001_INIT`], so a column added by a historical probe would otherwise be
-/// missing for good. This is idempotent (it checks `PRAGMA table_info` first) and
-/// is a bridge for those databases only; new columns must go through
-/// [`MIGRATIONS`] instead.
 fn ensure_legacy_columns(conn: &Connection) -> Result<()> {
     let columns: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(folders)")?;

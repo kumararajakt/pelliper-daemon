@@ -6,22 +6,19 @@ pub struct TokenResponse {
     pub access_token: String,
     #[allow(dead_code)]
     pub token_type: String,
-    /// Seconds until the access token expires (typically 3600).
+
     pub expires_in: Option<u64>,
-    /// A new refresh token may be issued on refresh (Google rotates them).
+
     pub refresh_token: Option<String>,
 }
 
 impl TokenResponse {
-    /// Compute the absolute Unix timestamp when this token expires.
-    /// Falls back to 1 hour from now if the server didn't specify.
     pub fn expires_at(&self) -> i64 {
         let secs = self.expires_in.unwrap_or(3600);
         chrono::Utc::now().timestamp() + secs as i64
     }
 }
 
-/// Refresh an OAuth2 access token using a refresh token.
 pub async fn refresh_access_token(
     token_endpoint: &str,
     client_id: &str,
@@ -33,8 +30,7 @@ pub async fn refresh_access_token(
         ("client_id", client_id),
         ("refresh_token", refresh_token),
     ];
-    // Public clients (e.g. the Microsoft loopback flow) must not present a
-    // client_secret at all — an empty one is rejected as AADSTS700025.
+
     if !client_secret.is_empty() {
         params.push(("client_secret", client_secret));
     }
@@ -53,9 +49,7 @@ pub async fn refresh_access_token(
     Ok(token)
 }
 
-/// Token endpoint and client-credential env var names for one OAuth provider.
 pub struct ProviderConfig {
-    /// Short provider id, matching the UI's `OAuth2` provider ids.
     pub id: &'static str,
     pub token_endpoint: &'static str,
     pub client_id_env: &'static str,
@@ -76,8 +70,6 @@ const MICROSOFT: ProviderConfig = ProviderConfig {
     client_secret_env: "PELLIPER_MICROSOFT_CLIENT_SECRET",
 };
 
-/// Guess a provider id from an email domain, mirroring the UI's
-/// `OAuth2::detectProvider`. Only used when `accounts.provider` is unset.
 fn provider_from_email(email: &str) -> Option<&'static str> {
     let domain = email.rsplit('@').next()?.to_ascii_lowercase();
     match domain.as_str() {
@@ -88,7 +80,6 @@ fn provider_from_email(email: &str) -> Option<&'static str> {
     }
 }
 
-/// Map a provider id to its configuration.
 pub fn config_for_id(id: &str) -> Result<&'static ProviderConfig, String> {
     match id.trim().to_ascii_lowercase().as_str() {
         "google" => Ok(&GOOGLE),
@@ -97,8 +88,6 @@ pub fn config_for_id(id: &str) -> Result<&'static ProviderConfig, String> {
     }
 }
 
-/// Resolve the OAuth provider for an account: the stored `provider` column
-/// when present, otherwise inferred from the email domain.
 pub fn provider_for(account: &Account) -> Result<&'static ProviderConfig, String> {
     if let Some(provider) = account
         .provider
@@ -119,7 +108,6 @@ pub fn provider_for(account: &Account) -> Result<&'static ProviderConfig, String
         .and_then(config_for_id)
 }
 
-/// Read the client credentials for a provider from the environment.
 pub fn client_credentials(provider: &ProviderConfig) -> Result<(String, String), String> {
     let client_id = std::env::var(provider.client_id_env).map_err(|_| {
         format!(

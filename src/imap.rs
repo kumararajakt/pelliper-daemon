@@ -12,32 +12,15 @@ use futures::StreamExt;
 use crate::types::{FolderKind, ImapFolder, ImapMessageSummary, MessageHeaders};
 
 pub type CompatTls = tokio_util::compat::Compat<TlsStream<TcpStream>>;
-/// The authenticated IMAP session type used by the worker.
+
 pub type ImapSession = async_imap::Session<CompatTls>;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IMAP_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Summary fetch query: UID, flags, body structure, the server-computed
-/// `ENVELOPE`, and the two threading headers `ENVELOPE` has no field for.
-///
-/// `ENVELOPE` covers the ten RFC2822 fields the server can decode for us, and
-/// is the only source of `To`/`Cc`/`Bcc`/`Reply-To`. It has exactly ten
-/// fields and **no `references`**, so `HEADER.FIELDS (REFERENCES
-/// IN-REPLY-TO)` is fetched alongside it: `src/threadmodel.cpp` builds its
-/// union-find from `references_`, and with it empty every message would be
-/// its own thread root.
-///
-/// The field list is deliberately narrow. Fetching the whole block
-/// (`BODY.PEEK[HEADER]`) cost ~5.6 KB per message — almost entirely
-/// `Return-Path`, `DKIM-Signature`, `ARC-Seal` and `Received`, none of which
-/// anything reads. `PEEK` keeps `\Seen` unset.
-///
-/// Both attributes cost the same round trip: this is one FETCH either way.
 const SUMMARY_FETCH_QUERY: &str =
     "(UID FLAGS BODYSTRUCTURE ENVELOPE BODY.PEEK[HEADER.FIELDS (REFERENCES IN-REPLY-TO)])";
 
-/// Inline preview characters kept per summary.
 const PREVIEW_CHARS: usize = 240;
 
 pub async fn test_connection_oauth(host: &str, port: u16, email: &str, access_token: &str) -> bool {
@@ -56,9 +39,7 @@ pub async fn test_connection_oauth(host: &str, port: u16, email: &str, access_to
 
     let result = timeout(IMAP_TIMEOUT, async {
         let mut client = async_imap::Client::new(stream.compat());
-        // Consume the server greeting: async-imap's `authenticate` does not
-        // read it before AUTHENTICATE, which deadlocks against Gmail's
-        // XOAUTH2 flow (chatmail/async-imap issue #84).
+
         client.read_response().await?.ok_or("no server greeting")?;
         let auth = XoAuth2 {
             user: email.to_owned(),
@@ -120,11 +101,6 @@ pub async fn test_connection_password(host: &str, port: u16, email: &str, passwo
     }
 }
 
-/// XOAUTH2 SASL authenticator for async-imap's `Client::authenticate`.
-///
-/// async-imap drives the base64 SASL exchange; this type supplies the initial
-/// client response that Gmail's XOAUTH2 expects. The server greeting must be
-/// consumed before authenticating (see `connect_session_oauth`).
 struct XoAuth2 {
     user: String,
     access_token: String,
@@ -141,7 +117,6 @@ impl async_imap::Authenticator for &XoAuth2 {
     }
 }
 
-/// Connect via XOAUTH2 and return a live authenticated session.
 pub async fn connect_session_oauth(
     host: &str,
     port: u16,
@@ -151,10 +126,6 @@ pub async fn connect_session_oauth(
     let stream = connect_tls_stream(host, port).await?;
     let mut client = async_imap::Client::new(stream.compat());
 
-    // Consume the server greeting before authenticating: async-imap's
-    // `authenticate` sends AUTHENTICATE immediately and never reads the
-    // greeting, which deadlocks Gmail's XOAUTH2 flow (chatmail/async-imap
-    // issue #84, maintainer-confirmed workaround).
     client.read_response().await?.ok_or("no server greeting")?;
 
     let auth = XoAuth2 {
@@ -168,7 +139,6 @@ pub async fn connect_session_oauth(
     Ok(session)
 }
 
-/// Connect with a password and return a live authenticated session.
 pub async fn connect_session_password(
     host: &str,
     port: u16,
@@ -176,7 +146,7 @@ pub async fn connect_session_password(
     password: &str,
 ) -> Result<ImapSession, Box<dyn std::error::Error + Send + Sync>> {
     let client = connect_tls(host, port).await?;
-    // `login` reads responses in a loop and skips the greeting itself.
+
     let session = client
         .login(email, password)
         .await
@@ -184,7 +154,6 @@ pub async fn connect_session_password(
     Ok(session)
 }
 
-/// Connect to an IMAP server with TLS, returning the raw TLS stream.
 async fn connect_tls_stream(
     host: &str,
     port: u16,
@@ -206,7 +175,6 @@ async fn connect_tls_stream(
     Ok(tls_stream)
 }
 
-/// Connect to an IMAP server with TLS, returning an async-imap Client.
 async fn connect_tls(
     host: &str,
     port: u16,
@@ -217,14 +185,6 @@ async fn connect_tls(
     Ok(client)
 }
 
-// ---------------------------------------------------------------------------
-// Session management for sync
-// ---------------------------------------------------------------------------
-
-/// Read a folder's UIDVALIDITY, the value that tells us whether the server's
-/// UIDs are still the ones we cached. EXAMINE avoids taking a writable lock.
-/// Returns 0 when the server does not report one, which callers must treat as
-/// "unknown" rather than as a change.
 pub async fn folder_uidvalidity(
     session: &mut ImapSession,
     folder: &str,
@@ -233,9 +193,6 @@ pub async fn folder_uidvalidity(
     Ok(mailbox.uid_validity.map(i64::from).unwrap_or(0))
 }
 
-/// EXAMINE a folder once and return everything the sync loop needs:
-/// `(uidvalidity, exists, uid_next)` — 0 / None when the server does not
-/// report them. One round trip instead of probing each value separately.
 pub async fn examine_folder(
     session: &mut ImapSession,
     folder: &str,
@@ -248,18 +205,11 @@ pub async fn examine_folder(
     ))
 }
 
-/// The highest UID implied by `UIDNEXT`, but only when the server metadata is
-/// internally consistent — Flectar's rule. UIDs are unique positive integers,
-/// so `UIDNEXT - 1` (the highest UID ever assigned) cannot sit below the
-/// number of live messages; an inconsistent or absent UIDNEXT reads as
-/// "untrusted" and the caller falls back to SEARCH.
 fn trusted_highest_uid(exists: u32, uid_next: Option<u32>) -> Option<u32> {
     let high = uid_next?.checked_sub(1)?;
     (high >= exists).then_some(high)
 }
 
-/// The mailbox's highest UID: `UIDNEXT - 1` when consistent with EXISTS,
-/// otherwise the maximum of `UID SEARCH ALL`. Returns 0 for an empty mailbox.
 pub async fn mailbox_highest_uid(
     session: &mut ImapSession,
     folder: &str,
@@ -285,10 +235,6 @@ pub async fn mailbox_highest_uid(
     }
 }
 
-/// Every UID strictly above `last_seen`: `UID SEARCH UID (last_seen+1):*`.
-/// The client-side filter is load-bearing, not redundant — when `last_seen`
-/// is above the mailbox's highest UID the `n:*` range reverses (RFC 3501) and
-/// could return that older highest UID.
 pub async fn uid_search_after(
     session: &mut ImapSession,
     folder: &str,
@@ -309,8 +255,6 @@ pub async fn uid_search_after(
     ))
 }
 
-/// Keep only the UIDs strictly above `last_seen`, sorted ascending and
-/// deduped (SEARCH results are a set, but ordering must not be assumed).
 fn filter_uids_after(uids: Vec<i64>, last_seen: i64) -> Vec<i64> {
     let mut uids: Vec<i64> = uids.into_iter().filter(|u| *u > last_seen).collect();
     uids.sort_unstable();
@@ -318,11 +262,6 @@ fn filter_uids_after(uids: Vec<i64>, last_seen: i64) -> Vec<i64> {
     uids
 }
 
-/// Fetch the newest `limit` message summaries for a folder, newest first.
-///
-/// Uses a *sequence-number* range (`{last}:*`) so the page is the newest
-/// `limit` messages even when UIDs are sparse — the old UID FETCH {exists}:*
-/// only returned the single newest message on a fresh mailbox.
 pub async fn fetch_recent_summaries(
     session: &mut ImapSession,
     folder: &str,
@@ -356,7 +295,6 @@ pub async fn fetch_recent_summaries(
     Ok(summaries)
 }
 
-/// Fetch summaries for an explicit UID set.
 pub async fn fetch_summaries_by_uids(
     session: &mut ImapSession,
     folder: &str,
@@ -381,11 +319,6 @@ pub async fn fetch_summaries_by_uids(
     Ok(summaries)
 }
 
-/// Fetch just (UID, is_read, is_starred) flags for an explicit UID set.
-///
-/// Used for lightweight reconciliation: detects expunges (messages missing
-/// from the returned set) and flags altered by other clients without the
-/// cost of full header parsing.
 pub async fn fetch_uid_flags(
     session: &mut ImapSession,
     folder: &str,
@@ -419,7 +352,6 @@ pub async fn fetch_uid_flags(
     Ok(results)
 }
 
-/// All UIDs in a folder (from UID SEARCH ALL), for backfill planning.
 pub async fn fetch_all_uids(
     session: &mut ImapSession,
     folder: &str,
@@ -429,7 +361,6 @@ pub async fn fetch_all_uids(
     Ok(uids.into_iter().map(|u| u as i64).collect())
 }
 
-/// Fetch the raw RFC822 body of one message.
 pub async fn fetch_body(
     session: &mut ImapSession,
     folder: &str,
@@ -450,8 +381,6 @@ pub async fn fetch_body(
     Ok(body)
 }
 
-/// Add/remove message flags by UID. The caller must have SELECTed the folder
-/// (read-write); STORE requires a writable mailbox.
 pub async fn store_flags(
     session: &mut ImapSession,
     uid: i64,
@@ -479,13 +408,11 @@ pub async fn store_flags(
     Ok(())
 }
 
-/// List all folders, classifying each by SPECIAL-USE attribute with a
-/// name-heuristic fallback (same contract as `FolderKind::as_str`).
 pub async fn list_folders(
     session: &mut ImapSession,
 ) -> Result<Vec<ImapFolder>, Box<dyn std::error::Error + Send + Sync>> {
     let mut folders = Vec::new();
-    // Parallel to `folders`: whether the kind came from a SPECIAL-USE attribute.
+
     let mut by_attribute: Vec<bool> = Vec::new();
     let stream = session
         .list(None, Some("*"))
@@ -508,13 +435,6 @@ pub async fn list_folders(
     Ok(folders)
 }
 
-/// Classify a mailbox, also reporting whether the kind came from an RFC 6154
-/// SPECIAL-USE attribute (`true`) rather than name matching (`false`).
-///
-/// The flag is what lets `list_folders` prefer the server's real special-use
-/// folder when it also exposes a stray folder that merely *looks* like it fills
-/// the same role — e.g. Gmail's `[Gmail]/Trash` (`\Trash`) sitting next to a
-/// plain top-level `Trash` label.
 pub fn classify_with_source(path: &str, attrs: &[NameAttribute]) -> (FolderKind, bool) {
     let mut kind = FolderKind::Custom;
     let mut from_attribute = false;
@@ -538,21 +458,11 @@ pub fn classify_with_source(path: &str, attrs: &[NameAttribute]) -> (FolderKind,
         from_attribute = true;
     }
     if !from_attribute {
-        // Servers without RFC 6154 support (Outlook/Exchange, older Dovecot)
-        // send no attributes at all, so the name heuristic is the only signal
-        // they will ever produce.
         kind = FolderKind::from_path(path);
     }
     (kind, from_attribute)
 }
 
-/// When a role has a real SPECIAL-USE folder, demote any name-matched impostor
-/// of that role to `Custom`.
-///
-/// Without this, a stray folder such as a plain top-level `Trash` label can
-/// shadow the server's actual `[Gmail]/Trash`, and mail "deleted" into it never
-/// leaves the mailbox — it just gains a label, while the sidebar shows the role
-/// twice. `Inbox` is excluded: it is never resolved by heuristic lookup.
 pub fn demote_name_matched_impostors(folders: &mut [ImapFolder], by_attribute: &[bool]) {
     for role in [
         FolderKind::Sent,
@@ -582,18 +492,6 @@ pub fn demote_name_matched_impostors(folders: &mut [ImapFolder], by_attribute: &
     }
 }
 
-/// Convert a library `Fetch` response into an `ImapMessageSummary`.
-///
-/// The typed `ENVELOPE` supplies every address and scalar header, and
-/// `HEADER.FIELDS (REFERENCES IN-REPLY-TO)` — which imap-proto also normalizes
-/// to `SectionPath::Full(Header)`, so `fetch.header()` returns it — supplies
-/// the two fields ENVELOPE cannot express. Whichever the server populated wins,
-/// envelope first, so servers that omit one still produce a full row.
-/// Attachments come from the typed BODYSTRUCTURE.
-///
-/// `preview` is read from the `BODY[1]` partial (`SectionPath::Part([1], None)`),
-/// which `SUMMARY_FETCH_QUERY` does not currently request — so it is always
-/// empty until a `BODY.PEEK[1]<0.N>` item is added back to the query.
 fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
     let uid = fetch.uid.unwrap_or(0) as i64;
     if uid == 0 {
@@ -615,8 +513,6 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
         .map(bodystructure_has_attachments)
         .unwrap_or(false);
 
-    // Inline preview from the BODY[1] partial; absent because the fetch query
-    // does not request it, so this is always empty.
     let preview = fetch
         .section(&SectionPath::Part(vec![1], None))
         .map(preview_from_unknown)
@@ -626,10 +522,6 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
     let header_text = String::from_utf8_lossy(header_bytes);
     let env = fetch.envelope();
 
-    // ENVELOPE is now the *only* source for these: the fetched header block
-    // holds just References and In-Reply-To, so there is nothing to fall back
-    // to for the rest. A server that omits ENVELOPE therefore yields empty
-    // scalars — it would also break every other IMAP client.
     let subject = env
         .and_then(|e| envelope_scalar(e.subject.as_deref()))
         .unwrap_or_default();
@@ -643,9 +535,6 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
         .and_then(|e| envelope_scalar(e.in_reply_to.as_deref()))
         .unwrap_or_default();
 
-    // The six address lists, each already JSON. A list the server did not send
-    // is the empty array, and so is a wholly absent ENVELOPE, so the column
-    // contract in `cache.rs` ("absent is `[]`, not NULL") holds either way.
     const NO_ADDRESSES: &str = "[]";
     let (from, from_hdr, reply_to, to, cc, bcc) = match &env {
         Some(e) => (
@@ -654,7 +543,6 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
             envelope_addresses(e.reply_to.as_deref()),
             envelope_addresses(e.to.as_deref()),
             envelope_addresses(e.cc.as_deref()),
-            // Stripped by the sending MTA, so ENVELOPE rarely carries it.
             envelope_addresses(e.bcc.as_deref()),
         ),
         None => (
@@ -669,17 +557,12 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
 
     let date = parse_date(&date_header);
 
-    // Message-IDs are normalized (angle brackets / comments stripped) so that
-    // threading links match no matter which source supplied them — the UI's
-    // union-find in `src/threadmodel.cpp` compares these strings verbatim.
     let message_id = normalize_message_id(&raw_message_id);
     let mut in_reply_to = normalize_references(&envelope_in_reply_to);
     if in_reply_to.is_empty() {
         in_reply_to = normalize_references(&parse_header(&header_text, "In-Reply-To"));
     }
-    // `References` has no ENVELOPE field, so the header block is its only
-    // source. Fall back to In-Reply-To so a single-level reply still threads
-    // when the sender omitted References.
+
     let references_raw = parse_header(&header_text, "References");
     let references = if references_raw.is_empty() {
         in_reply_to.clone()
@@ -721,8 +604,6 @@ fn summary_from_fetch(fetch: &Fetch) -> Option<ImapMessageSummary> {
     })
 }
 
-/// The first `{name, email}` entry of a stored address header, for indexing a
-/// single correspondent (e.g. the sender autocomplete).
 pub fn first_address(list_json: &str) -> Option<(String, String)> {
     #[derive(serde::Deserialize)]
     struct Entry {
@@ -740,31 +621,17 @@ pub fn first_address(list_json: &str) -> Option<(String, String)> {
     }
 }
 
-/// Decode an `ENVELOPE` scalar (date, subject, in-reply-to, message-id).
-/// Returns `None` for NIL so the caller can fall back to the header block.
 fn envelope_scalar(value: Option<&[u8]>) -> Option<String> {
     let raw = value.filter(|b| !b.is_empty())?;
     Some(decode_rfc2047(&String::from_utf8_lossy(raw)))
 }
 
-/// One entry of a stored address header, serialized into the JSON array that
-/// lives in the `*_addr` columns of `message_headers`.
-///
-/// `name` and `email` are always present (possibly empty strings) so the UI
-/// never has to test for a missing key.
 #[derive(serde::Serialize)]
 struct AddressEntry {
     name: String,
     email: String,
 }
 
-/// Format an `ENVELOPE` address list as a JSON array of `{name, email}`
-/// objects, e.g. `[{"name":"Alice","email":"alice@example.com"}]`.
-///
-/// Structured rather than a flat display string so recipients stay
-/// addressable: group syntax (a `host` of NIL) yields an entry with an empty
-/// `email` and the group name in `name`, which a display string would lose.
-/// The UI turns one of these back into display text on read.
 fn envelope_addresses(list: Option<&[Address<'_>]>) -> String {
     let entries: Vec<AddressEntry> = list
         .unwrap_or_default()
@@ -775,7 +642,6 @@ fn envelope_addresses(list: Option<&[Address<'_>]>) -> String {
     serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Split one `ENVELOPE` address into its personal name and addr-spec.
 fn envelope_address(addr: &Address<'_>) -> AddressEntry {
     let part = |v: Option<&[u8]>| -> String {
         v.filter(|b| !b.is_empty())
@@ -784,10 +650,7 @@ fn envelope_address(addr: &Address<'_>) -> AddressEntry {
     };
     let mailbox = part(addr.mailbox.as_deref());
     let host = part(addr.host.as_deref());
-    // A NIL host with a non-empty mailbox is group syntax: the mailbox holds
-    // the *group name*, not an addr-spec, so it belongs in `name` with an
-    // empty `email`. Putting it in `email` would hand the UI something that
-    // looks addressable but is not.
+
     let (name_from_mailbox, email) = if mailbox.is_empty() {
         (String::new(), host)
     } else if host.is_empty() {
@@ -811,11 +674,6 @@ fn envelope_address(addr: &Address<'_>) -> AddressEntry {
     }
 }
 
-/// Parse an address header out of a raw header block into the same JSON shape
-/// `envelope_addresses` produces, so both write paths agree on one format.
-///
-/// Used only by the body-fetch path, which has the whole message; the FETCH
-/// path gets structured addresses from ENVELOPE directly.
 fn address_list_from_raw(value: &str) -> String {
     let entries: Vec<AddressEntry> = split_address_list(value)
         .into_iter()
@@ -824,19 +682,12 @@ fn address_list_from_raw(value: &str) -> String {
     serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Split one address into `(email, display name)`.
-///
-/// Takes the last `<...>` as the addr-spec and everything before it as the
-/// display name; with no angle brackets the whole thing is the addr-spec.
-/// Strips RFC2047 encoding from the name, matching `envelope_address`.
 fn parse_one_address(one: &str) -> Option<(String, String)> {
     let one = one.trim();
     if one.is_empty() {
         return None;
     }
-    // Group syntax, e.g. `undisclosed-recipients:;`. The name is the group
-    // label; there is no addr-spec, matching how `envelope_address` treats a
-    // NIL host.
+
     if let Some(group) = one.strip_suffix(":;") {
         let group = group.trim();
         return if group.is_empty() {
@@ -860,8 +711,6 @@ fn parse_one_address(one: &str) -> Option<(String, String)> {
     }
 }
 
-/// Split an address header on top-level commas, respecting quoted strings and
-/// angle brackets so `Doe, Jane <j@x>` stays in one piece.
 fn split_address_list(value: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut current = String::new();
@@ -891,22 +740,15 @@ fn split_address_list(value: &str) -> Vec<String> {
     parts.into_iter().map(|p| p.trim().to_string()).collect()
 }
 
-/// Split a raw RFC822 message into its header block and body.
-///
-/// Returns everything before the first blank line, excluding that line's own
-/// terminator, so the result is exactly the header lines. Handles both CRLF
-/// and bare-LF endings. A message with no blank line is treated as
-/// all-headers rather than erroring.
 pub fn split_header_block(raw: &[u8]) -> &[u8] {
     let mut start = 0usize;
     while start < raw.len() {
         let Some(rel) = raw[start..].iter().position(|&b| b == b'\n') else {
-            break; // unterminated final line
+            break;
         };
         let line_end = start + rel;
-        // An empty line ("\n") or a bare CR ("\r\n") ends the header block.
+
         if raw[start..line_end].iter().all(|&b| b == b'\r') {
-            // Drop the terminator of the header line above it.
             return match raw[..start].strip_suffix(b"\r\n") {
                 Some(block) => block,
                 None => raw[..start].strip_suffix(b"\n").unwrap_or(&raw[..start]),
@@ -917,19 +759,6 @@ pub fn split_header_block(raw: &[u8]) -> &[u8] {
     raw
 }
 
-/// Build a `MessageHeaders` from a complete raw RFC822 message — the
-/// `BODY.PEEK[]` payload.
-///
-/// The body-fetch path already holds every header, so this fills in
-/// `message_headers` at no extra network cost. It covers messages the
-/// header-only FETCH never reached (older mail, backfill that has not run)
-/// and refreshes rows whose ENVELOPE fields were previously empty.
-/// Build a `MessageHeaders` from a complete raw RFC822 message.
-///
-/// Used by the body-fetch path, which already has the whole message in hand,
-/// so it reads every header directly. Address fields go out in the same JSON
-/// shape the FETCH path produces, so the two paths agree on one column format
-/// — that matters because they can write the same message in either order.
 pub fn headers_from_raw_message(raw: &[u8]) -> MessageHeaders {
     let block = split_header_block(raw);
     let text = String::from_utf8_lossy(block);
@@ -949,7 +778,7 @@ pub fn headers_from_raw_message(raw: &[u8]) -> MessageHeaders {
         date_ts: parse_date(&date),
         date,
         in_reply_to: in_reply_to.clone(),
-        // Same fallback the FETCH path applies, so both agree on one column.
+
         references: if references_raw.is_empty() {
             in_reply_to
         } else {
@@ -959,17 +788,12 @@ pub fn headers_from_raw_message(raw: &[u8]) -> MessageHeaders {
     }
 }
 
-/// Detect attachments from a typed BODYSTRUCTURE: a part with a name/filename
-/// parameter, an explicit `attachment` disposition, or a non-text top-level
-/// type (application/image/video/audio/font/model). Mirrors the old raw
-/// BODYSTRUCTURE text heuristic.
 fn bodystructure_has_attachments(bs: &BodyStructure<'_>) -> bool {
     match bs {
         BodyStructure::Multipart { bodies, .. } => bodies.iter().any(bodystructure_has_attachments),
         BodyStructure::Basic { common, .. }
         | BodyStructure::Text { common, .. }
         | BodyStructure::Message { common, .. } => {
-            // A name/filename parameter directly signals an attachment.
             let named = common.ty.params.as_ref().is_some_and(|params| {
                 params.iter().any(|(k, _)| {
                     k.eq_ignore_ascii_case("name") || k.eq_ignore_ascii_case("filename")
@@ -984,7 +808,7 @@ fn bodystructure_has_attachments(bs: &BodyStructure<'_>) -> bool {
             if named {
                 return true;
             }
-            // Explicit attachment disposition.
+
             if common
                 .disposition
                 .as_ref()
@@ -992,7 +816,7 @@ fn bodystructure_has_attachments(bs: &BodyStructure<'_>) -> bool {
             {
                 return true;
             }
-            // Non-text top-level type → treated as a binary attachment.
+
             let main = common.ty.ty.to_ascii_lowercase();
             matches!(
                 main.as_str(),
@@ -1002,9 +826,6 @@ fn bodystructure_has_attachments(bs: &BodyStructure<'_>) -> bool {
     }
 }
 
-/// Build an inline preview from raw fetched bytes when the transfer encoding
-/// is unknown (raw session path). Heuristic: base64 if it looks like base64,
-/// otherwise apply quoted-printable decoding (a no-op for plain ASCII).
 fn preview_from_unknown(bytes: &[u8]) -> String {
     let cleaned: Vec<u8> = bytes
         .iter()
@@ -1029,8 +850,6 @@ fn preview_from_unknown(bytes: &[u8]) -> String {
     clean_preview(&decode_quoted_printable(bytes))
 }
 
-/// Normalize preview bytes into clean display text: strip HTML tags, collapse
-/// whitespace, and truncate to PREVIEW_CHARS characters.
 fn clean_preview(raw: &[u8]) -> String {
     let mut text = String::from_utf8_lossy(raw).to_string();
     if text.contains('<') && text.contains('>') {
@@ -1044,7 +863,6 @@ fn clean_preview(raw: &[u8]) -> String {
         .collect()
 }
 
-/// Remove HTML tags (text between '<' and '>'), keeping the text in between.
 fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
@@ -1059,8 +877,6 @@ fn strip_html_tags(s: &str) -> String {
     out
 }
 
-/// Decode quoted-printable: `=XX` hex escapes and soft line breaks (`=\r\n`).
-/// Safe for plain text (unrecognized `=` is kept as-is).
 fn decode_quoted_printable(bytes: &[u8]) -> Vec<u8> {
     fn hex_val(b: u8) -> Option<u8> {
         match b {
@@ -1091,8 +907,6 @@ fn decode_quoted_printable(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Parse a single header value from raw RFC822 headers.
-/// Handles folded headers (continuation lines starting with whitespace).
 fn parse_header(headers: &str, name: &str) -> String {
     let mut result = String::new();
     let mut found = false;
@@ -1104,7 +918,6 @@ fn parse_header(headers: &str, name: &str) -> String {
                 found = true;
             }
         } else if line.starts_with(' ') || line.starts_with('\t') {
-            // RFC 822 continuation line — append with a space
             result.push(' ');
             result.push_str(&decode_rfc2047(line.trim()));
         } else {
@@ -1114,8 +927,6 @@ fn parse_header(headers: &str, name: &str) -> String {
     result
 }
 
-/// Strip RFC 5322 comments from a header value.  Comments are balanced
-/// `(...)` groups; the comment text itself is discarded.
 fn strip_rfc_comments(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut depth = 0usize;
@@ -1130,15 +941,10 @@ fn strip_rfc_comments(s: &str) -> String {
     out
 }
 
-/// Extract all Message-IDs from a raw header value (References, In-Reply-To,
-/// or Message-ID), returning their canonical form: angle brackets removed,
-/// whitespace trimmed, RFC 5322 comments skipped.  Entities without `@` are
-/// only kept when angle-bracketed (strict ID form).
 fn extract_message_ids(raw: &str) -> Vec<String> {
     let text = strip_rfc_comments(raw);
     let mut ids = Vec::new();
 
-    // Angle-bracketed ids, handled first so comments can't confuse them.
     let mut rest = text.trim();
     while let Some(open) = rest.find('<') {
         let tail = &rest[open + 1..];
@@ -1154,7 +960,6 @@ fn extract_message_ids(raw: &str) -> Vec<String> {
         }
     }
 
-    // Remaining bare tokens that mention '@' (non-bracketed ids).
     for tok in rest.split_whitespace() {
         let tok = tok.trim_matches(|c| c == ',' || c == ';' || c == '<' || c == '>');
         if tok.contains('@') && !tok.is_empty() && !ids.iter().any(|i| i == tok) {
@@ -1162,14 +967,11 @@ fn extract_message_ids(raw: &str) -> Vec<String> {
         }
     }
 
-    // Dedup preserving first occurrence.
     let mut seen = std::collections::HashSet::new();
     ids.retain(|id| seen.insert(id.clone()));
     ids
 }
 
-/// Canonical form of a single Message-ID header value (or "") — the first
-/// id token, without angle brackets or comments.
 fn normalize_message_id(raw: &str) -> String {
     extract_message_ids(raw)
         .into_iter()
@@ -1177,13 +979,10 @@ fn normalize_message_id(raw: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Canonical form of a References / In-Reply-To header value: the extracted
-/// Message-IDs, space-separated.  Empty string when no ids are present.
 fn normalize_references(raw: &str) -> String {
     extract_message_ids(raw).join(" ")
 }
 
-/// Decode RFC 2047 encoded words: =?charset?encoding?text?=
 fn decode_rfc2047(input: &str) -> String {
     use rfc2047_decoder::{Decoder, RecoverStrategy};
     match Decoder::new()
@@ -1195,26 +994,21 @@ fn decode_rfc2047(input: &str) -> String {
     }
 }
 
-/// Parse an RFC822 date string into a Unix timestamp (best-effort).
 fn parse_date(date_str: &str) -> i64 {
     if date_str.is_empty() {
         return 0;
     }
-    // Try chrono parsing
+
     use chrono::DateTime;
     if let Ok(dt) = DateTime::parse_from_rfc2822(date_str) {
         return dt.timestamp();
     }
-    // Fallback: try common formats
+
     if let Ok(dt) = DateTime::parse_from_str(date_str, "%d %b %Y %H:%M:%S %z") {
         return dt.timestamp();
     }
     0
 }
-
-// ---------------------------------------------------------------------------
-// MIME body parsing (via mail-parser crate)
-// ---------------------------------------------------------------------------
 
 pub struct ParsedAttachment {
     pub name: String,
@@ -1229,9 +1023,6 @@ pub struct ParsedBody {
     pub attachments: Vec<ParsedAttachment>,
 }
 
-/// Parse a raw RFC822 message into HTML + plain text parts, plus the list of
-/// real attachments (binary parts with a filename or an `attachment`
-/// disposition; inline `cid:` images are excluded).
 pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
     use mail_parser::{MimeHeaders, PartType};
 
@@ -1255,8 +1046,7 @@ pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
             .content_disposition()
             .map(|cd| cd.c_type.eq_ignore_ascii_case("attachment"))
             .unwrap_or(false);
-        // Skip parts that are neither dispositioned as attachments nor named:
-        // typically embedded inline images (logo, emoji) referenced by cid:.
+
         if !is_attachment && name.is_empty() {
             continue;
         }
@@ -1275,7 +1065,6 @@ pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
         });
     }
 
-    // Collect HTML parts
     let mut html = String::new();
     for part in parsed.html_bodies() {
         match &part.body {
@@ -1287,7 +1076,6 @@ pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
         }
     }
 
-    // Collect plain text parts
     let mut text = String::new();
     for part in parsed.text_bodies() {
         match &part.body {
@@ -1299,16 +1087,12 @@ pub fn parse_message_body(raw: &[u8]) -> ParsedBody {
         }
     }
 
-    // Check for attachments (matches the downloadable list above, so the
-    // paperclip indicator tracks the attachment panel).
     let has_attachments = !attachments.is_empty();
 
-    // If no HTML but we have text, wrap in <pre>
     if html.is_empty() && !text.is_empty() {
         html = format!("<pre>{}</pre>", html_escape(&text));
     }
 
-    // If still empty, try body_text as fallback
     ParsedBody {
         html,
         text,
@@ -1326,8 +1110,6 @@ fn html_escape(input: &str) -> String {
         .replace('\'', "&#39;")
 }
 
-/// Whether the server advertises support for the IDLE extension. The IDLE
-/// extension lets the server push mailbox changes without the client polling.
 pub async fn supports_idle(session: &mut ImapSession) -> bool {
     match session.capabilities().await {
         Ok(caps) => caps.has_str("IDLE"),

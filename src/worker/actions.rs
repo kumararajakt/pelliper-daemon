@@ -1,24 +1,8 @@
-//! Execution of the durable action ledger.
-//!
-//! Both paths into a mutation go through here: the interactive handlers enqueue
-//! then call [`Worker::process_action`] once for immediate feedback, and the
-//! worker's priority loop calls [`Worker::drain_one_action`] to retry whatever is
-//! due. A successful action applies its local cache effect and is dropped; a
-//! failed one is rescheduled with backoff or dropped when the error is permanent
-//! (policy in `crate::actions`).
-//!
-//! This is what makes flags/move/delete survive being offline: the intent lives
-//! in `pending_actions` until the server accepts it, rather than being logged
-//! and forgotten (which is all gap #5's gating could do on its own).
-
 use super::Worker;
 use crate::actions::{backoff_secs_jittered, retry_decision, RetryDecision};
 use crate::types::{ActionKind, DaemonSignal, MovePayload, PendingAction, SetFlagsPayload};
 
 impl Worker {
-    /// Claim and process one due queued action. Returns `true` when one was
-    /// claimed (whether it succeeded, was rescheduled, or was dropped), so the
-    /// caller loops; `false` when the queue is quiet.
     pub(super) async fn drain_one_action(&mut self) -> bool {
         let now = chrono::Utc::now().timestamp();
         let action = {
@@ -34,11 +18,6 @@ impl Worker {
         }
     }
 
-    /// Execute an action and reconcile the cache.
-    ///
-    /// On success the local effect is applied and the ledger row removed; on
-    /// failure the row is rescheduled with backoff, or dropped when
-    /// [`retry_decision`] says the error is permanent or attempts are exhausted.
     pub(super) async fn process_action(&mut self, action: PendingAction) {
         match self.execute_action(&action).await {
             Ok(()) => {
@@ -91,9 +70,6 @@ impl Worker {
         }
     }
 
-    /// Run the IMAP operation for an action, refreshing a stale OAuth token and
-    /// retrying once — the same recovery the interactive path used before the
-    /// ledger existed.
     async fn execute_action(&mut self, action: &PendingAction) -> Result<(), String> {
         self.ensure_session().await?;
         match self.try_action_op(action).await {
@@ -112,8 +88,6 @@ impl Worker {
         }
     }
 
-    /// Dispatch one action to its IMAP operation. No auth retry here; the
-    /// caller wraps it.
     async fn try_action_op(&mut self, action: &PendingAction) -> Result<(), String> {
         match action.kind {
             ActionKind::SetFlags => {
@@ -133,8 +107,6 @@ impl Worker {
         }
     }
 
-    /// Apply the action's local cache effect, now that the server accepted it.
-    /// Mirrors the inline behaviour the handlers used before the ledger existed.
     async fn apply_local_effect(&mut self, action: &PendingAction) {
         match action.kind {
             ActionKind::SetFlags => {
@@ -227,9 +199,6 @@ impl Worker {
     }
 }
 
-/// Translate the `is_read` / `is_starred` options into IMAP flag add/remove
-/// lists. Shared by the interactive handler and the retry drain so a queued flag
-/// change replays exactly what the user asked for. `None` touches nothing.
 pub(super) fn flags_to_add_remove(
     is_read: Option<bool>,
     is_starred: Option<bool>,

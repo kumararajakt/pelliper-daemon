@@ -50,7 +50,6 @@ fn stored_provider_wins_over_domain() {
     let acc = account("user@contoso.com", Some("microsoft"));
     assert_eq!(provider_for(&acc).unwrap().id, "microsoft");
 
-    // A gmail address explicitly marked as Microsoft must not be sent to Google.
     let acc = account("user@gmail.com", Some("microsoft"));
     assert_eq!(provider_for(&acc).unwrap().id, "microsoft");
 }

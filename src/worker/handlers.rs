@@ -1,6 +1,3 @@
-//! Worker request dispatch: user-initiated operations (folders, flags,
-//! move/delete, load body) driven by the D-Bus layer.
-
 use super::{Worker, WorkerRequest};
 use crate::imap;
 use crate::types::{ActionKind, MovePayload, SetFlagsPayload, SyncStage};
@@ -62,7 +59,6 @@ impl Worker {
     }
 
     async fn handle_load_body(&mut self, folder_path: &str, uid: i64) -> String {
-        // Check cache first.
         {
             let cache = self.cache.lock().await;
             if let Ok(Some(html)) = cache.load_body(self.account.id, folder_path, uid) {
@@ -70,7 +66,6 @@ impl Worker {
             }
         }
 
-        // Fetch from IMAP (retry once with a fresh connection).
         match self.fetch_single_body(folder_path, uid).await {
             Ok((html, has_attachments)) => {
                 let cache = self.cache.lock().await;
@@ -87,7 +82,6 @@ impl Worker {
                 html
             }
             Err(e) => {
-                // On auth error, invalidate token so reconnect gets a fresh one
                 if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" {
                     tracing::warn!(
                         "Worker[{}]: auth error in load_body, refreshing token",
@@ -118,9 +112,7 @@ impl Worker {
                     }
                     Err(e) => {
                         let err = e.to_string();
-                        // Both attempts failed: record it so the body is
-                        // fetched in the background even if the UI never
-                        // re-opens the message.
+
                         self.note_sync_failure(folder_path, uid, SyncStage::Body, &err)
                             .await;
                         format!("<p>Failed to load message: {err}</p>")
@@ -131,13 +123,6 @@ impl Worker {
     }
 
     async fn handle_sync_all(&mut self) {
-        // SyncAll is the UI's startup trigger and the "sync now" switch. Make
-        // sure the session is live first: `connect()` refreshes the folder list
-        // from the server, so a cache holding stale messages but an empty
-        // folder table (empty sidebar) self-heals instead of iterating zero
-        // folders and doing nothing. `connect()` only lists folders — it does
-        // not fetch first pages — so a fresh cache stays empty until something
-        // requests a sync.
         if let Err(e) = self.ensure_session().await {
             tracing::error!("Worker[{}]: sync_all: no session: {}", self.account.id, e);
             return;
@@ -165,12 +150,6 @@ impl Worker {
         }
     }
 
-    /// Record a mutation as a durable intent and try it immediately. On success
-    /// that is the end of it; on failure the row stays queued and the worker's
-    /// drain loop retries it with backoff (`worker/actions.rs`).
-    ///
-    /// Enqueue-before-attempt is the point: a crash or disconnect between the
-    /// two leaves a recoverable row rather than a lost user action.
     async fn enqueue_and_process(
         &mut self,
         folder_path: &str,
@@ -198,8 +177,6 @@ impl Worker {
         self.process_action(action).await;
     }
 
-    /// Apply read/starred flag changes to a message (STORE + local cache),
-    /// then refresh the folder's unread count.
     async fn handle_set_flags(
         &mut self,
         folder_path: &str,
@@ -216,7 +193,6 @@ impl Worker {
             .await;
     }
 
-    /// Internal helper: select folder and store flags (may fail with auth error).
     pub(super) async fn do_set_flags(
         &mut self,
         folder_path: &str,
@@ -238,18 +214,12 @@ impl Worker {
         Ok(())
     }
 
-    /// Move a message to a destination folder (or Trash when None). Uses
-    /// UID MOVE where available, falling back to COPY + \Deleted + EXPUNGE.
     async fn handle_move_message(
         &mut self,
         folder_path: &str,
         uid: i64,
         dest_folder: Option<String>,
     ) {
-        // Best-effort folder-list refresh: role resolution reads the cache, and
-        // an offline account must still get its intent queued for retry, so a
-        // failed connect here is not fatal (it will be attempted again by
-        // `process_action`).
         let _ = self.ensure_session().await;
 
         let dest = match dest_folder {
@@ -302,8 +272,7 @@ impl Worker {
             .select(folder_path)
             .await
             .map_err(|e| e.to_string())?;
-        // `uid_mv` fails (tagged error) when the server lacks RFC 6851; fall
-        // back to COPY + \Deleted + EXPUNGE.
+
         if let Err(e) = session.uid_mv(uid.to_string(), dest).await {
             tracing::info!(
                 "Worker[{}]: UID MOVE unsupported ({}), using COPY + EXPUNGE",
@@ -324,7 +293,6 @@ impl Worker {
         Ok(())
     }
 
-    /// Internal helper: select folder, mark \Deleted, and EXPUNGE (may fail).
     pub(super) async fn do_expunge(&mut self, folder_path: &str, uid: i64) -> Result<(), String> {
         let session = self
             .session
@@ -343,30 +311,17 @@ impl Worker {
         Ok(())
     }
 
-    /// Delete a message: if already in a Trash folder, permanently remove it
-    /// (flag \Deleted + EXPUNGE); otherwise move it to Trash as a soft delete.
     async fn handle_delete_message(&mut self, folder_path: &str, uid: i64) {
-        // Best-effort folder-list refresh only: role resolution reads the cache,
-        // and an offline account must still get its intent queued for retry
-        // (see the durable action ledger).
         let _ = self.ensure_session().await;
 
-        // Consult the classified folder list, not the folder's name. `list_folders`
-        // demotes name-matched impostors when the server exposes a real SPECIAL-USE
-        // trash, so a user folder that merely happens to be called "Deleted" is a
-        // normal folder here and takes the soft delete instead of an EXPUNGE.
         let in_trash = self
             .is_role_folder(folder_path, crate::types::FolderKind::Trash)
             .await;
 
         if in_trash {
-            // Permanently delete: \Deleted + EXPUNGE.
             self.enqueue_and_process(folder_path, uid, ActionKind::Delete, "{}".to_string())
                 .await;
         } else {
-            // Soft delete: move to Trash. The destination is resolved now and
-            // captured in the payload, so a retry after a restart does not
-            // depend on the folder list still classifying the same way.
             let trash = match self
                 .resolve_role_folder(crate::types::FolderKind::Trash)
                 .await
@@ -412,7 +367,7 @@ impl Worker {
             tracing::error!("Worker[{}]: create folder failed: {}", self.account.id, e);
             return;
         }
-        // Refresh the folder list so the sidebar picks up the new folder.
+
         match imap::list_folders(session).await {
             Ok(folders) => {
                 let cache = self.cache.lock().await;
@@ -444,7 +399,7 @@ impl Worker {
             tracing::error!("Worker[{}]: rename folder failed: {}", self.account.id, e);
             return;
         }
-        // Refresh the folder list.
+
         match imap::list_folders(session).await {
             Ok(folders) => {
                 let cache = self.cache.lock().await;
@@ -476,7 +431,7 @@ impl Worker {
             tracing::error!("Worker[{}]: delete folder failed: {}", self.account.id, e);
             return;
         }
-        // Remove from cache and refresh list.
+
         {
             let cache = self.cache.lock().await;
             let _ = cache.delete_folder(self.account.id, name);

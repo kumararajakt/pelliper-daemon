@@ -10,9 +10,6 @@ pub struct Cache {
     conn: Connection,
 }
 
-/// Build the search-index row for one message. `LEFT JOIN bodies` so a message
-/// whose body has not been fetched yet is still searchable by its headers. The
-/// rowid is `messages.rowid`, which is what a search hit joins back on.
 const INDEX_FTS_SQL: &str = "\
 INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body)
 SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html
@@ -23,8 +20,6 @@ LEFT JOIN bodies b
   ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid
 WHERE m.account_id = ?1 AND m.folder_path = ?2 AND m.uid = ?3";
 
-/// Rebuild every index row: [`INDEX_FTS_SQL`] without the per-message filter.
-/// Messages with no header row are skipped (nothing to index).
 const BACKFILL_FTS_SQL: &str = "\
 INSERT INTO messages_fts(rowid, subject, sender, preview, message_id, body)
 SELECT m.rowid, h.subject, h.from_addr, m.preview, h.message_id, b.html
@@ -34,20 +29,14 @@ JOIN message_headers h
 LEFT JOIN bodies b
   ON b.account_id = m.account_id AND b.folder_path = m.folder_path AND b.uid = m.uid";
 
-/// Delete the index row(s) for one message. Resolves the rowid through the live
-/// `messages` row, so it must run before that row is deleted.
 const DEINDEX_MESSAGE_SQL: &str = "\
 DELETE FROM messages_fts WHERE rowid IN
     (SELECT rowid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3)";
 
-/// Delete the index rows for a whole folder; see [`DEINDEX_MESSAGE_SQL`] on
-/// ordering.
 const DEINDEX_FOLDER_SQL: &str = "\
 DELETE FROM messages_fts WHERE rowid IN
     (SELECT rowid FROM messages WHERE account_id = ?1 AND folder_path = ?2)";
 
-/// Delete the index rows for a whole account; see [`DEINDEX_MESSAGE_SQL`] on
-/// ordering.
 const DEINDEX_ACCOUNT_SQL: &str = "\
 DELETE FROM messages_fts WHERE rowid IN
     (SELECT rowid FROM messages WHERE account_id = ?1)";
@@ -63,40 +52,11 @@ impl Cache {
         Ok(Self { conn })
     }
 
-    /// Bring the schema up to the version this build expects by running any
-    /// pending migrations (see [`crate::migrations`]).
-    ///
-    /// This replaces the old `create_tables`: schema changes now go through the
-    /// migration runner, so a column added to a released schema actually applies
-    /// to an existing database instead of being a `CREATE TABLE IF NOT EXISTS`
-    /// no-op. The search index has its own initializer ([`Cache::fts_init`]),
-    /// which keeps its create/migrate/reindex logic out of plain SQL.
     pub fn migrate(&self) -> Result<()> {
         crate::migrations::run(&self.conn)
     }
 
-    /// Create the full-text search index (FTS5).
-    ///
-    /// The index is **contentless** (`content=''`): the text is tokenized but
-    /// not stored a second time, and there are **no triggers**. Instead the
-    /// writers that change searchable content call [`Cache::index_message`] /
-    /// [`Cache::deindex_message`] explicitly. That is deliberate: the old
-    /// whole-row-rebuild triggers were fragile — a partial-column INSERT
-    /// against an existing FTS5 rowid fails and rolls back the *enclosing*
-    /// statement, which once silently discarded every cached body (see
-    /// `saving_a_body_indexes_it_instead_of_rolling_the_insert_back`).
-    ///
-    /// A contentless table cannot be updated in place, so `index_message`
-    /// deletes then re-inserts; `contentless_delete=1` (SQLite 3.43+) is what
-    /// makes that DELETE legal. Rows are keyed on `messages.rowid`, so a search
-    /// hit joins straight back to the message.
-    ///
-    /// Databases written before this change still hold the contentful table and
-    /// its triggers. `fts_init` drops the triggers and, when it finds the old
-    /// shape, rebuilds the table and reindexes from `messages`.
     pub fn fts_init(&self) -> Result<()> {
-        // The triggers are the thing being removed; drop them unconditionally
-        // so an upgraded database cannot keep firing them.
         self.conn.execute_batch(
             "DROP TRIGGER IF EXISTS message_headers_fts_ai;
              DROP TRIGGER IF EXISTS message_headers_fts_au;
@@ -108,8 +68,6 @@ impl Cache {
         )?;
 
         if !self.fts_is_current()? {
-            // Old contentful table (or none): drop and recreate. The index is
-            // rebuilt from `messages` by the backfill below, so nothing is lost.
             self.conn
                 .execute_batch("DROP TABLE IF EXISTS messages_fts;")?;
         }
@@ -123,9 +81,6 @@ impl Cache {
         self.backfill_fts()
     }
 
-    /// Whether `messages_fts` already exists in the current (contentless)
-    /// shape. A table written by an older build stores its content and must be
-    /// rebuilt.
     fn fts_is_current(&self) -> Result<bool> {
         let sql: Option<String> = self
             .conn
@@ -140,9 +95,6 @@ impl Cache {
             .unwrap_or(false))
     }
 
-    /// Rebuild the whole index from `messages` + `message_headers` + `bodies`,
-    /// but only when it is empty — so an existing cache is indexed on the first
-    /// run (or after a shape rebuild) without doing work every startup.
     fn backfill_fts(&self) -> Result<()> {
         let count: i64 = self
             .conn
@@ -153,9 +105,6 @@ impl Cache {
         Ok(())
     }
 
-    /// (Re)build one message's search-index row. Contentless FTS5 cannot update
-    /// in place, so the row is deleted first (a no-op if it was never indexed).
-    /// A message with no header row is left out — there is nothing to index.
     fn index_message(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<()> {
         self.deindex_message(account_id, folder_path, uid)?;
         self.conn.execute(
@@ -165,8 +114,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Drop one message's search-index row. The rowid is resolved through the
-    /// live `messages` row, so this must run before the message is deleted.
     fn deindex_message(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<()> {
         self.conn.execute(
             DEINDEX_MESSAGE_SQL,
@@ -175,8 +122,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Drop the index rows for every message in a folder. Must run before the
-    /// folder's `messages` rows are deleted.
     fn deindex_folder(&self, account_id: i64, folder_path: &str) -> Result<()> {
         self.conn.execute(
             DEINDEX_FOLDER_SQL,
@@ -185,8 +130,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Drop the index rows for every message in an account. Must run before the
-    /// account's `messages` rows are deleted.
     fn deindex_account(&self, account_id: i64) -> Result<()> {
         self.conn
             .execute(DEINDEX_ACCOUNT_SQL, rusqlite::params![account_id])?;
@@ -260,10 +203,7 @@ impl Cache {
         Ok(count > 0)
     }
 
-    /// Delete an account and all its folders, messages, bodies, and attachments.
     pub fn remove_account(&self, account_id: i64) -> Result<()> {
-        // Foreign keys with ON DELETE CASCADE handle messages/bodies/folders.
-        // The search index has no FK, so clear it before the messages go.
         self.deindex_account(account_id)?;
         self.conn.execute(
             "DELETE FROM attachments WHERE account_id = ?1",
@@ -333,7 +273,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Update the read/starred flags of one message in place.
     pub fn update_message_flags(
         &self,
         account_id: i64,
@@ -359,11 +298,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Update the read/starred flags of multiple messages in bulk.
-    ///
-    /// Skips rows whose flags already match the target values to avoid
-    /// redundant disk writes. Returns the `(uid, is_read, is_starred)` of
-    /// rows actually modified.
     pub fn update_message_flags_bulk(
         &mut self,
         account_id: i64,
@@ -398,7 +332,6 @@ impl Cache {
         Ok(updated)
     }
 
-    /// Read the (is_read, is_starred) flags of a cached message.
     pub fn message_flags(
         &self,
         account_id: i64,
@@ -417,11 +350,6 @@ impl Cache {
         Ok(result)
     }
 
-    /// Move a message (and its cached headers and body) from one folder to
-    /// another.  All three tables are keyed by the same composite key, so each
-    /// is copied before the source row is deleted (which cascades the rest).
-    /// The search-index row is re-keyed from the source rowid to the
-    /// destination's while both rows exist.
     pub fn move_message(
         &self,
         account_id: i64,
@@ -454,8 +382,7 @@ impl Cache {
              WHERE account_id = ?1 AND folder_path = ?3 AND uid = ?4",
             rusqlite::params![account_id, to_folder, from_folder, uid],
         )?;
-        // Reindex under the destination before the source row disappears; the
-        // source's index row is keyed on its old `messages.rowid`.
+
         self.index_message(account_id, to_folder, uid)?;
         self.deindex_message(account_id, from_folder, uid)?;
         self.conn.execute(
@@ -465,8 +392,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Remove a message row (and its cascade-deleted body), and its search-index
-    /// row.
     pub fn delete_message(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<()> {
         self.deindex_message(account_id, folder_path, uid)?;
         self.conn.execute(
@@ -476,7 +401,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Remove a folder (and all its messages via CASCADE) from the cache.
     pub fn delete_folder(&self, account_id: i64, path: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM folders WHERE account_id = ?1 AND path = ?2",
@@ -485,8 +409,6 @@ impl Cache {
         Ok(())
     }
 
-    /// The stored UIDVALIDITY for a folder, or 0 when it has never been
-    /// observed (a missing folder row also reads as 0).
     pub fn folder_uidvalidity(&self, account_id: i64, folder_path: &str) -> Result<i64> {
         let result = self.conn.query_row(
             "SELECT uidvalidity FROM folders WHERE account_id = ?1 AND path = ?2",
@@ -500,7 +422,6 @@ impl Cache {
         }
     }
 
-    /// Record the UIDVALIDITY the server currently reports for a folder.
     pub fn set_folder_uidvalidity(
         &self,
         account_id: i64,
@@ -514,14 +435,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Drop every cached message in a folder, used when the server reassigns
-    /// UIDs (a UIDVALIDITY change) and `(folder, uid)` can no longer be
-    /// trusted. Message headers and bodies cascade; attachment rows are keyed
-    /// without a foreign key, so they are removed explicitly. Search-index rows
-    /// are removed first (there are no triggers). The sync cursors are reset
-    /// too — they are meaningless once the UID space is invalidated, as are any
-    /// queued fetch retries for the old UIDs.
-    /// Returns the number of messages removed.
     pub fn clear_folder_messages(&self, account_id: i64, folder_path: &str) -> Result<usize> {
         self.deindex_folder(account_id, folder_path)?;
         let removed = self.conn.execute(
@@ -544,10 +457,6 @@ impl Cache {
         Ok(removed)
     }
 
-    /// The folder's persisted sync cursors: `(last_seen_uid, backfill_cursor)`.
-    /// `last_seen_uid` is the forward high-water mark (0 = never synced);
-    /// `backfill_cursor` is the top of the next history window (None = never
-    /// planned, Some(0) = complete). An unknown folder reads as a fresh one.
     pub fn folder_sync_state(
         &self,
         account_id: i64,
@@ -565,8 +474,6 @@ impl Cache {
         }
     }
 
-    /// Advance (or initialize) a folder's forward high-water UID. Only ever
-    /// grows: incremental sync asks for UIDs strictly above this.
     pub fn set_folder_last_seen_uid(
         &self,
         account_id: i64,
@@ -580,8 +487,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Persist history-backfill progress: the top of the next UID window to
-    /// fetch. `Some(0)` marks the folder fully backfilled.
     pub fn set_folder_backfill_cursor(
         &self,
         account_id: i64,
@@ -595,7 +500,6 @@ impl Cache {
         Ok(())
     }
 
-    /// UIDs of messages cached in a given range [lo, hi] (inclusive), ascending.
     pub fn cached_uids_in_range(
         &self,
         account_id: i64,
@@ -616,8 +520,6 @@ impl Cache {
         Ok(uids)
     }
 
-    /// Delete messages by UID, removing their FTS index entries, cached
-    /// attachments, and sync-failure records.
     pub fn delete_messages(
         &mut self,
         account_id: i64,
@@ -630,8 +532,6 @@ impl Cache {
         let mut removed = 0;
         let tx = self.conn.transaction()?;
         for uid in uids {
-            // Deindex before the message row goes, so the rowid subquery
-            // resolves; the transaction keeps the two in step.
             tx.execute(
                 DEINDEX_MESSAGE_SQL,
                 rusqlite::params![account_id, folder_path, uid],
@@ -653,8 +553,6 @@ impl Cache {
         Ok(removed)
     }
 
-    /// The lowest UID already cached in a folder, if any. Used to seed the
-    /// history cursor so an existing cache is not re-downloaded.
     pub fn min_cached_uid(&self, account_id: i64, folder_path: &str) -> Result<Option<i64>> {
         let min: Option<i64> = self.conn.query_row(
             "SELECT MIN(uid) FROM messages WHERE account_id = ?1 AND folder_path = ?2",
@@ -683,12 +581,6 @@ impl Cache {
         Ok(folders)
     }
 
-    /// Page through a folder's messages, newest first.
-    ///
-    /// Header columns are joined in from `message_headers`; recency sorts on
-    /// `h.date_ts` (the parsed timestamp), never `h.date` (the raw header
-    /// string, which sorts lexically). A LEFT JOIN keeps a message visible
-    /// even if its header row is missing.
     pub fn load_messages(
         &self,
         account_id: i64,
@@ -713,9 +605,7 @@ impl Cache {
                         uid: row.get(0)?,
                         subject: row.get(1)?,
                         sender: row.get(2)?,
-                        // NULL when the LEFT JOIN found no header row; a
-                        // headerless message sorts as epoch rather than
-                        // failing the whole page load.
+
                         date: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
                         in_reply_to: row.get(4)?,
                         message_id: row.get(5)?,
@@ -740,8 +630,6 @@ impl Cache {
         Ok(count)
     }
 
-    /// UIDs of messages flagged as having attachments but with no attachment
-    /// files stored yet, newest first. Used by the attachment prefetch queue.
     pub fn messages_missing_attachments(
         &self,
         account_id: i64,
@@ -771,7 +659,6 @@ impl Cache {
         Ok(uids)
     }
 
-    /// Count unread messages for a folder (from DB, not IMAP).
     pub fn count_unread(&self, account_id: i64, folder_path: &str) -> Result<i32> {
         let count: i32 = self.conn.query_row(
             "SELECT COUNT(*) FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND is_read = 0",
@@ -781,7 +668,6 @@ impl Cache {
         Ok(count)
     }
 
-    /// Load cached body HTML for a message. Returns None if not cached.
     pub fn load_body(
         &self,
         account_id: i64,
@@ -800,17 +686,6 @@ impl Cache {
         }
     }
 
-    /// The threading headers of one message — `(message_id, references_)` — for
-    /// building a reply.
-    ///
-    /// Reads from `message_headers`, which is where they live. Returns `None`
-    /// when the message has no header row at all, and `None` fields when the
-    /// message predates header caching.
-    ///
-    /// This is reply construction, *not* thread resolution: the daemon never
-    /// groups messages into threads (gap #9, threading is UI-owned). Callers
-    /// wanting a whole conversation should read `Cache::load_messages` and let
-    /// the UI do the JWZ pass.
     pub fn message_refs(
         &self,
         account_id: i64,
@@ -835,15 +710,6 @@ impl Cache {
         }
     }
 
-    /// Save a message's complete header block plus its decoded ENVELOPE
-    /// fields.  The row is keyed to `messages` by (account_id, folder_path,
-    /// uid) and cascades on delete, so callers must have upserted the message
-    /// itself first — a header row with no parent would fail the foreign key.
-    /// Empty input is skipped rather than stored as an empty shell.
-    ///
-    /// This write also (re)builds the message's search-index row, because
-    /// `message_headers` owns the indexed header columns (there are no FTS
-    /// triggers now — the index is maintained explicitly).
     pub fn save_message_headers(
         &self,
         account_id: i64,
@@ -888,7 +754,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Save body HTML to cache.
     pub fn save_body(
         &self,
         account_id: i64,
@@ -901,14 +766,11 @@ impl Cache {
              ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET html = ?4",
             rusqlite::params![account_id, folder_path, uid, html],
         )?;
-        // The body is the last indexed column; reindex so the new text is
-        // searchable without dropping the header columns (contentless FTS5
-        // cannot update in place, so `index_message` rebuilds the whole row).
+
         self.index_message(account_id, folder_path, uid)?;
         Ok(())
     }
 
-    /// Update has_attachments flag from actual body parse (corrects BODYSTRUCTURE guesses).
     pub fn update_has_attachment(
         &self,
         account_id: i64,
@@ -923,7 +785,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Check if a body is already cached.
     pub fn has_body(&self, account_id: i64, folder_path: &str, uid: i64) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM bodies WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
@@ -933,8 +794,6 @@ impl Cache {
         Ok(count > 0)
     }
 
-    /// Replace the stored attachments for a message (delete + insert). Called
-    /// whenever a body is re-parsed, so attachment metadata stays in sync.
     pub fn replace_attachments(
         &self,
         account_id: i64,
@@ -964,7 +823,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Load the attachment metadata for a message.
     pub fn load_attachments(
         &self,
         account_id: i64,
@@ -987,7 +845,6 @@ impl Cache {
         rows.collect::<Result<Vec<_>>>()
     }
 
-    /// Whether the message's parsed body flagged it as having attachments.
     pub fn message_has_attachments(
         &self,
         account_id: i64,
@@ -1002,7 +859,6 @@ impl Cache {
         Ok(has != 0)
     }
 
-    /// Update the refresh token for an account (when Google rotates it).
     pub fn update_refresh_token(&self, account_id: i64, new_refresh_token: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE accounts SET refresh_token = ?1 WHERE id = ?2",
@@ -1011,11 +867,6 @@ impl Cache {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Outbox
-    // -----------------------------------------------------------------------
-
-    /// Store an unsent message so it can be retried when the daemon reconnects.
     pub fn enqueue_outbox(
         &self,
         account_id: i64,
@@ -1047,7 +898,6 @@ impl Cache {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Load every unsent message (oldest first) for the background flusher.
     pub fn load_pending_outbox(&self) -> Result<Vec<OutboxItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, account_id, to_addr, cc_addr, bcc_addr, reply_to, subject, body, attempts
@@ -1069,7 +919,6 @@ impl Cache {
         rows.collect::<Result<Vec<_>>>()
     }
 
-    /// Increment a queued message's retry counter, returning the new value.
     pub fn increment_outbox_attempts(&self, id: i64) -> Result<i32> {
         self.conn.execute(
             "UPDATE outbox SET attempts = attempts + 1 WHERE id = ?1",
@@ -1083,23 +932,12 @@ impl Cache {
         Ok(attempts)
     }
 
-    /// Remove a queued message once it's sent or permanently dropped.
     pub fn delete_outbox(&self, id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM outbox WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Durable non-send action ledger (flags / move / delete)
-    // -----------------------------------------------------------------------
-
-    /// Record a non-send mutation as a durable intent **before** the server is
-    /// touched, returning the stored row so the caller can try it immediately.
-    ///
-    /// `now` is the `created_at`/initial `not_before`: a freshly enqueued action
-    /// is due at once. If the process dies before the attempt, the row stays
-    /// `pending` and the worker's drain loop picks it up on the next start.
     pub fn enqueue_action(
         &self,
         account_id: i64,
@@ -1125,13 +963,6 @@ impl Cache {
         })
     }
 
-    /// Atomically claim the oldest due action for an account, marking it
-    /// `in_flight` so a later claim cannot return it again. Returns `None` when
-    /// nothing is due.
-    ///
-    /// `Cache` is serialized behind a single mutex, so the select-then-update is
-    /// atomic with respect to other claims; the state column still matters for
-    /// crash recovery (see [`Cache::reset_in_flight_actions`]).
     pub fn claim_due_action(&self, account_id: i64, now: i64) -> Result<Option<PendingAction>> {
         let action = {
             let mut stmt = self.conn.prepare(
@@ -1156,7 +987,6 @@ impl Cache {
         Ok(action)
     }
 
-    /// Drop an action: it either succeeded or is being abandoned.
     pub fn complete_action(&self, id: i64) -> Result<()> {
         self.conn.execute(
             "DELETE FROM pending_actions WHERE id = ?1",
@@ -1165,8 +995,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Record a failed attempt: bump the counter, schedule the retry, and return
-    /// the action to the `pending` pool. Returns the new attempt count.
     pub fn reschedule_action(&self, id: i64, not_before: i64, last_error: &str) -> Result<i32> {
         self.conn.execute(
             "UPDATE pending_actions
@@ -1182,10 +1010,6 @@ impl Cache {
         Ok(attempts)
     }
 
-    /// Return an account's `in_flight` actions to the `pending` pool. Called
-    /// when a worker (re)starts so actions interrupted by a crash or restart are
-    /// retried instead of being stranded as `in_flight` forever. Returns the
-    /// number recovered.
     pub fn reset_in_flight_actions(&self, account_id: i64) -> Result<usize> {
         let recovered = self.conn.execute(
             "UPDATE pending_actions SET state = 'pending'
@@ -1195,10 +1019,6 @@ impl Cache {
         Ok(recovered)
     }
 
-    /// UIDs of messages in a folder that have pending (or in-flight) actions.
-    ///
-    /// Reconciliation skips these UIDs so background expunge/flag checks do
-    /// not clobber user mutations that have not yet reached the server.
     pub fn pending_action_uids(&self, account_id: i64, folder_path: &str) -> Result<HashSet<i64>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT uid FROM pending_actions
@@ -1212,16 +1032,6 @@ impl Cache {
         Ok(uids)
     }
 
-    // -----------------------------------------------------------------------
-    // Per-message sync-failure ledger (header / body fetch retries)
-    // -----------------------------------------------------------------------
-
-    /// Record a failed header/body fetch for one message, bumping its attempt
-    /// count and scheduling the next retry. Upserts on the
-    /// `(account, folder, uid, stage)` key, so a message that keeps failing
-    /// accumulates attempts instead of creating duplicate rows. `retry_at` is
-    /// the next eligible time, computed by the caller from the retry policy.
-    /// Returns the new attempt count.
     pub fn record_sync_failure(
         &self,
         account_id: i64,
@@ -1255,11 +1065,6 @@ impl Cache {
         Ok(attempts)
     }
 
-    /// Claim the most overdue due sync failure for an account, pushing its retry
-    /// time out to `push_to` so a retry that fails before it can be rescheduled
-    /// is not picked up again immediately. Unlike the action ledger there is no
-    /// `in_flight` state: the retry is synchronous in the single worker task, so
-    /// a crash mid-retry simply leaves the row to be retried after `push_to`.
     pub fn claim_due_sync_failure(
         &self,
         account_id: i64,
@@ -1297,7 +1102,6 @@ impl Cache {
         Ok(failure)
     }
 
-    /// Drop a sync-failure row: the retry succeeded, or it is being abandoned.
     pub fn clear_sync_failure(
         &self,
         account_id: i64,
@@ -1313,7 +1117,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Outstanding sync failures for an account (for status and tests).
     pub fn count_sync_failures(&self, account_id: i64) -> Result<i64> {
         self.conn.query_row(
             "SELECT count(*) FROM sync_failures WHERE account_id = ?1",
@@ -1322,7 +1125,6 @@ impl Cache {
         )
     }
 
-    /// Load a single account by id (None if it no longer exists).
     pub fn load_account(&self, account_id: i64) -> Result<Option<Account>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, email, display_name, provider, auth_type, imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security, username, refresh_token, enabled FROM accounts WHERE id = ?1",
@@ -1352,11 +1154,6 @@ impl Cache {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Address book (autocomplete)
-    // -----------------------------------------------------------------------
-
-    /// Upsert a sender address (increment frequency on conflict).
     pub fn upsert_address(&self, email: &str, display_name: &str) -> Result<()> {
         if email.is_empty() {
             return Ok(());
@@ -1371,7 +1168,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Search addresses by prefix (email or display name), most used first.
     pub fn search_addresses(&self, query: &str, limit: usize) -> Result<Vec<(String, String)>> {
         let pattern = format!("%{}%", query.to_lowercase());
         let mut stmt = self.conn.prepare(
@@ -1385,7 +1181,6 @@ impl Cache {
         rows.collect::<Result<Vec<_>>>()
     }
 
-    /// Check if an email address is in the address book.
     pub fn is_known_address(&self, email: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM addresses WHERE email = ?1",
@@ -1395,11 +1190,6 @@ impl Cache {
         Ok(count > 0)
     }
 
-    // -----------------------------------------------------------------------
-    // Sender policies (allow/block)
-    // -----------------------------------------------------------------------
-
-    /// Set a sender policy: block or allow remote content for this sender.
     pub fn set_sender_policy(
         &self,
         sender_email: &str,
@@ -1414,7 +1204,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Remove a sender policy entry.
     pub fn remove_sender_policy(&self, sender_email: &str) -> Result<()> {
         self.conn.execute(
             "DELETE FROM sender_policies WHERE sender_email = ?1",
@@ -1423,7 +1212,6 @@ impl Cache {
         Ok(())
     }
 
-    /// Check if a sender is blocked.
     pub fn is_sender_blocked(&self, sender_email: &str) -> Result<bool> {
         let blocked: i32 = self
             .conn
@@ -1436,7 +1224,6 @@ impl Cache {
         Ok(blocked != 0)
     }
 
-    /// Load all sender policies.
     pub fn load_sender_policies(&self) -> Result<Vec<(String, bool, bool)>> {
         let mut stmt = self.conn.prepare(
             "SELECT sender_email, block_sender, allow_remote FROM sender_policies ORDER BY sender_email"
@@ -1452,9 +1239,6 @@ impl Cache {
     }
 }
 
-/// Map a `pending_actions` row to a [`PendingAction`]. An unknown `kind` is an
-/// error rather than a guess: silently misreading a destructive intent is worse
-/// than surfacing it.
 fn row_to_action(row: &rusqlite::Row) -> Result<PendingAction> {
     let kind_raw: String = row.get(4)?;
     let kind = ActionKind::from_str(&kind_raw).ok_or_else(|| {
@@ -1470,8 +1254,6 @@ fn row_to_action(row: &rusqlite::Row) -> Result<PendingAction> {
     })
 }
 
-/// Map a `sync_failures` row to a [`SyncFailure`]. An unknown `stage` is an
-/// error rather than a guess, matching [`row_to_action`].
 fn row_to_sync_failure(row: &rusqlite::Row) -> Result<SyncFailure> {
     let stage_raw: String = row.get(2)?;
     let stage = SyncStage::from_str(&stage_raw).ok_or_else(|| {

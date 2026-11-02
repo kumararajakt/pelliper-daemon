@@ -1,6 +1,3 @@
-//! Policy tests for the durable action ledger: backoff growth, jitter bounds,
-//! error classification, and the retry/drop decision.
-
 use super::*;
 
 #[test]
@@ -9,10 +6,10 @@ fn backoff_doubles_then_saturates() {
     assert_eq!(backoff_secs(2), BACKOFF_BASE_SECS * 2);
     assert_eq!(backoff_secs(3), BACKOFF_BASE_SECS * 4);
     assert_eq!(backoff_secs(4), BACKOFF_BASE_SECS * 8);
-    // Beyond the exponent cap the value is pinned to the ceiling, never wraps.
+
     assert_eq!(backoff_secs(40), BACKOFF_CAP_SECS);
     assert_eq!(backoff_secs(1000), BACKOFF_CAP_SECS);
-    // Zero/negative attempts still yield at least the base.
+
     assert_eq!(backoff_secs(0), BACKOFF_BASE_SECS);
     assert_eq!(backoff_secs(-5), BACKOFF_BASE_SECS);
 }
@@ -37,7 +34,6 @@ fn permanent_errors_are_recognised_case_insensitively() {
 
 #[test]
 fn transient_errors_are_not_treated_as_permanent() {
-    // Auth and transport failures must stay queued: they resolve on reconnect.
     assert!(!is_permanent_error("authentication failed"));
     assert!(!is_permanent_error(
         "AUTHENTICATIONFAILED Invalid credentials"
@@ -57,6 +53,6 @@ fn retry_is_bounded_and_drops_permanent_failures() {
         retry_decision(MAX_ACTION_ATTEMPTS, "timed out"),
         RetryDecision::Drop
     );
-    // A permanent error drops immediately, even on the first failure.
+
     assert_eq!(retry_decision(1, "no such message"), RetryDecision::Drop);
 }
