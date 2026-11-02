@@ -26,6 +26,7 @@ impl Daemon {
             self.secrets.clone(),
             self.attachments_dir.clone(),
         );
+        handle.send(worker::WorkerRequest::SyncAll);
         self.workers.lock().unwrap().insert(account.id, handle);
     }
 }

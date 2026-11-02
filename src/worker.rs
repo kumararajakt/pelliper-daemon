@@ -42,6 +42,9 @@ const REOPEN_PAGE_SIZE: usize = 50;
 /// fewer round-trips; smaller = more responsive to interleaved user requests.
 /// The same band size bounds incremental new-mail catch-up fetches.
 const BACKFILL_CHUNK: usize = 1_000;
+/// Width (in UIDs) of the active window checked for remote expunges and flag
+/// changes on each incremental folder sync.
+const RECONCILE_WINDOW: usize = 1_000;
 /// Fallback re-sync interval used when the worker is NOT actively IDLE-watching
 /// a folder (no folder selected yet, no session, or after a disconnect). IMAP
 /// IDLE pushes mailbox changes, but servers are not reliable about it — poll
@@ -523,6 +526,40 @@ impl Worker {
             imap::examine_folder(session, folder_path).await?
         };
 
+        if exists == 0 {
+            let (to_delete, has_pending) = {
+                let cache = self.cache.lock().await;
+                let cached = cache
+                    .cached_uids_in_range(self.account.id, folder_path, 1, i64::MAX)
+                    .unwrap_or_default();
+                let pending = cache
+                    .pending_action_uids(self.account.id, folder_path)
+                    .unwrap_or_default();
+                let to_delete: Vec<i64> = cached
+                    .into_iter()
+                    .filter(|u| !pending.contains(u))
+                    .collect();
+                (to_delete, !pending.is_empty())
+            };
+            if !to_delete.is_empty() {
+                let mut cache = self.cache.lock().await;
+                let _ = cache.delete_messages(self.account.id, folder_path, &to_delete);
+                let _ = cache.update_folder_unread(self.account.id, folder_path, 0);
+                tracing::info!(
+                    "Worker[{}]: folder {} is empty on server; expunged {} cached message(s)",
+                    self.account.id,
+                    folder_path,
+                    to_delete.len()
+                );
+            }
+            if !has_pending {
+                let cache = self.cache.lock().await;
+                let _ = cache.set_folder_last_seen_uid(self.account.id, folder_path, 0);
+                let _ = cache.set_folder_backfill_cursor(self.account.id, folder_path, Some(0));
+            }
+            return Ok(Vec::new());
+        }
+
         // UIDVALIDITY guard. Everything below is keyed on `(folder, uid)`, but
         // IMAP only guarantees those UIDs stay meaningful while the folder's
         // UIDVALIDITY is unchanged. When the server reports a new value it has
@@ -618,6 +655,22 @@ impl Worker {
             );
             summaries
         } else {
+            // Reconcile expunges and flags across the active window [lo, hi].
+            let hi = last_seen_uid.max(high);
+            let lo = (hi.saturating_sub(RECONCILE_WINDOW as i64) + 1).max(1);
+            if let Err(e) = self.reconcile_window(folder_path, lo, hi).await {
+                tracing::warn!(
+                    "Worker[{}]: active window reconciliation failed for {}: {}",
+                    self.account.id,
+                    folder_path,
+                    e
+                );
+            }
+            if high < last_seen_uid {
+                let cache = self.cache.lock().await;
+                let _ = cache.set_folder_last_seen_uid(self.account.id, folder_path, high);
+            }
+
             let new_uids = {
                 let session = self.session.as_mut().ok_or("no session")?;
                 imap::uid_search_after(session, folder_path, last_seen_uid).await?
@@ -739,6 +792,122 @@ impl Worker {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Fetch (UID, is_read, is_starred) flags for an explicit UID set,
+    /// retrying once on an OAuth auth error.
+    async fn fetch_uid_flags(
+        &mut self,
+        folder_path: &str,
+        uid_set: &str,
+    ) -> Result<Vec<(i64, bool, bool)>, Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_session()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let first = {
+            let session = self.session.as_mut().ok_or("no session")?;
+            imap::fetch_uid_flags(session, folder_path, uid_set).await
+        };
+        match first {
+            Ok(s) => Ok(s),
+            Err(e) if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" => {
+                tracing::warn!(
+                    "Worker[{}]: auth error fetching {} UID flags, refreshing token",
+                    self.account.id,
+                    folder_path
+                );
+                self.invalidate_token();
+                self.connect().await?;
+                let session = self.session.as_mut().ok_or("no session after reconnect")?;
+                imap::fetch_uid_flags(session, folder_path, uid_set).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reconcile expunges and flags in the given UID range `[lo, hi]`.
+    ///
+    /// Fetches lightweight `(UID FLAGS)` from IMAP for the range:
+    /// - Cached UIDs missing from the response (and not pending locally) are expunged.
+    /// - Flag changes (is_read, is_starred) from other clients are updated in bulk.
+    ///
+    /// Returns `(deleted_count, flags_updated_count)`.
+    pub(super) async fn reconcile_window(
+        &mut self,
+        folder_path: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+        if lo > hi || hi <= 0 {
+            return Ok((0, 0));
+        }
+        let uid_set = format!("{lo}:{hi}");
+        let server_flags = self.fetch_uid_flags(folder_path, &uid_set).await?;
+        let server_uids: HashSet<i64> = server_flags.iter().map(|&(u, _, _)| u).collect();
+
+        let (to_delete, flags_to_update) = {
+            let cache = self.cache.lock().await;
+            let cached = cache.cached_uids_in_range(self.account.id, folder_path, lo, hi)?;
+            let pending = cache.pending_action_uids(self.account.id, folder_path)?;
+
+            let to_delete: Vec<i64> = cached
+                .into_iter()
+                .filter(|u| !server_uids.contains(u) && !pending.contains(u))
+                .collect();
+
+            let flags_to_update: Vec<(i64, bool, bool)> = server_flags
+                .into_iter()
+                .filter(|(u, _, _)| !pending.contains(u))
+                .collect();
+
+            (to_delete, flags_to_update)
+        };
+
+        let mut deleted = 0;
+        let mut flags_updated = 0;
+
+        if !to_delete.is_empty() || !flags_to_update.is_empty() {
+            let mut cache = self.cache.lock().await;
+            if !to_delete.is_empty() {
+                deleted = cache.delete_messages(self.account.id, folder_path, &to_delete)?;
+                if deleted > 0 {
+                    tracing::info!(
+                        "Worker[{}]: expunged {} message(s) in {} (window {uid_set})",
+                        self.account.id,
+                        deleted,
+                        folder_path
+                    );
+                }
+            }
+            if !flags_to_update.is_empty() {
+                flags_updated = cache.update_message_flags_bulk(
+                    self.account.id,
+                    folder_path,
+                    &flags_to_update,
+                )?;
+            }
+            if deleted > 0 || flags_updated > 0 {
+                let unread = cache
+                    .count_unread(self.account.id, folder_path)
+                    .unwrap_or(0);
+                let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+            }
+        }
+
+        // Clean up prefetch queues for any expunged UIDs
+        if !to_delete.is_empty() {
+            let del_set: HashSet<i64> = to_delete.into_iter().collect();
+            self.body_prefetch
+                .retain(|(p, u)| !(p == folder_path && del_set.contains(u)));
+            self.body_prefetched
+                .retain(|(p, u)| !(p == folder_path && del_set.contains(u)));
+            self.attachment_prefetch
+                .retain(|(p, u)| !(p == folder_path && del_set.contains(u)));
+            self.attachment_prefetched
+                .retain(|(p, u)| !(p == folder_path && del_set.contains(u)));
+        }
+
+        Ok((deleted, flags_updated))
     }
 
     /// Upsert a batch of summaries (message row, autocomplete address, header

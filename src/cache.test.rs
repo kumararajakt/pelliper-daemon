@@ -1218,3 +1218,207 @@ fn a_database_newer_than_this_build_is_rejected_before_any_work() {
         .expect("query");
     assert_eq!(found, 0, "nothing must be created for a rejected database");
 }
+
+#[test]
+fn cached_uids_in_range_returns_uids_within_bounds_sorted() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+
+    for uid in [5, 10, 15, 20, 25] {
+        add_message(&cache, uid);
+    }
+    // Message in another folder to verify scoping
+    cache
+        .upsert_message(1, "Archive", 15, false, false, false, "")
+        .expect("archive message");
+
+    let uids = cache
+        .cached_uids_in_range(1, "INBOX", 10, 20)
+        .expect("cached uids in range");
+    assert_eq!(uids, vec![10, 15, 20]);
+
+    let below = cache
+        .cached_uids_in_range(1, "INBOX", 0, 4)
+        .expect("below range");
+    assert!(below.is_empty());
+
+    let above = cache
+        .cached_uids_in_range(1, "INBOX", 30, 50)
+        .expect("above range");
+    assert!(above.is_empty());
+
+    let archive = cache
+        .cached_uids_in_range(1, "Archive", 1, 30)
+        .expect("archive uids");
+    assert_eq!(archive, vec![15]);
+}
+
+#[test]
+fn pending_action_uids_returns_distinct_uids_scoped_to_account_and_folder() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .conn
+        .execute(
+            "INSERT INTO accounts (id, email) VALUES (2, 'b@example.com')",
+            [],
+        )
+        .expect("second account");
+
+    cache
+        .enqueue_action(1, "INBOX", 10, crate::types::ActionKind::SetFlags, "{}", 0)
+        .expect("enqueue 1");
+    // Duplicate action for UID 10 in same folder
+    cache
+        .enqueue_action(1, "INBOX", 10, crate::types::ActionKind::Move, "{}", 0)
+        .expect("enqueue 2");
+    cache
+        .enqueue_action(1, "INBOX", 20, crate::types::ActionKind::Delete, "{}", 0)
+        .expect("enqueue 3");
+    // Different folder
+    cache
+        .enqueue_action(1, "Drafts", 30, crate::types::ActionKind::SetFlags, "{}", 0)
+        .expect("enqueue 4");
+    // Different account
+    cache
+        .enqueue_action(2, "INBOX", 10, crate::types::ActionKind::SetFlags, "{}", 0)
+        .expect("enqueue 5");
+
+    let inbox_pending = cache.pending_action_uids(1, "INBOX").expect("pending uids");
+    assert_eq!(inbox_pending.len(), 2);
+    assert!(inbox_pending.contains(&10));
+    assert!(inbox_pending.contains(&20));
+
+    let drafts_pending = cache
+        .pending_action_uids(1, "Drafts")
+        .expect("drafts pending");
+    assert_eq!(drafts_pending.len(), 1);
+    assert!(drafts_pending.contains(&30));
+
+    let acc2_pending = cache.pending_action_uids(2, "INBOX").expect("acc2 pending");
+    assert_eq!(acc2_pending.len(), 1);
+    assert!(acc2_pending.contains(&10));
+}
+
+#[test]
+fn update_message_flags_bulk_modifies_flags_and_returns_number_of_changed_rows() {
+    let (mut cache, _dir) = scratch();
+    add_account(&cache);
+
+    // Initial state: all unread and unstarred
+    for uid in [1, 2, 3] {
+        add_message(&cache, uid);
+    }
+
+    let updates = vec![
+        (1, true, false),  // read
+        (2, false, true),  // starred
+        (3, false, false), // unchanged
+    ];
+    let count = cache
+        .update_message_flags_bulk(1, "INBOX", &updates)
+        .expect("bulk update");
+    assert_eq!(
+        count, 2,
+        "only messages with changed flags count as updated"
+    );
+
+    let msgs = cache.load_messages(1, "INBOX", 0, 10).expect("load");
+    let m1 = msgs.iter().find(|m| m.uid == 1).unwrap();
+    assert!(m1.is_read);
+    assert!(!m1.is_starred);
+
+    let m2 = msgs.iter().find(|m| m.uid == 2).unwrap();
+    assert!(!m2.is_read);
+    assert!(m2.is_starred);
+
+    let m3 = msgs.iter().find(|m| m.uid == 3).unwrap();
+    assert!(!m3.is_read);
+    assert!(!m3.is_starred);
+
+    // Idempotent re-run returns 0 updated
+    let count2 = cache
+        .update_message_flags_bulk(1, "INBOX", &updates)
+        .expect("re-run");
+    assert_eq!(count2, 0, "no-op updates touch zero rows");
+}
+
+#[test]
+fn delete_messages_purges_messages_fts_attachments_and_sync_failures() {
+    let (mut cache, _dir) = scratch();
+    add_account(&cache);
+
+    for uid in [1, 2] {
+        add_message(&cache, uid);
+        let mut h = sample_headers();
+        h.subject = format!("subject {uid}");
+        cache
+            .save_message_headers(1, "INBOX", uid, &h)
+            .expect("headers");
+        cache
+            .save_body(1, "INBOX", uid, &format!("<p>body content {uid}</p>"))
+            .expect("body");
+        cache
+            .replace_attachments(
+                1,
+                "INBOX",
+                uid,
+                &[crate::types::AttachmentRecord {
+                    name: format!("file{uid}.txt"),
+                    file_path: format!("/tmp/file{uid}.txt"),
+                    content_type: "text/plain".to_string(),
+                    size: 100,
+                }],
+            )
+            .expect("attachments");
+        cache
+            .record_sync_failure(
+                1,
+                "INBOX",
+                uid,
+                crate::types::SyncStage::Body,
+                1000,
+                "test failure",
+            )
+            .expect("failure");
+    }
+
+    assert_eq!(fts_hits(&cache, "subject"), 2);
+    assert_eq!(fts_hits(&cache, "content"), 2);
+
+    let deleted = cache.delete_messages(1, "INBOX", &[1]).expect("delete");
+    assert_eq!(deleted, 1);
+
+    // Message 1 is completely gone
+    assert_eq!(cache.count_messages(1, "INBOX").expect("count"), 1);
+    assert_eq!(fts_hits(&cache, "\"subject 1\""), 0);
+    assert_eq!(fts_hits(&cache, "\"body content 1\""), 0);
+    assert!(cache
+        .load_attachments(1, "INBOX", 1)
+        .expect("att")
+        .is_empty());
+
+    let sf_count: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_failures WHERE account_id = 1 AND folder_path = 'INBOX' AND uid = 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("sf count");
+    assert_eq!(sf_count, 0);
+
+    // Message 2 survives intact
+    assert_eq!(fts_hits(&cache, "\"subject 2\""), 1);
+    assert_eq!(fts_hits(&cache, "\"body content 2\""), 1);
+    assert_eq!(cache.load_attachments(1, "INBOX", 2).expect("att").len(), 1);
+    let sf2_count: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_failures WHERE account_id = 1 AND folder_path = 'INBOX' AND uid = 2",
+            [],
+            |r| r.get(0),
+        )
+        .expect("sf2 count");
+    assert_eq!(sf2_count, 1);
+}

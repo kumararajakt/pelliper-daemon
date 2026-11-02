@@ -3,6 +3,7 @@
 
 use super::{BackfillJob, Worker};
 use crate::imap;
+use std::collections::HashSet;
 
 impl Worker {
     // -----------------------------------------------------------------------
@@ -131,6 +132,40 @@ impl Worker {
                 return false;
             }
         };
+
+        // Reconcile expunges: any UID cached in [lo, hi] that the server did not
+        // return (and is not a pending user action) has been deleted on the server.
+        let server_uids: HashSet<i64> = summaries.iter().map(|s| s.uid).collect();
+        let to_delete = {
+            let cache = self.cache.lock().await;
+            let cached = cache
+                .cached_uids_in_range(self.account.id, folder_path, lo, hi)
+                .unwrap_or_default();
+            let pending = cache
+                .pending_action_uids(self.account.id, folder_path)
+                .unwrap_or_default();
+            cached
+                .into_iter()
+                .filter(|u| !server_uids.contains(u) && !pending.contains(u))
+                .collect::<Vec<i64>>()
+        };
+        if !to_delete.is_empty() {
+            let mut cache = self.cache.lock().await;
+            if let Ok(removed) = cache.delete_messages(self.account.id, folder_path, &to_delete) {
+                if removed > 0 {
+                    let unread = cache
+                        .count_unread(self.account.id, folder_path)
+                        .unwrap_or(0);
+                    let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
+                    tracing::info!(
+                        "Worker[{}]: backfill expunged {} message(s) in {} (window {uid_set})",
+                        self.account.id,
+                        removed,
+                        folder_path
+                    );
+                }
+            }
+        }
 
         let failures = self.write_summaries_to_cache(folder_path, &summaries).await;
         self.note_header_write_failures(folder_path, failures).await;

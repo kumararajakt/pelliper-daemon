@@ -15,7 +15,7 @@ not raw feature parity. Each is independently shippable.
 |---|-----|--------|--------|------|
 | 1 | ~~No UIDVALIDITY tracking~~ ✅ done | Data corruption/mis-association on server UID reset | S | M |
 | 2 | ~~No persisted sync cursor~~ ✅ done | Repeated full `UID SEARCH ALL` + newest-page refetch | M | M |
-| 3 | No expunge/flag reconciliation ⚠️ in progress | Stale rows; server-side changes never applied locally | M | M |
+| 3 | ~~No expunge/flag reconciliation~~ ✅ done | Stale rows; server-side changes never applied locally | M | M |
 | 4 | ~~No durable action ledger (non-send)~~ ✅ done | Offline/failed flags, moves, deletes silently diverge | L | M |
 | 5 | ~~Cache mutated even when IMAP op fails~~ ✅ done | Local state claims success that server rejected | S | L |
 | 6 | ~~No IDLE capability probe~~ ✅ done | Connects IDLE to servers that don't advertise it | S | L |
@@ -132,30 +132,43 @@ without a server, mirroring Flectar's
 
 ## 3. Reconcile expunges and flags
 
-**Status: partially implemented.** The cache-level bulk deletion primitive
-(`Cache::delete_messages`) was added to `src/cache.rs` with FTS de-indexing, but
-the worker reconciliation pass is not yet wired up into `sync_folder_first_page`
-or `src/worker/backfill.rs` (generating a `dead_code` warning). As a result,
-messages expunged or moved on the server from other clients remain in the local
-cache as ghost messages. Additionally, flag reconciliation is limited to the
-newest 50 messages (`REOPEN_PAGE_SIZE`), so flag changes on older mail are not
-reconciled.
+**Status: implemented.** Remote message expunges and flag mutations made by
+other clients are reconciled locally without downloading entire message headers.
 
-**Flectar reference.** `run_cycle` reconciles flags (a bounded `FLAG_WINDOW`) and
-expunges each cycle; `reconcile_flags` skips rows with a pending intent, and
-`reconcile_expunges` skips in-flight moves.
-
-**Proposed change.**
-- In `Worker::sync_folder_first_page` and backfill, diff server UIDs against
-  cached UIDs in the examined window and call `Cache::delete_messages` on
-  missing UIDs (skipping UIDs with an in-flight pending action from gap #4).
-- Refresh flags across an active window (`UID FETCH <range> FLAGS`) and update
-  `messages.is_read`/`is_starred` in bulk without rewriting whole headers.
-
-**Files.** `src/worker.rs`, `src/worker/backfill.rs`, `src/cache.rs`.
-
-**Test.** Cache & worker tests: seed cached rows, simulate server expunges,
-assert survivors remain and FTS no longer matches purged entries.
+- **Storage & Cache Primitives** (`src/cache.rs`):
+  - `Cache::cached_uids_in_range(account_id, folder_path, lo, hi)` returns sorted
+    cached UIDs in the target range.
+  - `Cache::pending_action_uids(account_id, folder_path)` queries active
+    entries in `pending_actions` to protect in-flight local mutations from being
+    clobbered or erroneously purged as expunges.
+  - `Cache::update_message_flags_bulk(account_id, folder_path, &flags)` bulk updates
+    `is_read` and `is_starred` flags in a single transaction, skipping rows
+    whose state already matches to minimize SQLite disk writes.
+  - `Cache::delete_messages(account_id, folder_path, &uids)` purges expunged
+    messages across `messages`, cascading to `message_headers` and `bodies`,
+    while explicitly deindexing from `messages_fts` and cleaning up
+    `attachments` and `sync_failures`.
+- **IMAP Protocol** (`src/imap.rs`):
+  - `fetch_uid_flags(session, folder, uid_set)` fetches lightweight
+    `UID FETCH <range> (UID FLAGS)` returning `(UID, is_read, is_starred)`
+    in a single round trip without full header or envelope overhead.
+- **Worker Active Window Reconciliation** (`src/worker.rs`):
+  - On warm folder sync (`sync_folder_first_page`), reconciles an active window
+    `[lo, hi]` (`RECONCILE_WINDOW = 1,000` UIDs) via `Worker::reconcile_window`.
+    Missing cached UIDs (not pending locally) are deleted, server flag changes
+    are bulk updated, and folder unread counts are updated from cache.
+  - If `exists == 0`, all cached messages (excluding pending actions) are
+    purged immediately.
+  - If `high < last_seen_uid` (e.g. top messages deleted), `last_seen_uid` is
+    clamped back down to `high`.
+- **History Backfill Reconciliation** (`src/worker/backfill.rs`):
+  - During descending history backfill chunks (`run_backfill_chunk`), cached
+    UIDs in `[lo, hi]` absent from server summaries are expunged and unread
+    counts updated.
+- **Tests** (`src/cache.test.rs`):
+  - Unit tests verifying `cached_uids_in_range`, `pending_action_uids` isolation,
+    idempotent `update_message_flags_bulk`, and multi-table purge + FTS
+    deindexing in `delete_messages`.
 
 ---
 

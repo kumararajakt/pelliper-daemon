@@ -381,6 +381,44 @@ pub async fn fetch_summaries_by_uids(
     Ok(summaries)
 }
 
+/// Fetch just (UID, is_read, is_starred) flags for an explicit UID set.
+///
+/// Used for lightweight reconciliation: detects expunges (messages missing
+/// from the returned set) and flags altered by other clients without the
+/// cost of full header parsing.
+pub async fn fetch_uid_flags(
+    session: &mut ImapSession,
+    folder: &str,
+    uid_set: &str,
+) -> Result<Vec<(i64, bool, bool)>, Box<dyn std::error::Error + Send + Sync>> {
+    session.examine(folder).await.map_err(|e| e.to_string())?;
+    if uid_set.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stream = session
+        .uid_fetch(uid_set, "(UID FLAGS)")
+        .await
+        .map_err(|e| e.to_string())?;
+    futures::pin_mut!(stream);
+    let mut results = Vec::new();
+    while let Some(f) = stream.next().await {
+        let f = f.map_err(|e| e.to_string())?;
+        if let Some(uid) = f.uid {
+            let mut is_read = false;
+            let mut is_starred = false;
+            for flag in f.flags() {
+                match flag {
+                    Flag::Seen => is_read = true,
+                    Flag::Flagged => is_starred = true,
+                    _ => {}
+                }
+            }
+            results.push((uid as i64, is_read, is_starred));
+        }
+    }
+    Ok(results)
+}
+
 /// All UIDs in a folder (from UID SEARCH ALL), for backfill planning.
 pub async fn fetch_all_uids(
     session: &mut ImapSession,

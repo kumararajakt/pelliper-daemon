@@ -107,6 +107,7 @@ async fn main() {
                 secrets.clone(),
                 data_dir.join("attachments"),
             );
+            handle.send(worker::WorkerRequest::SyncAll);
             workers.lock().unwrap().insert(account.id, handle);
         }
         tracing::info!(

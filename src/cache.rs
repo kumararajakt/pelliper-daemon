@@ -3,6 +3,7 @@ use crate::types::{
     PendingAction, SyncFailure, SyncStage,
 };
 use rusqlite::{Connection, OptionalExtension, Result};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 pub struct Cache {
@@ -358,6 +359,41 @@ impl Cache {
         Ok(())
     }
 
+    /// Update the read/starred flags of multiple messages in bulk.
+    ///
+    /// Skips rows whose flags already match the target values to avoid
+    /// redundant disk writes. Returns the number of messages actually modified.
+    pub fn update_message_flags_bulk(
+        &mut self,
+        account_id: i64,
+        folder_path: &str,
+        flags: &[(i64, bool, bool)],
+    ) -> Result<usize> {
+        if flags.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let mut updated = 0;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE messages SET is_read = ?1, is_starred = ?2
+                 WHERE account_id = ?3 AND folder_path = ?4 AND uid = ?5
+                   AND (is_read != ?1 OR is_starred != ?2)",
+            )?;
+            for &(uid, is_read, is_starred) in flags {
+                updated += stmt.execute(rusqlite::params![
+                    is_read as i32,
+                    is_starred as i32,
+                    account_id,
+                    folder_path,
+                    uid,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Move a message (and its cached headers and body) from one folder to
     /// another.  All three tables are keyed by the same composite key, so each
     /// is copied before the source row is deleted (which cascades the rest).
@@ -537,6 +573,28 @@ impl Cache {
     }
 
     /// UIDs of messages cached in a given range [lo, hi] (inclusive), ascending.
+    pub fn cached_uids_in_range(
+        &self,
+        account_id: i64,
+        folder_path: &str,
+        lo: i64,
+        hi: i64,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uid FROM messages
+             WHERE account_id = ?1 AND folder_path = ?2 AND uid >= ?3 AND uid <= ?4
+             ORDER BY uid ASC",
+        )?;
+        let uids = stmt
+            .query_map(rusqlite::params![account_id, folder_path, lo, hi], |row| {
+                row.get(0)
+            })?
+            .collect::<Result<Vec<i64>, _>>()?;
+        Ok(uids)
+    }
+
+    /// Delete messages by UID, removing their FTS index entries, cached
+    /// attachments, and sync-failure records.
     pub fn delete_messages(
         &mut self,
         account_id: i64,
@@ -553,6 +611,14 @@ impl Cache {
             // resolves; the transaction keeps the two in step.
             tx.execute(
                 DEINDEX_MESSAGE_SQL,
+                rusqlite::params![account_id, folder_path, uid],
+            )?;
+            tx.execute(
+                "DELETE FROM attachments WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
+                rusqlite::params![account_id, folder_path, uid],
+            )?;
+            tx.execute(
+                "DELETE FROM sync_failures WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
                 rusqlite::params![account_id, folder_path, uid],
             )?;
             removed += tx.execute(
@@ -1104,6 +1170,23 @@ impl Cache {
             rusqlite::params![account_id],
         )?;
         Ok(recovered)
+    }
+
+    /// UIDs of messages in a folder that have pending (or in-flight) actions.
+    ///
+    /// Reconciliation skips these UIDs so background expunge/flag checks do
+    /// not clobber user mutations that have not yet reached the server.
+    pub fn pending_action_uids(&self, account_id: i64, folder_path: &str) -> Result<HashSet<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT uid FROM pending_actions
+             WHERE account_id = ?1 AND folder_path = ?2",
+        )?;
+        let uids = stmt
+            .query_map(rusqlite::params![account_id, folder_path], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<Result<HashSet<i64>, _>>()?;
+        Ok(uids)
     }
 
     // -----------------------------------------------------------------------
