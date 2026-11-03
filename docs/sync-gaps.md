@@ -27,7 +27,7 @@ not raw feature parity. Each is independently shippable.
 | 12 | ~~No D-Bus search method for FTS~~ ✅ done | `messages_fts` is maintained but unqueried via D-Bus | S | L |
 | 13 | ~~Single connection drops INBOX push on folder switch~~ ✅ done | Viewing custom/sent folders stops real-time new mail alerts | M | M |
 | 14 | ~~Folder operations unhedged by action ledger~~ ✅ done | Offline folder create/rename/delete drops on network glitch | S | L |
-| 15 | Corrupt MIME structure and missing filename on sent attachments | Attachments show as unnamed.dat or overwrite text body | S | L |
+| 15 | ~~Corrupt MIME structure and missing filename on sent attachments~~ ✅ done | Attachments show as unnamed.dat or overwrite text body | S | L |
 | 16 | Outbox table drops attachment paths and reply headers on retry | Offline sends lose attachments and threading on retry | S | M |
 | 17 | Inline cid: images unmapped in body HTML | Embedded logos/screenshots appear broken in Qt MessageView | S | L |
 | 18 | No IMAP APPEND to Sent folder on SMTP send | Non-Gmail accounts have empty Sent folder in client | M | M |
@@ -591,24 +591,17 @@ and `Cache::search_messages(account_id, query)`:
 
 ## 15. Fix outgoing attachment MIME structure, filename headers, and recipient parsing
 
-**Status: proposed.** In `src/smtp.rs`, outgoing messages with attachments append
-attachment parts directly to `MultiPart::alternative()`. In RFC 2046 MIME,
-attachments must be enclosed in `MultiPart::mixed()` containing the `alternative`
-text/HTML part plus each attachment. Furthermore, the attachments currently omit
-`Content-Disposition: attachment; filename="..."`, causing recipient clients
-(such as Gmail and Outlook) to display them as `unnamed.dat` or hide them.
+**Status: ✅ done.** Outgoing MIME structure, attachment headers, and recipient parsing
+in `src/smtp.rs` now conform to RFC 2046 and RFC 5322.
 
-Additionally, recipient splitting naively splits on `to.split([',', ';'])`, which
-breaks formatted display names containing commas (such as `"Doe, Jane" <jane@example.com>`).
+**Implementation.**
+- Extracted and structured message creation in `src/smtp.rs::build_message`.
+- Wrapped `body_part` (`MultiPart::alternative()`) in `MultiPart::mixed()` whenever attachments are present, preventing email clients from treating attachments as alternative representations of the text body.
+- Constructed each attachment using `lettre::message::Attachment::new(att.filename).body(data, content_type)`, properly generating `Content-Disposition: attachment; filename="..."`, `Content-Type`, and transfer encoding.
+- Implemented `split_recipient_list` to parse `To`, `Cc`, and `Bcc` address lists while respecting quotes and angle brackets, preventing formatted display names like `"Doe, Jane" <jane@example.com>` from being split corruptedly across commas or semicolons.
+- Added comprehensive unit tests in `src/smtp.test.rs` validating MIME boundary hierarchies, disposition headers, and display name parsing.
 
-**Proposed change.**
-- In `src/smtp.rs`, wrap the `body_part` in `MultiPart::mixed()` when attachments
-  are present.
-- Set `ContentDisposition::attachment(&att.filename)` on each attachment part.
-- Use an RFC 5322-compliant address parser or split addresses only on commas
-  outside quotes.
-
-**Files.** `src/smtp.rs`.
+**Files.** `src/smtp.rs`, `src/smtp.test.rs`.
 
 ---
 
