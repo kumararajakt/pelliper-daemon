@@ -12,6 +12,7 @@ mod actions;
 mod backfill;
 mod handlers;
 mod idle;
+mod inbox_watcher;
 mod prefetch;
 mod sync_failures;
 
@@ -116,9 +117,7 @@ pub struct Worker {
 
     shutdown: bool,
 
-    cached_access_token: Option<String>,
-
-    token_expires_at: i64,
+    cached_token: Option<(String, i64)>,
 
     attachments_dir: PathBuf,
 
@@ -148,8 +147,7 @@ impl Worker {
             backfill_queue: VecDeque::new(),
             pending: None,
             shutdown: false,
-            cached_access_token: None,
-            token_expires_at: 0,
+            cached_token: None,
             attachments_dir,
             signal_tx,
         }
@@ -168,6 +166,20 @@ impl Worker {
         if let Err(e) = self.connect().await {
             tracing::error!("Worker[{}]: bootstrap connect failed: {}", id, e);
         }
+
+        let (inbox_shutdown_tx, inbox_shutdown_rx) = tokio::sync::watch::channel(false);
+        let watcher_account = self.account.clone();
+        let watcher_cache = self.cache.clone();
+        let watcher_secrets = self.secrets.clone();
+        let watcher_signal_tx = self.signal_tx.clone();
+
+        tokio::spawn(inbox_watcher::run_inbox_watcher(
+            watcher_account,
+            watcher_cache,
+            watcher_secrets,
+            watcher_signal_tx,
+            inbox_shutdown_rx,
+        ));
 
         {
             let cache = self.cache.lock().await;
@@ -234,6 +246,7 @@ impl Worker {
             {
                 if cursor <= 0 {
                     self.backfill_queue.pop_front();
+                    self.maybe_queue_next_backfill_folder().await;
                     continue;
                 }
 
@@ -244,6 +257,7 @@ impl Worker {
                         path
                     );
                     self.backfill_queue.pop_front();
+                    self.maybe_queue_next_backfill_folder().await;
                     continue;
                 }
                 let hi = cursor;
@@ -252,11 +266,19 @@ impl Worker {
                     let next = lo - 1;
                     if next <= 0 {
                         self.backfill_queue.pop_front();
+                        self.maybe_queue_next_backfill_folder().await;
                     } else if let Some(job) = self.backfill_queue.front_mut() {
                         job.cursor = next;
                     }
                 }
                 continue;
+            }
+
+            if self.backfill_queue.is_empty() {
+                self.maybe_queue_next_backfill_folder().await;
+                if !self.backfill_queue.is_empty() {
+                    continue;
+                }
             }
 
             if self.session.is_some() && self.supports_idle {
@@ -297,6 +319,7 @@ impl Worker {
             }
         }
 
+        let _ = inbox_shutdown_tx.send(true);
         tracing::info!("Worker[{}]: shut down", id);
     }
 
@@ -326,86 +349,16 @@ impl Worker {
         Ok(())
     }
 
-    async fn get_valid_access_token(
-        &mut self,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let now = chrono::Utc::now().timestamp();
-
-        let buffer = 300;
-
-        if let Some(ref token) = self.cached_access_token {
-            if self.token_expires_at > 0 && now < self.token_expires_at - buffer {
-                return Ok(token.clone());
-            }
-        }
-
-        let refresh_token = self
-            .account
-            .refresh_token
-            .as_deref()
-            .ok_or("No refresh token")?;
-        let provider = crate::oauth::provider_for(&self.account)?;
-        let (client_id, client_secret) = crate::oauth::client_credentials(provider)?;
-        let token = crate::oauth::refresh_access_token(
-            provider.token_endpoint,
-            &client_id,
-            &client_secret,
-            refresh_token,
-        )
-        .await?;
-
-        if let Some(ref new_rt) = token.refresh_token {
-            if new_rt != refresh_token {
-                tracing::info!(
-                    "Worker[{}]: {} issued new refresh token, saving",
-                    self.account.id,
-                    provider.id
-                );
-                let cache = self.cache.lock().await;
-                if let Err(e) = cache.update_refresh_token(self.account.id, new_rt) {
-                    tracing::error!(
-                        "Worker[{}]: failed to save new refresh token: {}",
-                        self.account.id,
-                        e
-                    );
-                } else {
-                    self.account.refresh_token = Some(new_rt.clone());
-                }
-            }
-        }
-
-        let access_token = token.access_token.clone();
-        self.cached_access_token = Some(access_token.clone());
-        self.token_expires_at = token.expires_at();
-
-        tracing::debug!(
-            "Worker[{}]: refreshed access token (expires in {}s)",
-            self.account.id,
-            self.token_expires_at - now
-        );
-
-        Ok(access_token)
-    }
-
     async fn connect_session(
         &mut self,
     ) -> Result<ImapSession, Box<dyn std::error::Error + Send + Sync>> {
-        let host = self
-            .account
-            .imap_host
-            .clone()
-            .unwrap_or_else(|| "localhost".to_string());
-        let port = self.account.imap_port.unwrap_or(993) as u16;
-        let email = self.account.email.clone();
-
-        if self.account.auth_type == "oauth" {
-            let access_token = self.get_valid_access_token().await?;
-            imap::connect_session_oauth(&host, port, &email, &access_token).await
-        } else {
-            let key_name = format!("pelliper:{}", email);
-            let password = self.secrets.get_password(&key_name).await?;
-            imap::connect_session_password(&host, port, &email, &password).await
-        }
+        connect_account_session(
+            &self.account,
+            &self.secrets,
+            &self.cache,
+            &mut self.cached_token,
+        )
+        .await
     }
 
     async fn ensure_session(&mut self) -> Result<(), String> {
@@ -428,8 +381,7 @@ impl Worker {
     }
 
     fn invalidate_token(&mut self) {
-        self.cached_access_token = None;
-        self.token_expires_at = 0;
+        self.cached_token = None;
         self.session = None;
     }
 
@@ -493,39 +445,11 @@ impl Worker {
                     .unwrap_or(0)
             };
             if cached != 0 && cached != uidvalidity {
-                let cleared = {
-                    let cache = self.cache.lock().await;
-                    cache
-                        .clear_folder_messages(self.account.id, folder_path)
-                        .unwrap_or(0)
-                };
-                tracing::warn!(
-                    "Worker[{}]: UIDVALIDITY changed for {} ({} -> {}); cleared {} cached message(s)",
-                    self.account.id,
-                    folder_path,
-                    cached,
-                    uidvalidity,
-                    cleared
-                );
-
-                self.body_prefetch.retain(|(p, _)| p != folder_path);
-                self.body_prefetched.retain(|(p, _)| p != folder_path);
-                self.attachment_prefetch.retain(|(p, _)| p != folder_path);
-                self.attachment_prefetched.retain(|(p, _)| p != folder_path);
-                self.backfill_queue
-                    .retain(|job| job.folder_path != folder_path);
-            }
-            if cached != uidvalidity {
+                self.handle_uidvalidity_change(folder_path, uidvalidity)
+                    .await;
+            } else if cached != uidvalidity {
                 let cache = self.cache.lock().await;
-                if let Err(e) =
-                    cache.set_folder_uidvalidity(self.account.id, folder_path, uidvalidity)
-                {
-                    tracing::error!(
-                        "Worker[{}]: failed to store UIDVALIDITY for {}: {e}",
-                        self.account.id,
-                        folder_path
-                    );
-                }
+                let _ = cache.set_folder_uidvalidity(self.account.id, folder_path, uidvalidity);
             }
         }
 
@@ -715,111 +639,26 @@ impl Worker {
         }
     }
 
-    async fn fetch_uid_flags(
-        &mut self,
-        folder_path: &str,
-        uid_set: &str,
-    ) -> Result<Vec<(i64, bool, bool)>, Box<dyn std::error::Error + Send + Sync>> {
-        self.ensure_session()
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-        let first = {
-            let session = self.session.as_mut().ok_or("no session")?;
-            imap::fetch_uid_flags(session, folder_path, uid_set).await
-        };
-        match first {
-            Ok(s) => Ok(s),
-            Err(e) if Self::is_auth_error(&e.to_string()) && self.account.auth_type == "oauth" => {
-                tracing::warn!(
-                    "Worker[{}]: auth error fetching {} UID flags, refreshing token",
-                    self.account.id,
-                    folder_path
-                );
-                self.invalidate_token();
-                self.connect().await?;
-                let session = self.session.as_mut().ok_or("no session after reconnect")?;
-                imap::fetch_uid_flags(session, folder_path, uid_set).await
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     pub(super) async fn reconcile_window(
         &mut self,
         folder_path: &str,
         lo: i64,
         hi: i64,
     ) -> Result<(usize, usize), Box<dyn std::error::Error + Send + Sync>> {
-        if lo > hi || hi <= 0 {
-            return Ok((0, 0));
-        }
-        let uid_set = format!("{lo}:{hi}");
-        let server_flags = self.fetch_uid_flags(folder_path, &uid_set).await?;
-        let server_uids: HashSet<i64> = server_flags.iter().map(|&(u, _, _)| u).collect();
-
-        let (to_delete, flags_to_update) = {
-            let cache = self.cache.lock().await;
-            let cached = cache.cached_uids_in_range(self.account.id, folder_path, lo, hi)?;
-            let pending = cache.pending_action_uids(self.account.id, folder_path)?;
-
-            let to_delete: Vec<i64> = cached
-                .into_iter()
-                .filter(|u| !server_uids.contains(u) && !pending.contains(u))
-                .collect();
-
-            let flags_to_update: Vec<(i64, bool, bool)> = server_flags
-                .into_iter()
-                .filter(|(u, _, _)| !pending.contains(u))
-                .collect();
-
-            (to_delete, flags_to_update)
-        };
-
-        let mut deleted = 0;
-        let mut changed_flags = Vec::new();
-
-        if !to_delete.is_empty() || !flags_to_update.is_empty() {
-            let mut cache = self.cache.lock().await;
-            if !to_delete.is_empty() {
-                deleted = cache.delete_messages(self.account.id, folder_path, &to_delete)?;
-                if deleted > 0 {
-                    tracing::info!(
-                        "Worker[{}]: expunged {} message(s) in {} (window {uid_set})",
-                        self.account.id,
-                        deleted,
-                        folder_path
-                    );
-                }
-            }
-            if !flags_to_update.is_empty() {
-                changed_flags = cache.update_message_flags_bulk(
-                    self.account.id,
-                    folder_path,
-                    &flags_to_update,
-                )?;
-            }
-            if deleted > 0 || !changed_flags.is_empty() {
-                let unread = cache
-                    .count_unread(self.account.id, folder_path)
-                    .unwrap_or(0);
-                let _ = cache.update_folder_unread(self.account.id, folder_path, unread);
-                self.emit_signal(DaemonSignal::FolderUnreadChanged {
-                    account_id: self.account.id,
-                    folder_path: folder_path.to_string(),
-                    unread_count: unread,
-                });
-            }
-        }
-
-        for &(uid, is_read, is_starred) in &changed_flags {
-            self.emit_signal(DaemonSignal::MessageFlagsChanged {
-                account_id: self.account.id,
-                folder_path: folder_path.to_string(),
-                uid,
-                is_read,
-                is_starred,
-            });
-        }
+        self.ensure_session()
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+        let session = self.session.as_mut().ok_or("no session")?;
+        let (to_delete, deleted, flags_len) = reconcile_window_impl(
+            self.account.id,
+            folder_path,
+            lo,
+            hi,
+            session,
+            &self.cache,
+            self.signal_tx.as_ref(),
+        )
+        .await?;
 
         if !to_delete.is_empty() {
             let del_set: HashSet<i64> = to_delete.into_iter().collect();
@@ -833,7 +672,7 @@ impl Worker {
                 .retain(|(p, u)| !(p == folder_path && del_set.contains(u)));
         }
 
-        Ok((deleted, changed_flags.len()))
+        Ok((deleted, flags_len))
     }
 
     async fn write_summaries_to_cache(
@@ -841,44 +680,10 @@ impl Worker {
         folder_path: &str,
         summaries: &[ImapMessageSummary],
     ) -> Vec<(i64, String)> {
-        let mut failures = Vec::new();
+        let failures =
+            write_summaries_to_cache_impl(self.account.id, folder_path, summaries, &self.cache)
+                .await;
         let cache = self.cache.lock().await;
-        for msg in summaries {
-            if let Some((email, name)) = imap::first_address(&msg.from) {
-                let _ = cache.upsert_address(&email, &name);
-            }
-            if let Err(e) = cache.upsert_message(
-                self.account.id,
-                folder_path,
-                msg.uid,
-                msg.is_read,
-                msg.is_starred,
-                msg.has_attachments,
-                &msg.preview,
-            ) {
-                tracing::error!(
-                    "Worker[{}]: upsert_message {}/{} failed: {e}",
-                    self.account.id,
-                    folder_path,
-                    msg.uid
-                );
-                failures.push((msg.uid, e.to_string()));
-                continue;
-            }
-
-            if let Err(e) =
-                cache.save_message_headers(self.account.id, folder_path, msg.uid, &msg.headers)
-            {
-                tracing::error!(
-                    "Worker[{}]: save_message_headers {}/{} failed: {e}",
-                    self.account.id,
-                    folder_path,
-                    msg.uid
-                );
-                failures.push((msg.uid, e.to_string()));
-            }
-        }
-
         let unread = cache
             .count_unread(self.account.id, folder_path)
             .unwrap_or(0);
@@ -915,6 +720,117 @@ impl Worker {
                 self.session = None;
             }
         }
+        self.poll_background_folders_status().await;
+    }
+
+    async fn poll_background_folders_status(&mut self) {
+        let folders = {
+            let cache = self.cache.lock().await;
+            cache.load_folders(self.account.id).unwrap_or_default()
+        };
+
+        let current = self.current_folder.clone();
+        for folder in folders {
+            if folder.noselect {
+                continue;
+            }
+            if folder.path.eq_ignore_ascii_case("INBOX") {
+                continue;
+            }
+            if current.as_deref() == Some(&folder.path) {
+                continue;
+            }
+
+            let session = match self.session.as_mut() {
+                Some(s) => s,
+                None => break,
+            };
+
+            match imap::folder_status(session, &folder.path).await {
+                Ok((uidvalidity, exists, uid_next, unseen)) => {
+                    let (cached_last_seen, _) = {
+                        let cache = self.cache.lock().await;
+                        cache
+                            .folder_sync_state(self.account.id, &folder.path)
+                            .unwrap_or((0, None))
+                    };
+                    let cached_uv = {
+                        let cache = self.cache.lock().await;
+                        cache
+                            .folder_uidvalidity(self.account.id, &folder.path)
+                            .unwrap_or(0)
+                    };
+
+                    if uidvalidity != 0 && cached_uv != 0 && uidvalidity != cached_uv {
+                        self.handle_uidvalidity_change(&folder.path, uidvalidity)
+                            .await;
+                    }
+
+                    let should_sync = match uid_next {
+                        Some(next) => i64::from(next) > cached_last_seen + 1,
+                        None => exists > 0 && cached_last_seen == 0,
+                    };
+
+                    if should_sync {
+                        tracing::info!(
+                            "Worker[{}]: background folder {} advanced; syncing",
+                            self.account.id,
+                            folder.path
+                        );
+                        let _ = self.sync_folder_first_page(&folder.path).await;
+                    } else if let Some(unseen_count) = unseen {
+                        let unread_i32 = unseen_count as i32;
+                        if folder.unread_count != unread_i32 {
+                            let cache = self.cache.lock().await;
+                            let _ = cache.update_folder_unread(
+                                self.account.id,
+                                &folder.path,
+                                unread_i32,
+                            );
+                            self.emit_signal(DaemonSignal::FolderUnreadChanged {
+                                account_id: self.account.id,
+                                folder_path: folder.path.clone(),
+                                unread_count: unread_i32,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "Worker[{}]: STATUS on {} failed: {}",
+                        self.account.id,
+                        folder.path,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    async fn handle_uidvalidity_change(&mut self, folder_path: &str, uidvalidity: i64) {
+        let cleared = {
+            let cache = self.cache.lock().await;
+            cache
+                .clear_folder_messages(self.account.id, folder_path)
+                .unwrap_or(0)
+        };
+        tracing::warn!(
+            "Worker[{}]: UIDVALIDITY changed for {} to {}; cleared {} cached message(s)",
+            self.account.id,
+            folder_path,
+            uidvalidity,
+            cleared
+        );
+
+        self.body_prefetch.retain(|(p, _)| p != folder_path);
+        self.body_prefetched.retain(|(p, _)| p != folder_path);
+        self.attachment_prefetch.retain(|(p, _)| p != folder_path);
+        self.attachment_prefetched.retain(|(p, _)| p != folder_path);
+        self.backfill_queue
+            .retain(|job| job.folder_path != folder_path);
+
+        let cache = self.cache.lock().await;
+        let _ = cache.set_folder_uidvalidity(self.account.id, folder_path, uidvalidity);
     }
 
     async fn resolve_role_folder(&self, kind: crate::types::FolderKind) -> Option<String> {
@@ -946,4 +862,215 @@ enum IdleResult {
     Disconnected,
 
     Request,
+}
+
+pub(crate) async fn get_valid_access_token_impl(
+    account: &Account,
+    cache: &Arc<Mutex<Cache>>,
+    cached_token: &mut Option<(String, i64)>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let now = chrono::Utc::now().timestamp();
+    let buffer = 300;
+
+    if let Some((ref token, expires_at)) = cached_token {
+        if *expires_at > 0 && now < *expires_at - buffer {
+            return Ok(token.clone());
+        }
+    }
+
+    let refresh_token = {
+        let c = cache.lock().await;
+        c.load_account(account.id)?
+            .and_then(|a| a.refresh_token)
+            .or_else(|| account.refresh_token.clone())
+    }
+    .ok_or("No refresh token")?;
+
+    let provider = crate::oauth::provider_for(account)?;
+    let (client_id, client_secret) = crate::oauth::client_credentials(provider)?;
+    let token = crate::oauth::refresh_access_token(
+        provider.token_endpoint,
+        &client_id,
+        &client_secret,
+        &refresh_token,
+    )
+    .await?;
+
+    if let Some(ref new_rt) = token.refresh_token {
+        if new_rt != &refresh_token {
+            tracing::info!(
+                "Worker[{}]: {} issued new refresh token, saving",
+                account.id,
+                provider.id
+            );
+            let c = cache.lock().await;
+            if let Err(e) = c.update_refresh_token(account.id, new_rt) {
+                tracing::error!(
+                    "Worker[{}]: failed to save new refresh token: {}",
+                    account.id,
+                    e
+                );
+            }
+        }
+    }
+
+    let access_token = token.access_token.clone();
+    *cached_token = Some((access_token.clone(), token.expires_at()));
+
+    tracing::debug!(
+        "Worker[{}]: refreshed access token (expires in {}s)",
+        account.id,
+        token.expires_at() - now
+    );
+
+    Ok(access_token)
+}
+
+pub(crate) async fn connect_account_session(
+    account: &Account,
+    secrets: &Secrets,
+    cache: &Arc<Mutex<Cache>>,
+    cached_token: &mut Option<(String, i64)>,
+) -> Result<ImapSession, Box<dyn std::error::Error + Send + Sync>> {
+    let host = account
+        .imap_host
+        .clone()
+        .unwrap_or_else(|| "localhost".to_string());
+    let port = account.imap_port.unwrap_or(993) as u16;
+    let email = account.email.clone();
+
+    if account.auth_type == "oauth" {
+        let access_token = get_valid_access_token_impl(account, cache, cached_token).await?;
+        imap::connect_session_oauth(&host, port, &email, &access_token).await
+    } else {
+        let key_name = format!("pelliper:{}", email);
+        let password = secrets.get_password(&key_name).await?;
+        imap::connect_session_password(&host, port, &email, &password).await
+    }
+}
+
+pub(crate) async fn write_summaries_to_cache_impl(
+    account_id: i64,
+    folder_path: &str,
+    summaries: &[ImapMessageSummary],
+    cache: &Arc<Mutex<Cache>>,
+) -> Vec<(i64, String)> {
+    let mut failures = Vec::new();
+    let cache = cache.lock().await;
+    for msg in summaries {
+        if let Some((email, name)) = imap::first_address(&msg.from) {
+            let _ = cache.upsert_address(&email, &name);
+        }
+        if let Err(e) = cache.upsert_message(
+            account_id,
+            folder_path,
+            msg.uid,
+            msg.is_read,
+            msg.is_starred,
+            msg.has_attachments,
+            &msg.preview,
+        ) {
+            tracing::error!(
+                "Worker[{}]: upsert_message {}/{} failed: {e}",
+                account_id,
+                folder_path,
+                msg.uid
+            );
+            failures.push((msg.uid, e.to_string()));
+            continue;
+        }
+
+        if let Err(e) = cache.save_message_headers(account_id, folder_path, msg.uid, &msg.headers) {
+            tracing::error!(
+                "Worker[{}]: save_message_headers {}/{} failed: {e}",
+                account_id,
+                folder_path,
+                msg.uid
+            );
+            failures.push((msg.uid, e.to_string()));
+        }
+    }
+    failures
+}
+
+pub(crate) async fn reconcile_window_impl(
+    account_id: i64,
+    folder_path: &str,
+    lo: i64,
+    hi: i64,
+    session: &mut ImapSession,
+    cache: &Arc<Mutex<Cache>>,
+    signal_tx: Option<&mpsc::UnboundedSender<DaemonSignal>>,
+) -> Result<(Vec<i64>, usize, usize), Box<dyn std::error::Error + Send + Sync>> {
+    if lo > hi || hi <= 0 {
+        return Ok((Vec::new(), 0, 0));
+    }
+    let uid_set = format!("{lo}:{hi}");
+    let server_flags = imap::fetch_uid_flags(session, folder_path, &uid_set).await?;
+    let server_uids: HashSet<i64> = server_flags.iter().map(|&(u, _, _)| u).collect();
+
+    let (to_delete, flags_to_update) = {
+        let cache = cache.lock().await;
+        let cached = cache.cached_uids_in_range(account_id, folder_path, lo, hi)?;
+        let pending = cache.pending_action_uids(account_id, folder_path)?;
+
+        let to_delete: Vec<i64> = cached
+            .into_iter()
+            .filter(|u| !server_uids.contains(u) && !pending.contains(u))
+            .collect();
+
+        let flags_to_update: Vec<(i64, bool, bool)> = server_flags
+            .into_iter()
+            .filter(|(u, _, _)| !pending.contains(u))
+            .collect();
+
+        (to_delete, flags_to_update)
+    };
+
+    let mut deleted = 0;
+    let mut changed_flags = Vec::new();
+
+    if !to_delete.is_empty() || !flags_to_update.is_empty() {
+        let mut cache = cache.lock().await;
+        if !to_delete.is_empty() {
+            deleted = cache.delete_messages(account_id, folder_path, &to_delete)?;
+            if deleted > 0 {
+                tracing::info!(
+                    "Worker[{}]: expunged {} message(s) in {} (window {uid_set})",
+                    account_id,
+                    deleted,
+                    folder_path
+                );
+            }
+        }
+        if !flags_to_update.is_empty() {
+            changed_flags =
+                cache.update_message_flags_bulk(account_id, folder_path, &flags_to_update)?;
+        }
+        if deleted > 0 || !changed_flags.is_empty() {
+            let unread = cache.count_unread(account_id, folder_path).unwrap_or(0);
+            let _ = cache.update_folder_unread(account_id, folder_path, unread);
+            if let Some(tx) = signal_tx {
+                let _ = tx.send(DaemonSignal::FolderUnreadChanged {
+                    account_id,
+                    folder_path: folder_path.to_string(),
+                    unread_count: unread,
+                });
+            }
+        }
+    }
+
+    if let Some(tx) = signal_tx {
+        for &(uid, is_read, is_starred) in &changed_flags {
+            let _ = tx.send(DaemonSignal::MessageFlagsChanged {
+                account_id,
+                folder_path: folder_path.to_string(),
+                uid,
+                is_read,
+                is_starred,
+            });
+        }
+    }
+
+    Ok((to_delete, deleted, changed_flags.len()))
 }

@@ -66,6 +66,37 @@ impl Worker {
         });
     }
 
+    pub(super) async fn maybe_queue_next_backfill_folder(&mut self) {
+        if !self.backfill_queue.is_empty() {
+            return;
+        }
+        let folders = {
+            let cache = self.cache.lock().await;
+            cache.load_folders(self.account.id).unwrap_or_default()
+        };
+        for folder in folders {
+            if folder.noselect {
+                continue;
+            }
+            let (last_seen_uid, cursor) = {
+                let cache = self.cache.lock().await;
+                cache
+                    .folder_sync_state(self.account.id, &folder.path)
+                    .unwrap_or((0, None))
+            };
+            let needs_backfill = match cursor {
+                Some(c) => c > 0,
+                None => last_seen_uid > 0,
+            };
+            if needs_backfill {
+                self.queue_backfill_for_folder(&folder.path).await;
+                if !self.backfill_queue.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+
     pub(super) async fn backfill_uidvalidity_ok(
         &mut self,
         folder_path: &str,

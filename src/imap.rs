@@ -205,6 +205,22 @@ pub async fn examine_folder(
     ))
 }
 
+pub async fn folder_status(
+    session: &mut ImapSession,
+    folder: &str,
+) -> Result<(i64, u32, Option<u32>, Option<u32>), Box<dyn std::error::Error + Send + Sync>> {
+    let mailbox = session
+        .status(folder, "(UIDVALIDITY EXISTS UIDNEXT UNSEEN)")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok((
+        mailbox.uid_validity.map(i64::from).unwrap_or(0),
+        mailbox.exists,
+        mailbox.uid_next,
+        mailbox.unseen,
+    ))
+}
+
 fn trusted_highest_uid(exists: u32, uid_next: Option<u32>) -> Option<u32> {
     let high = uid_next?.checked_sub(1)?;
     (high >= exists).then_some(high)

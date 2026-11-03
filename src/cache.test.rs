@@ -1487,3 +1487,56 @@ fn search_messages_empty_or_whitespace_query_returns_empty_vec() {
         .is_empty());
     assert!(cache.search_messages(1, "***").expect("stars").is_empty());
 }
+
+#[test]
+fn background_folder_tracking_and_backfill_advancement() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+
+    for (path, kind, last_seen, cursor, unread) in [
+        ("INBOX", "inbox", 500, Some(0), 2),
+        ("Sent", "sent", 200, None, 0),
+        ("Archive", "archive", 1000, Some(400), 5),
+        ("Drafts", "drafts", 0, None, 0),
+    ] {
+        cache
+            .upsert_folder(1, path, unread, false, kind)
+            .expect("upsert folder");
+        cache
+            .set_folder_last_seen_uid(1, path, last_seen)
+            .expect("set last seen");
+        if let Some(c) = cursor {
+            cache
+                .set_folder_backfill_cursor(1, path, Some(c))
+                .expect("set cursor");
+        }
+    }
+
+    let folders = cache.load_folders(1).expect("load folders");
+    assert_eq!(folders.len(), 4);
+
+    let needs_backfill: Vec<String> = folders
+        .iter()
+        .filter_map(|f| {
+            let (last_seen, cursor) = cache.folder_sync_state(1, &f.path).ok()?;
+            let needed = match cursor {
+                Some(c) => c > 0,
+                None => last_seen > 0,
+            };
+            if needed {
+                Some(f.path.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(needs_backfill, vec!["Archive", "Sent"]);
+
+    cache
+        .update_folder_unread(1, "Archive", 12)
+        .expect("update unread");
+    let updated = cache.load_folders(1).expect("reload");
+    let archive_folder = updated.iter().find(|f| f.path == "Archive").unwrap();
+    assert_eq!(archive_folder.unread_count, 12);
+}

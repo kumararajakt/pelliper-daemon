@@ -25,7 +25,7 @@ not raw feature parity. Each is independently shippable.
 | 10 | ~~`sync_failures` ledger absent~~ ✅ done | Failed header/body fetches are lost for the session | S | L |
 | 11 | ~~No D-Bus signals for real-time UI push~~ ✅ done | UI must poll daemon for new mail, status, and folder changes | S | L |
 | 12 | ~~No D-Bus search method for FTS~~ ✅ done | `messages_fts` is maintained but unqueried via D-Bus | S | L |
-| 13 | Single connection drops INBOX push on folder switch | Viewing custom/sent folders stops real-time new mail alerts | M | M |
+| 13 | ~~Single connection drops INBOX push on folder switch~~ ✅ done | Viewing custom/sent folders stops real-time new mail alerts | M | M |
 | 14 | Folder operations unhedged by action ledger | Offline folder create/rename/delete drops on network glitch | S | L |
 | 15 | Corrupt MIME structure and missing filename on sent attachments | Attachments show as unnamed.dat or overwrite text body | S | L |
 | 16 | Outbox table drops attachment paths and reply headers on retry | Offline sends lose attachments and threading on retry | S | M |
@@ -550,36 +550,23 @@ and `Cache::search_messages(account_id, query)`:
 
 ## 13. Dual-connection architecture for INBOX IDLE and background folder tracking
 
-**Status: proposed.** Currently, the worker maintains exactly one stateful IMAP
-connection per account. Because IMAP limits an `IDLE` session to the single
-currently selected folder, when the user opens or backfills another folder (e.g.
-`Archive`, `Sent`, or a custom label), the connection leaves `INBOX`. While
-servicing or watching another folder, push notifications for newly arriving
-`INBOX` mail are completely dormant and only caught by the 120s fallback poll.
-
-Opening an open connection per folder to IDLE across all folders is infeasible
-due to server connection caps (e.g., Gmail limits accounts to 15 connections;
-Yahoo, iCloud, and Dovecot often enforce 5–10 per IP).
-
-**Flectar reference.** A separate connection is dedicated to INBOX push vs
-background sync and worker tasks.
-
-**Proposed change.**
-- **Connection 1 (Dedicated Push)**: Stays permanently locked to `INBOX` via
-  `IDLE`. It never navigates away, guaranteeing zero-latency desktop notifications
-  for incoming mail regardless of user activity.
+**Status: implemented.**
+- **Connection 1 (Dedicated Push)**: Implemented in `src/worker/inbox_watcher.rs`. Spawns
+  a dedicated concurrent task per account running its own IMAP connection permanently
+  locked to `INBOX` in `IDLE`. Real-time incoming mail alerts (`NewMailReceived`,
+  `FolderUnreadChanged`) and reconciliation trigger with zero latency regardless of
+  what folder the user is currently browsing or backfilling.
 - **Connection 2 (Worker)**: Handles active user views, lazy body downloads,
-  action ledger draining, and global history backfill.
-- **Background Folder Tracking (Lightweight STATUS polling)**: To detect mail
-  routed to non-inbox folders by server-side rules without opening a connection
-  per folder, Connection 2 periodically issues lightweight IMAP `STATUS` commands
-  (`STATUS "<folder>" (UNSEEN UIDNEXT)`) on background folders every few minutes.
-  If `UIDNEXT` has advanced beyond the local cursor, it fetches the new messages.
-- **Global Folder Backfill**: When backfill completes on the active folder,
-  Connection 2 advances through remaining account folders to ensure historical
-  headers are fully cached offline across all folders.
-
-**Files.** `src/worker.rs`, `src/worker/idle.rs`, `src/worker/backfill.rs`.
+  action ledger draining, and global history backfill. When the user selects a folder,
+  Connection 2 navigates to and IDLEs on that folder while Connection 1 continues
+  watching `INBOX`.
+- **Background Folder Tracking (Lightweight STATUS polling)**: In `do_periodic_resync`,
+  Connection 2 queries `STATUS` (`UIDVALIDITY EXISTS UIDNEXT UNSEEN`) via `imap::folder_status`
+  across all background account folders without opening individual connections or leaving
+  the current folder. When `UIDNEXT` advances, it syncs the folder and updates unread counts.
+- **Global Folder Backfill**: In `src/worker/backfill.rs`, `maybe_queue_next_backfill_folder`
+  automatically advances through remaining account folders when the active folder's backfill
+  reaches 0, ensuring offline caching across all mailboxes.
 
 ---
 
