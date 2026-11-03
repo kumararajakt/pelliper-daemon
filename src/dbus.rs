@@ -289,6 +289,17 @@ impl Daemon {
         }
     }
 
+    async fn search_messages(&self, account_id: i64, query: &str) -> String {
+        let cache = self.cache.lock().await;
+        match cache.search_messages(account_id, query) {
+            Ok(results) => serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string()),
+            Err(e) => {
+                tracing::error!("Search failed: {e}");
+                "[]".to_string()
+            }
+        }
+    }
+
     async fn is_known_address(&self, email: &str) -> bool {
         let cache = self.cache.lock().await;
         cache.is_known_address(email).unwrap_or(false)

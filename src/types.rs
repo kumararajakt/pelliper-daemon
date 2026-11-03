@@ -43,6 +43,23 @@ pub struct Message {
     pub preview: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SearchResult {
+    pub account_id: i64,
+    pub folder_path: String,
+    pub uid: i64,
+    pub subject: Option<String>,
+    pub sender: Option<String>,
+    pub date: i64,
+    pub in_reply_to: Option<String>,
+    pub message_id: Option<String>,
+    pub references: Option<String>,
+    pub has_attachments: bool,
+    pub is_read: bool,
+    pub is_starred: bool,
+    pub preview: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AttachmentRecord {
     pub name: String,

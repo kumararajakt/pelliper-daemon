@@ -1,6 +1,6 @@
 use crate::types::{
     Account, ActionKind, AttachmentRecord, Folder, Message, MessageHeaders, OutboxItem,
-    PendingAction, SyncFailure, SyncStage,
+    PendingAction, SearchResult, SyncFailure, SyncStage,
 };
 use rusqlite::{Connection, OptionalExtension, Result};
 use std::collections::HashSet;
@@ -630,6 +630,67 @@ impl Cache {
         Ok(count)
     }
 
+    pub fn search_messages(&self, account_id: i64, query: &str) -> Result<Vec<SearchResult>> {
+        let sanitized = sanitize_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let map_row = |row: &rusqlite::Row| {
+            Ok(SearchResult {
+                account_id: row.get(0)?,
+                folder_path: row.get(1)?,
+                uid: row.get(2)?,
+                subject: row.get(3)?,
+                sender: row.get(4)?,
+                date: row.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                in_reply_to: row.get(6)?,
+                message_id: row.get(7)?,
+                references: row.get(8)?,
+                has_attachments: row.get::<_, i32>(9)? != 0,
+                is_read: row.get::<_, i32>(10)? != 0,
+                is_starred: row.get::<_, i32>(11)? != 0,
+                preview: row.get(12)?,
+            })
+        };
+
+        if account_id > 0 {
+            let mut stmt = self.conn.prepare(
+                "SELECT m.account_id, m.folder_path, m.uid, h.subject, h.from_addr, h.date_ts,
+                        h.in_reply_to, h.message_id, h.references_, m.has_attachments,
+                        m.is_read, m.is_starred, m.preview
+                 FROM messages_fts f
+                 JOIN messages m ON m.rowid = f.rowid
+                 LEFT JOIN message_headers h
+                   ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+                 WHERE messages_fts MATCH ?1 AND m.account_id = ?2
+                 ORDER BY bm25(messages_fts), h.date_ts DESC
+                 LIMIT 100",
+            )?;
+            let results = stmt
+                .query_map(rusqlite::params![sanitized, account_id], map_row)?
+                .collect::<Result<Vec<_>>>()?;
+            Ok(results)
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT m.account_id, m.folder_path, m.uid, h.subject, h.from_addr, h.date_ts,
+                        h.in_reply_to, h.message_id, h.references_, m.has_attachments,
+                        m.is_read, m.is_starred, m.preview
+                 FROM messages_fts f
+                 JOIN messages m ON m.rowid = f.rowid
+                 LEFT JOIN message_headers h
+                   ON h.account_id = m.account_id AND h.folder_path = m.folder_path AND h.uid = m.uid
+                 WHERE messages_fts MATCH ?1
+                 ORDER BY bm25(messages_fts), h.date_ts DESC
+                 LIMIT 100",
+            )?;
+            let results = stmt
+                .query_map(rusqlite::params![sanitized], map_row)?
+                .collect::<Result<Vec<_>>>()?;
+            Ok(results)
+        }
+    }
+
     pub fn messages_missing_attachments(
         &self,
         account_id: i64,
@@ -1237,6 +1298,22 @@ impl Cache {
         })?;
         rows.collect::<Result<Vec<_>>>()
     }
+}
+
+pub fn sanitize_fts_query(query: &str) -> String {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .filter_map(|t| {
+            let stripped = t.trim_matches(|c: char| c == '"' || c == '*');
+            if stripped.is_empty() {
+                None
+            } else {
+                let escaped = stripped.replace('"', "\"\"");
+                Some(format!("\"{escaped}\"*"))
+            }
+        })
+        .collect();
+    tokens.join(" AND ")
 }
 
 fn row_to_action(row: &rusqlite::Row) -> Result<PendingAction> {

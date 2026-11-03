@@ -24,7 +24,7 @@ not raw feature parity. Each is independently shippable.
 | 9 | ~~Threading owned implicitly by UI~~ ✅ done | No threads table; contract undocumented | L | L |
 | 10 | ~~`sync_failures` ledger absent~~ ✅ done | Failed header/body fetches are lost for the session | S | L |
 | 11 | ~~No D-Bus signals for real-time UI push~~ ✅ done | UI must poll daemon for new mail, status, and folder changes | S | L |
-| 12 | No D-Bus search method for FTS | `messages_fts` is maintained but unqueried via D-Bus | S | L |
+| 12 | ~~No D-Bus search method for FTS~~ ✅ done | `messages_fts` is maintained but unqueried via D-Bus | S | L |
 | 13 | Single connection drops INBOX push on folder switch | Viewing custom/sent folders stops real-time new mail alerts | M | M |
 | 14 | Folder operations unhedged by action ledger | Offline folder create/rename/delete drops on network glitch | S | L |
 | 15 | Corrupt MIME structure and missing filename on sent attachments | Attachments show as unnamed.dat or overwrite text body | S | L |
@@ -534,16 +534,17 @@ mutations, unread counter changes, or background outbox delivery.
 
 ## 12. Expose Full-Text Search over D-Bus
 
-**Status: proposed.** Gap #7 implemented a fast, triggerless contentless FTS5
-index (`messages_fts`) indexing subjects, senders, previews, and bodies. However,
-there is no D-Bus method to query it, requiring a client to read SQLite directly.
-
-**Proposed change.**
-- Add a D-Bus method `search_messages(account_id: i64, query: &str) -> String`
-  returning JSON-serialized `Vec<Message>` matching the FTS query, ranked by bm25.
-- Add `Cache::search_messages(account_id, query)`.
-
-**Files.** `src/cache.rs`, `src/dbus.rs`.
+**Status: implemented.** Added D-Bus method `search_messages(account_id: i64, query: &str) -> String`
+and `Cache::search_messages(account_id, query)`:
+- Sanitizes input query via `sanitize_fts_query` (splits tokens, strips wildcards/quotes,
+  escapes internal quotes, and wraps in `"term"*` joined with `AND`) to safely allow
+  prefix search without raw FTS5 syntax errors.
+- Queries `messages_fts` joined to `messages` and `message_headers`, ranked by
+  `bm25(messages_fts)` and `h.date_ts DESC`, returning up to 100 matching `SearchResult`
+  records containing account ID, folder path, UID, subject, sender, date, preview, flags,
+  and threading headers.
+- If `account_id <= 0`, searches across all accounts; if `account_id > 0`, scopes results
+  to that account. Empty or whitespace-only queries immediately return an empty result.
 
 ---
 

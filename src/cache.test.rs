@@ -1329,3 +1329,161 @@ fn delete_messages_purges_messages_fts_attachments_and_sync_failures() {
         .expect("sf2 count");
     assert_eq!(sf2_count, 1);
 }
+
+#[test]
+fn sanitize_fts_query_escapes_quotes_and_wraps_terms_with_wildcards() {
+    assert_eq!(sanitize_fts_query("hello"), "\"hello\"*");
+    assert_eq!(
+        sanitize_fts_query("hello world"),
+        "\"hello\"* AND \"world\"*"
+    );
+    assert_eq!(
+        sanitize_fts_query("alice@example.com"),
+        "\"alice@example.com\"*"
+    );
+    assert_eq!(sanitize_fts_query("***"), "");
+    assert_eq!(sanitize_fts_query("   "), "");
+    assert_eq!(
+        sanitize_fts_query("\"unclosed quote"),
+        "\"unclosed\"* AND \"quote\"*"
+    );
+}
+
+#[test]
+fn search_messages_returns_matches_across_subject_sender_body_and_preview() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+
+    add_message(&cache, 10);
+    let mut h1 = sample_headers();
+    h1.subject = "Urgent Quarterly Report".to_string();
+    h1.from = r#"[{"name":"Alice Smith","email":"alice.smith@example.org"}]"#.to_string();
+    cache
+        .save_message_headers(1, "INBOX", 10, &h1)
+        .expect("headers 10");
+    cache
+        .save_body(1, "INBOX", 10, "<p>Meeting scheduled for tomorrow.</p>")
+        .expect("body 10");
+
+    add_message(&cache, 20);
+    let mut h2 = sample_headers();
+    h2.subject = "Invoice for Services".to_string();
+    h2.from = r#"[{"name":"Bob Jones","email":"bob.jones@vendor.net"}]"#.to_string();
+    cache
+        .save_message_headers(1, "INBOX", 20, &h2)
+        .expect("headers 20");
+    cache
+        .save_body(1, "INBOX", 20, "<p>Payment due immediately.</p>")
+        .expect("body 20");
+
+    let report_hits = cache.search_messages(1, "Report").expect("search report");
+    assert_eq!(report_hits.len(), 1);
+    assert_eq!(report_hits[0].uid, 10);
+    assert_eq!(
+        report_hits[0].subject.as_deref(),
+        Some("Urgent Quarterly Report")
+    );
+    assert_eq!(
+        report_hits[0].sender.as_deref(),
+        Some(r#"[{"name":"Alice Smith","email":"alice.smith@example.org"}]"#)
+    );
+    assert_eq!(report_hits[0].folder_path, "INBOX");
+    assert_eq!(report_hits[0].account_id, 1);
+
+    let sender_hits = cache
+        .search_messages(1, "bob.jones@vendor.net")
+        .expect("search sender");
+    assert_eq!(sender_hits.len(), 1);
+    assert_eq!(sender_hits[0].uid, 20);
+
+    let body_hits = cache.search_messages(1, "scheduled").expect("search body");
+    assert_eq!(body_hits.len(), 1);
+    assert_eq!(body_hits[0].uid, 10);
+
+    let payment_hits = cache
+        .search_messages(1, "payment")
+        .expect("search body payment");
+    assert_eq!(payment_hits.len(), 1);
+    assert_eq!(payment_hits[0].uid, 20);
+}
+
+#[test]
+fn search_messages_respects_account_scoping() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    cache
+        .conn
+        .execute(
+            "INSERT INTO accounts (id, email) VALUES (2, 'user2@example.com')",
+            [],
+        )
+        .expect("add account 2");
+    cache
+        .conn
+        .execute(
+            "INSERT INTO folders (account_id, path) VALUES (2, 'INBOX')",
+            [],
+        )
+        .expect("folder 2");
+
+    cache
+        .conn
+        .execute(
+            "INSERT INTO messages (account_id, folder_path, uid, preview) VALUES (1, 'INBOX', 1, 'Conference notes')",
+            [],
+        )
+        .expect("msg acc 1");
+    let mut h1 = sample_headers();
+    h1.subject = "Global Announcement".to_string();
+    cache.save_message_headers(1, "INBOX", 1, &h1).expect("h1");
+
+    cache
+        .conn
+        .execute(
+            "INSERT INTO messages (account_id, folder_path, uid, preview) VALUES (2, 'INBOX', 1, 'Conference tickets')",
+            [],
+        )
+        .expect("msg acc 2");
+    let mut h2 = sample_headers();
+    h2.subject = "Global Announcement".to_string();
+    cache.save_message_headers(2, "INBOX", 1, &h2).expect("h2");
+
+    let acc1_results = cache
+        .search_messages(1, "Announcement")
+        .expect("search acc 1");
+    assert_eq!(acc1_results.len(), 1);
+    assert_eq!(acc1_results[0].account_id, 1);
+
+    let acc2_results = cache
+        .search_messages(2, "Announcement")
+        .expect("search acc 2");
+    assert_eq!(acc2_results.len(), 1);
+    assert_eq!(acc2_results[0].account_id, 2);
+
+    let global_results = cache
+        .search_messages(0, "Announcement")
+        .expect("search global 0");
+    assert_eq!(global_results.len(), 2);
+
+    let negative_account_results = cache
+        .search_messages(-1, "Announcement")
+        .expect("search global -1");
+    assert_eq!(negative_account_results.len(), 2);
+}
+
+#[test]
+fn search_messages_empty_or_whitespace_query_returns_empty_vec() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+    add_message(&cache, 1);
+    cache
+        .save_message_headers(1, "INBOX", 1, &sample_headers())
+        .expect("headers");
+
+    assert!(cache.search_messages(1, "").expect("empty").is_empty());
+    assert!(cache
+        .search_messages(1, "   ")
+        .expect("whitespace")
+        .is_empty());
+    assert!(cache.search_messages(1, "***").expect("stars").is_empty());
+}
