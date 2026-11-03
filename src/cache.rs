@@ -402,10 +402,64 @@ impl Cache {
     }
 
     pub fn delete_folder(&self, account_id: i64, path: &str) -> Result<()> {
+        self.clear_folder_messages(account_id, path)?;
+        self.conn.execute(
+            "DELETE FROM pending_actions WHERE account_id = ?1 AND folder_path = ?2",
+            rusqlite::params![account_id, path],
+        )?;
         self.conn.execute(
             "DELETE FROM folders WHERE account_id = ?1 AND path = ?2",
             rusqlite::params![account_id, path],
         )?;
+        Ok(())
+    }
+
+    pub fn rename_folder(&mut self, account_id: i64, old_path: &str, new_path: &str) -> Result<()> {
+        let (kind, _) = crate::imap::classify_with_source(new_path, &[]);
+        let tx = self.conn.transaction()?;
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        let updated = tx.execute(
+            "UPDATE folders SET path = ?1, kind = ?2 WHERE account_id = ?3 AND path = ?4",
+            rusqlite::params![new_path, kind.as_str(), account_id, old_path],
+        )?;
+        if updated == 0 {
+            tx.execute(
+                "INSERT INTO folders (account_id, path, unread_count, noselect, kind) VALUES (?1, ?2, 0, 0, ?3)
+                 ON CONFLICT(account_id, path) DO UPDATE SET kind = ?3",
+                rusqlite::params![account_id, new_path, kind.as_str()],
+            )?;
+        }
+        tx.execute(
+            "UPDATE messages SET folder_path = ?1 WHERE account_id = ?2 AND folder_path = ?3",
+            rusqlite::params![new_path, account_id, old_path],
+        )?;
+        tx.execute(
+            "UPDATE message_headers SET folder_path = ?1 WHERE account_id = ?2 AND folder_path = ?3",
+            rusqlite::params![new_path, account_id, old_path],
+        )?;
+        tx.execute(
+            "UPDATE bodies SET folder_path = ?1 WHERE account_id = ?2 AND folder_path = ?3",
+            rusqlite::params![new_path, account_id, old_path],
+        )?;
+        tx.execute(
+            "UPDATE attachments SET folder_path = ?1 WHERE account_id = ?2 AND folder_path = ?3",
+            rusqlite::params![new_path, account_id, old_path],
+        )?;
+        tx.execute(
+            "UPDATE sync_failures SET folder_path = ?1 WHERE account_id = ?2 AND folder_path = ?3",
+            rusqlite::params![new_path, account_id, old_path],
+        )?;
+        tx.execute(
+            "UPDATE pending_actions SET folder_path = ?1 WHERE account_id = ?2 AND folder_path = ?3",
+            rusqlite::params![new_path, account_id, old_path],
+        )?;
+        tx.execute(
+            "UPDATE pending_actions
+             SET payload = json_set(payload, '$.dest', ?1)
+             WHERE account_id = ?2 AND kind = 'move' AND json_extract(payload, '$.dest') = ?3",
+            rusqlite::params![new_path, account_id, old_path],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

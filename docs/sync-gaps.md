@@ -26,7 +26,7 @@ not raw feature parity. Each is independently shippable.
 | 11 | ~~No D-Bus signals for real-time UI push~~ ✅ done | UI must poll daemon for new mail, status, and folder changes | S | L |
 | 12 | ~~No D-Bus search method for FTS~~ ✅ done | `messages_fts` is maintained but unqueried via D-Bus | S | L |
 | 13 | ~~Single connection drops INBOX push on folder switch~~ ✅ done | Viewing custom/sent folders stops real-time new mail alerts | M | M |
-| 14 | Folder operations unhedged by action ledger | Offline folder create/rename/delete drops on network glitch | S | L |
+| 14 | ~~Folder operations unhedged by action ledger~~ ✅ done | Offline folder create/rename/delete drops on network glitch | S | L |
 | 15 | Corrupt MIME structure and missing filename on sent attachments | Attachments show as unnamed.dat or overwrite text body | S | L |
 | 16 | Outbox table drops attachment paths and reply headers on retry | Offline sends lose attachments and threading on retry | S | M |
 | 17 | Inline cid: images unmapped in body HTML | Embedded logos/screenshots appear broken in Qt MessageView | S | L |
@@ -572,16 +572,20 @@ and `Cache::search_messages(account_id, query)`:
 
 ## 14. Durable action ledger for folder operations
 
-**Status: proposed.** Flags, moves, and deletes are protected by the durable
-`pending_actions` ledger (Gap #4). Folder create, rename, and delete are
-currently executed immediately without ledger backup, so network interruptions
-or crashes drop the user's intent.
+**Status: ✅ done.** Flags, moves, and deletes are protected by the durable
+`pending_actions` ledger (Gap #4). Folder mutations (`CreateFolder`, `RenameFolder`,
+`DeleteFolder`) are now hedged by the ledger as well.
 
-**Proposed change.**
-- Extend `ActionKind` with `CreateFolder`, `RenameFolder`, and `DeleteFolder`.
-- Route folder mutations through `enqueue_action` and the drain loop.
+**Implementation.**
+- Extended `ActionKind` with `CreateFolder`, `RenameFolder`, and `DeleteFolder` variants, along with `RenameFolderPayload` in `src/types.rs`.
+- Added folder-specific permanent error detection strings to `is_permanent_error` in `src/actions.rs` ("already exists", "already in use", "invalid mailbox name", etc.).
+- Implemented `Cache::rename_folder` in `src/cache.rs` with `PRAGMA defer_foreign_keys = ON;` in a transaction, atomically updating `folders`, `messages`, `message_headers`, `bodies`, `attachments`, `sync_failures`, `pending_actions`, and rewriting destination paths in queued `move` actions.
+- Updated `Cache::delete_folder` in `src/cache.rs` to call `clear_folder_messages` to deindex FTS and clear messages, headers, bodies, attachments, and pending actions.
+- Routed `handle_create_folder`, `handle_rename_folder`, and `handle_delete_folder` through `Worker::enqueue_and_process`.
+- Handled folder action execution and local cache state application in `src/worker/actions.rs`.
+- Added unit tests verifying atomic folder renaming, message/FTS cascading on delete, and action round-tripping.
 
-**Files.** `src/types.rs`, `src/actions.rs`, `src/worker/actions.rs`, `src/worker/handlers.rs`.
+**Files.** `src/types.rs`, `src/actions.rs`, `src/actions.test.rs`, `src/cache.rs`, `src/cache.test.rs`, `src/worker/actions.rs`, `src/worker/handlers.rs`.
 
 ---
 

@@ -30,6 +30,8 @@ fn permanent_errors_are_recognised_case_insensitively() {
     assert!(is_permanent_error("Mailbox does not exist"));
     assert!(is_permanent_error("UNKNOWN MAILBOX"));
     assert!(is_permanent_error("folder doesn't exist"));
+    assert!(is_permanent_error("Mailbox already exists"));
+    assert!(is_permanent_error("Invalid mailbox name: [Test]"));
 }
 
 #[test]

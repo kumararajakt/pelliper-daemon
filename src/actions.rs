@@ -38,6 +38,10 @@ pub fn is_permanent_error(err: &str) -> bool {
         "non-existent",
         "nonexistent",
         "unknown mailbox",
+        "already exists",
+        "already in use",
+        "invalid mailbox name",
+        "invalid name",
     ]
     .iter()
     .any(|needle| l.contains(needle))

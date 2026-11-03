@@ -1540,3 +1540,256 @@ fn background_folder_tracking_and_backfill_advancement() {
     let archive_folder = updated.iter().find(|f| f.path == "Archive").unwrap();
     assert_eq!(archive_folder.unread_count, 12);
 }
+
+#[test]
+fn rename_folder_atomically_updates_all_associated_records() {
+    let (mut cache, _dir) = scratch();
+    add_account(&cache);
+
+    cache
+        .upsert_folder(1, "OldFolder", 3, false, "other")
+        .expect("upsert folder");
+    cache
+        .upsert_message(1, "OldFolder", 42, false, false, true, "preview text")
+        .expect("upsert message");
+
+    let mut headers = sample_headers();
+    headers.subject = "Secret Project".to_string();
+    cache
+        .save_message_headers(1, "OldFolder", 42, &headers)
+        .expect("headers");
+    cache
+        .save_body(1, "OldFolder", 42, "<p>secret details</p>")
+        .expect("body");
+    cache
+        .replace_attachments(
+            1,
+            "OldFolder",
+            42,
+            &[crate::types::AttachmentRecord {
+                name: "spec.pdf".to_string(),
+                file_path: "/tmp/spec.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                size: 2048,
+            }],
+        )
+        .expect("attachments");
+    cache
+        .record_sync_failure(
+            1,
+            "OldFolder",
+            42,
+            crate::types::SyncStage::Body,
+            1000,
+            "temporary fetch failure",
+        )
+        .expect("sync failure");
+    cache
+        .enqueue_action(
+            1,
+            "OldFolder",
+            42,
+            crate::types::ActionKind::SetFlags,
+            "{}",
+            1000,
+        )
+        .expect("enqueue action");
+
+    cache
+        .enqueue_action(
+            1,
+            "INBOX",
+            99,
+            crate::types::ActionKind::Move,
+            r#"{"dest":"OldFolder","refresh_dest":true}"#,
+            1000,
+        )
+        .expect("enqueue move action");
+
+    assert_eq!(fts_hits(&cache, "secret"), 1);
+
+    cache
+        .rename_folder(1, "OldFolder", "NewFolder")
+        .expect("rename folder");
+
+    let folders = cache.load_folders(1).expect("load folders");
+    assert!(!folders.iter().any(|f| f.path == "OldFolder"));
+    assert!(folders.iter().any(|f| f.path == "NewFolder"));
+
+    assert_eq!(cache.count_messages(1, "OldFolder").expect("old count"), 0);
+    assert_eq!(cache.count_messages(1, "NewFolder").expect("new count"), 1);
+
+    let msgs = cache.load_messages(1, "NewFolder", 0, 10).expect("load");
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].uid, 42);
+    assert_eq!(msgs[0].subject.as_deref(), Some("Secret Project"));
+
+    let body = cache.load_body(1, "NewFolder", 42).expect("body");
+    assert_eq!(body.as_deref(), Some("<p>secret details</p>"));
+
+    let atts = cache.load_attachments(1, "NewFolder", 42).expect("atts");
+    assert_eq!(atts.len(), 1);
+    assert_eq!(atts[0].name, "spec.pdf");
+
+    let sf_count: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_failures WHERE account_id = 1 AND folder_path = 'NewFolder' AND uid = 42",
+            [],
+            |r| r.get(0),
+        )
+        .expect("sf count");
+    assert_eq!(sf_count, 1);
+
+    let action_count: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_actions WHERE account_id = 1 AND folder_path = 'NewFolder' AND uid = 42",
+            [],
+            |r| r.get(0),
+        )
+        .expect("action count");
+    assert_eq!(action_count, 1);
+
+    let dest: String = cache
+        .conn
+        .query_row(
+            "SELECT json_extract(payload, '$.dest') FROM pending_actions WHERE account_id = 1 AND uid = 99",
+            [],
+            |r| r.get(0),
+        )
+        .expect("payload dest");
+    assert_eq!(dest, "NewFolder");
+
+    let hits = cache.search_messages(1, "secret").expect("search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].folder_path, "NewFolder");
+}
+
+#[test]
+fn delete_folder_clears_messages_attachments_actions_and_fts() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+
+    cache
+        .upsert_folder(1, "TrashFolder", 1, false, "trash")
+        .expect("upsert folder");
+    cache
+        .upsert_message(1, "TrashFolder", 77, false, false, false, "disposable")
+        .expect("upsert message");
+    let mut headers = sample_headers();
+    headers.subject = "Disposable Note".to_string();
+    cache
+        .save_message_headers(1, "TrashFolder", 77, &headers)
+        .expect("headers");
+    cache
+        .save_body(1, "TrashFolder", 77, "<p>disposable body</p>")
+        .expect("body");
+    cache
+        .enqueue_action(
+            1,
+            "TrashFolder",
+            77,
+            crate::types::ActionKind::SetFlags,
+            "{}",
+            1000,
+        )
+        .expect("enqueue action");
+
+    assert_eq!(fts_hits(&cache, "disposable"), 1);
+
+    cache
+        .delete_folder(1, "TrashFolder")
+        .expect("delete folder");
+
+    let folders = cache.load_folders(1).expect("load folders");
+    assert!(!folders.iter().any(|f| f.path == "TrashFolder"));
+    assert_eq!(cache.count_messages(1, "TrashFolder").expect("count"), 0);
+    assert_eq!(fts_hits(&cache, "disposable"), 0);
+
+    let pending_count: i64 = cache
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_actions WHERE account_id = 1 AND folder_path = 'TrashFolder'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("pending count");
+    assert_eq!(pending_count, 0);
+}
+
+#[test]
+fn folder_actions_round_trip_through_pending_actions_ledger() {
+    let (cache, _dir) = scratch();
+    add_account(&cache);
+
+    let action_create = cache
+        .enqueue_action(
+            1,
+            "Projects/New",
+            0,
+            crate::types::ActionKind::CreateFolder,
+            "{}",
+            100,
+        )
+        .expect("enqueue create");
+    assert_eq!(action_create.kind, crate::types::ActionKind::CreateFolder);
+    assert_eq!(action_create.folder_path, "Projects/New");
+    assert_eq!(action_create.uid, 0);
+
+    let rename_payload = serde_json::to_string(&crate::types::RenameFolderPayload {
+        new_name: "Projects/Renamed".to_string(),
+    })
+    .expect("serialize rename");
+    let action_rename = cache
+        .enqueue_action(
+            1,
+            "Projects/Old",
+            0,
+            crate::types::ActionKind::RenameFolder,
+            &rename_payload,
+            100,
+        )
+        .expect("enqueue rename");
+    assert_eq!(action_rename.kind, crate::types::ActionKind::RenameFolder);
+
+    let action_delete = cache
+        .enqueue_action(
+            1,
+            "Projects/Obsolete",
+            0,
+            crate::types::ActionKind::DeleteFolder,
+            "{}",
+            100,
+        )
+        .expect("enqueue delete");
+    assert_eq!(action_delete.kind, crate::types::ActionKind::DeleteFolder);
+
+    let claimed1 = cache
+        .claim_due_action(1, 200)
+        .expect("claim 1")
+        .expect("some");
+    assert_eq!(claimed1.id, action_create.id);
+    assert_eq!(claimed1.kind, crate::types::ActionKind::CreateFolder);
+    assert_eq!(claimed1.folder_path, "Projects/New");
+
+    let claimed2 = cache
+        .claim_due_action(1, 200)
+        .expect("claim 2")
+        .expect("some");
+    assert_eq!(claimed2.id, action_rename.id);
+    assert_eq!(claimed2.kind, crate::types::ActionKind::RenameFolder);
+    let parsed_rename: crate::types::RenameFolderPayload =
+        serde_json::from_str(&claimed2.payload).expect("deserialize rename payload");
+    assert_eq!(parsed_rename.new_name, "Projects/Renamed");
+
+    let claimed3 = cache
+        .claim_due_action(1, 200)
+        .expect("claim 3")
+        .expect("some");
+    assert_eq!(claimed3.id, action_delete.id);
+    assert_eq!(claimed3.kind, crate::types::ActionKind::DeleteFolder);
+    assert_eq!(claimed3.folder_path, "Projects/Obsolete");
+
+    assert!(cache.claim_due_action(1, 200).expect("claim 4").is_none());
+}

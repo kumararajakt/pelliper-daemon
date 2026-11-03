@@ -1,6 +1,6 @@
 use super::{Worker, WorkerRequest};
 use crate::imap;
-use crate::types::{ActionKind, MovePayload, SetFlagsPayload, SyncStage};
+use crate::types::{ActionKind, MovePayload, RenameFolderPayload, SetFlagsPayload, SyncStage};
 use futures::StreamExt;
 
 impl Worker {
@@ -356,50 +356,68 @@ impl Worker {
     }
 
     async fn handle_create_folder(&mut self, name: &str) {
-        if self.ensure_session().await.is_err() {
-            return;
-        }
-        let session = match self.session.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        if let Err(e) = session.create(name).await {
-            tracing::error!("Worker[{}]: create folder failed: {}", self.account.id, e);
-            return;
-        }
-
-        match imap::list_folders(session).await {
-            Ok(folders) => {
-                let cache = self.cache.lock().await;
-                for folder in folders {
-                    let _ = cache.upsert_folder(
-                        self.account.id,
-                        &folder.path,
-                        0,
-                        folder.noselect,
-                        folder.kind.as_str(),
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Worker[{}]: list_folders failed: {}", self.account.id, e);
-            }
-        }
+        self.enqueue_and_process(name, 0, ActionKind::CreateFolder, "{}".to_string())
+            .await;
     }
 
     async fn handle_rename_folder(&mut self, old_name: &str, new_name: &str) {
-        if self.ensure_session().await.is_err() {
-            return;
-        }
+        let payload = match serde_json::to_string(&RenameFolderPayload {
+            new_name: new_name.to_string(),
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    "Worker[{}]: failed to encode rename payload for {old_name}: {e}",
+                    self.account.id
+                );
+                return;
+            }
+        };
+        self.enqueue_and_process(old_name, 0, ActionKind::RenameFolder, payload)
+            .await;
+    }
+
+    async fn handle_delete_folder(&mut self, name: &str) {
+        self.enqueue_and_process(name, 0, ActionKind::DeleteFolder, "{}".to_string())
+            .await;
+    }
+
+    pub(super) async fn do_create_folder(&mut self, name: &str) -> Result<(), String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "no session".to_string())?;
+        session.create(name).await.map_err(|e| e.to_string())
+    }
+
+    pub(super) async fn do_rename_folder(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "no session".to_string())?;
+        session
+            .rename(old_name, new_name)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub(super) async fn do_delete_folder(&mut self, name: &str) -> Result<(), String> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or_else(|| "no session".to_string())?;
+        session.delete(name).await.map_err(|e| e.to_string())
+    }
+
+    pub(super) async fn refresh_folders_from_server(&mut self) {
         let session = match self.session.as_mut() {
             Some(s) => s,
             None => return,
         };
-        if let Err(e) = session.rename(old_name, new_name).await {
-            tracing::error!("Worker[{}]: rename folder failed: {}", self.account.id, e);
-            return;
-        }
-
         match imap::list_folders(session).await {
             Ok(folders) => {
                 let cache = self.cache.lock().await;
@@ -415,44 +433,6 @@ impl Worker {
             }
             Err(e) => {
                 tracing::warn!("Worker[{}]: list_folders failed: {}", self.account.id, e);
-            }
-        }
-    }
-
-    async fn handle_delete_folder(&mut self, name: &str) {
-        if self.ensure_session().await.is_err() {
-            return;
-        }
-        let session = match self.session.as_mut() {
-            Some(s) => s,
-            None => return,
-        };
-        if let Err(e) = session.delete(name).await {
-            tracing::error!("Worker[{}]: delete folder failed: {}", self.account.id, e);
-            return;
-        }
-
-        {
-            let cache = self.cache.lock().await;
-            let _ = cache.delete_folder(self.account.id, name);
-        }
-        if let Some(s) = self.session.as_mut() {
-            match imap::list_folders(s).await {
-                Ok(folders) => {
-                    let cache = self.cache.lock().await;
-                    for folder in folders {
-                        let _ = cache.upsert_folder(
-                            self.account.id,
-                            &folder.path,
-                            0,
-                            folder.noselect,
-                            folder.kind.as_str(),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Worker[{}]: list_folders failed: {}", self.account.id, e);
-                }
             }
         }
     }

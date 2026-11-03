@@ -84,10 +84,11 @@ pub struct OutboxItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
     SetFlags,
-
     Move,
-
     Delete,
+    CreateFolder,
+    RenameFolder,
+    DeleteFolder,
 }
 
 impl ActionKind {
@@ -96,6 +97,9 @@ impl ActionKind {
             ActionKind::SetFlags => "set_flags",
             ActionKind::Move => "move",
             ActionKind::Delete => "delete",
+            ActionKind::CreateFolder => "create_folder",
+            ActionKind::RenameFolder => "rename_folder",
+            ActionKind::DeleteFolder => "delete_folder",
         }
     }
 
@@ -104,6 +108,9 @@ impl ActionKind {
             "set_flags" => Some(ActionKind::SetFlags),
             "move" => Some(ActionKind::Move),
             "delete" => Some(ActionKind::Delete),
+            "create_folder" => Some(ActionKind::CreateFolder),
+            "rename_folder" => Some(ActionKind::RenameFolder),
+            "delete_folder" => Some(ActionKind::DeleteFolder),
             _ => None,
         }
     }
@@ -121,6 +128,11 @@ pub struct MovePayload {
     pub dest: String,
 
     pub refresh_dest: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RenameFolderPayload {
+    pub new_name: String,
 }
 
 #[derive(Debug, Clone)]

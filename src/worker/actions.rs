@@ -1,6 +1,8 @@
 use super::Worker;
 use crate::actions::{backoff_secs_jittered, retry_decision, RetryDecision};
-use crate::types::{ActionKind, DaemonSignal, MovePayload, PendingAction, SetFlagsPayload};
+use crate::types::{
+    ActionKind, DaemonSignal, MovePayload, PendingAction, RenameFolderPayload, SetFlagsPayload,
+};
 
 impl Worker {
     pub(super) async fn drain_one_action(&mut self) -> bool {
@@ -104,6 +106,14 @@ impl Worker {
                     .await
             }
             ActionKind::Delete => self.do_expunge(&action.folder_path, action.uid).await,
+            ActionKind::CreateFolder => self.do_create_folder(&action.folder_path).await,
+            ActionKind::RenameFolder => {
+                let payload: RenameFolderPayload = serde_json::from_str(&action.payload)
+                    .map_err(|e| format!("bad rename payload: {e}"))?;
+                self.do_rename_folder(&action.folder_path, &payload.new_name)
+                    .await
+            }
+            ActionKind::DeleteFolder => self.do_delete_folder(&action.folder_path).await,
         }
     }
 
@@ -194,6 +204,55 @@ impl Worker {
                     folder_path: action.folder_path.clone(),
                     unread_count: unread,
                 });
+            }
+            ActionKind::CreateFolder => {
+                let (kind, _) = crate::imap::classify_with_source(&action.folder_path, &[]);
+                {
+                    let cache = self.cache.lock().await;
+                    let _ = cache.upsert_folder(
+                        self.account.id,
+                        &action.folder_path,
+                        0,
+                        false,
+                        kind.as_str(),
+                    );
+                }
+                self.refresh_folders_from_server().await;
+            }
+            ActionKind::RenameFolder => {
+                let payload: RenameFolderPayload = match serde_json::from_str(&action.payload) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::error!(
+                            "Worker[{}]: failed to deserialize rename payload for {}: {e}",
+                            self.account.id,
+                            action.folder_path
+                        );
+                        return;
+                    }
+                };
+                {
+                    let mut cache = self.cache.lock().await;
+                    let _ = cache.rename_folder(
+                        self.account.id,
+                        &action.folder_path,
+                        &payload.new_name,
+                    );
+                }
+                if self.current_folder.as_deref() == Some(&action.folder_path) {
+                    self.current_folder = Some(payload.new_name);
+                }
+                self.refresh_folders_from_server().await;
+            }
+            ActionKind::DeleteFolder => {
+                {
+                    let cache = self.cache.lock().await;
+                    let _ = cache.delete_folder(self.account.id, &action.folder_path);
+                }
+                if self.current_folder.as_deref() == Some(&action.folder_path) {
+                    self.current_folder = None;
+                }
+                self.refresh_folders_from_server().await;
             }
         }
     }
