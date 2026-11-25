@@ -33,6 +33,16 @@ pub struct RpcNotification {
     pub params: Value,
 }
 
+impl RpcNotification {
+    pub fn new(method: impl Into<String>, params: Value) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method: method.into(),
+            params,
+        }
+    }
+}
+
 impl RpcResponse {
     pub fn ok(id: Value, result: Value) -> Self {
         Self {
