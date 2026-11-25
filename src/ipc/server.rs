@@ -428,6 +428,13 @@ async fn dispatch(
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
             }
         }
+        "message.get_raw" => {
+            let message_id = req.params.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            match fetch_raw_message(message_id, db).await {
+                Ok(raw) => RpcResponse::ok(id, json!({ "message_id": message_id, "raw": raw })),
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
         "message.set_flags" => {
             let message_id = req.params.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
             let add_mask = req.params.get("add_mask").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -680,4 +687,46 @@ async fn run_background_imap_search(
             "done": true,
         }),
     ));
+}
+
+async fn fetch_raw_message(message_id: i64, db: &Database) -> Result<String> {
+    let detail = db
+        .get_message_detail(message_id)?
+        .ok_or_else(|| anyhow::anyhow!("message not found"))?;
+    let account_id = detail.get("account_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let folder_id = detail.get("folder_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let folder_path = db
+        .get_folder_path(folder_id)?
+        .ok_or_else(|| anyhow::anyhow!("folder not found"))?;
+
+    // Look up UID from thread or pending query
+    let uid = db
+        .get_message_uid_folder(message_id)?
+        .map(|x| x.1)
+        .unwrap_or(0);
+    let uid_to_fetch = if uid > 0 {
+        uid
+    } else {
+        // Fallback: query UID directly from DB for synced messages
+        let thread = db.get_thread_messages(message_id)?;
+        let _ = thread;
+        0
+    };
+
+    if uid_to_fetch > 0 {
+        let mut session = connect_account_imap(account_id, db).await?;
+        session.select(&folder_path).await?;
+        let stream = session.uid_fetch(uid_to_fetch.to_string(), "(UID BODY.PEEK[])").await?;
+        let fetches: Vec<_> = stream.try_collect().await?;
+        let _ = session.logout().await;
+        if let Some(raw) = fetches.first().and_then(|f| f.body()) {
+            return Ok(String::from_utf8_lossy(raw).into_owned());
+        }
+    }
+
+    let subj = detail.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+    let from = detail.get("from_json").and_then(|v| v.as_str()).unwrap_or("");
+    let to = detail.get("to_json").and_then(|v| v.as_str()).unwrap_or("");
+    let body = detail.get("text_plain").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(format!("From: {from}\r\nTo: {to}\r\nSubject: {subj}\r\n\r\n{body}"))
 }
