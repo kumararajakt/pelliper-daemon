@@ -1076,4 +1076,30 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    pub fn suggest_contacts(&self, query: &str, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let pattern = format!("%{}%", query.trim());
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT from_json FROM messages WHERE from_json LIKE ?1 LIMIT ?2",
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let rows = stmt.query_map(params![pattern, limit * 3], |r| r.get::<_, String>(0))?;
+        for raw in rows.flatten() {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+                for item in arr {
+                    let addr = item.get("address").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+                    if !addr.is_empty() && seen.insert(addr.to_ascii_lowercase()) {
+                        out.push(serde_json::json!({ "name": name, "address": addr }));
+                        if out.len() >= limit as usize {
+                            return Ok(out);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
 }

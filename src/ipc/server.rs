@@ -514,6 +514,14 @@ async fn dispatch(
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
             }
         }
+        "contacts.suggest" => {
+            let query = req.params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = req.params.get("limit").and_then(|v| v.as_i64()).unwrap_or(8);
+            match db.suggest_contacts(query, limit) {
+                Ok(contacts) => RpcResponse::ok(id, json!({ "contacts": contacts })),
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
         other => RpcResponse::err(id, -32601, format!("method not found: {other}")),
     }
 }
