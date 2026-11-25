@@ -287,8 +287,62 @@ async fn dispatch(
         "message.get" => {
             let account_id = req.params.get("account_id").and_then(|v| v.as_i64()).unwrap_or(0);
             let message_id = req.params.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
-            supervisor.wake_account(account_id, SyncWakeCommand::FetchBodyNow(message_id));
-            RpcResponse::ok(id, json!({ "requested": message_id }))
+            match db.get_message_detail(message_id) {
+                Ok(Some(detail)) => {
+                    if !detail.get("body_synced").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        supervisor.wake_account(account_id, SyncWakeCommand::FetchBodyNow(message_id));
+                    }
+                    RpcResponse::ok(id, json!({ "message": detail }))
+                }
+                Ok(None) => {
+                    supervisor.wake_account(account_id, SyncWakeCommand::FetchBodyNow(message_id));
+                    RpcResponse::ok(id, json!({ "requested": message_id }))
+                }
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
+        "message.set_flags" => {
+            let message_id = req.params.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let add_mask = req.params.get("add_mask").and_then(|v| v.as_i64()).unwrap_or(0);
+            let remove_mask = req.params.get("remove_mask").and_then(|v| v.as_i64()).unwrap_or(0);
+            match db.set_flags_optimistic(message_id, add_mask, remove_mask) {
+                Ok(Some((account_id, _fid))) => {
+                    supervisor.wake_account(account_id, SyncWakeCommand::PendingOps);
+                    RpcResponse::ok(id, json!({ "ok": true }))
+                }
+                Ok(None) => RpcResponse::err(id, -32004, "message not found"),
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
+        "message.archive" | "message.delete" => {
+            let message_id = req.params.get("message_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let target_role = if req.method == "message.archive" { "archive" } else { "trash" };
+            match db.delete_or_move_optimistic(message_id, target_role) {
+                Ok(Some((account_id, folder_id))) => {
+                    let _ = events.send(RpcNotification::new(
+                        "folder.updated",
+                        json!({ "account_id": account_id, "folder_id": folder_id }),
+                    ));
+                    supervisor.wake_account(account_id, SyncWakeCommand::PendingOps);
+                    RpcResponse::ok(id, json!({ "ok": true }))
+                }
+                Ok(None) => RpcResponse::err(id, -32004, "message not found"),
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
+        "message.send" => {
+            let account_id = req.params.get("account_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let payload_str = req.params.to_string();
+            match db.enqueue_outbox(account_id, &payload_str) {
+                Ok(outbox_id) => {
+                    let _ = events.send(RpcNotification::new(
+                        "outbox.status",
+                        json!({ "outbox_id": outbox_id, "status": "queued" }),
+                    ));
+                    RpcResponse::ok(id, json!({ "outbox_id": outbox_id, "status": "queued" }))
+                }
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
         }
         other => RpcResponse::err(id, -32601, format!("method not found: {other}")),
     }

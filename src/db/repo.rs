@@ -364,4 +364,158 @@ impl Database {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    pub fn get_message_detail(&self, message_id: i64) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let row: Option<(i64, i64, i64, String, String, String, String, String, i64, i64, bool, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT m.id, m.account_id, m.folder_id, m.subject, m.from_json, m.to_json,
+                        m.cc_json, COALESCE(m.message_id, ''), m.date_ts, m.flags_bitmask, m.body_synced,
+                        b.text_plain, b.text_html
+                 FROM messages m
+                 LEFT JOIN message_bodies b ON b.message_id = m.id
+                 WHERE m.id = ?1",
+                params![message_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get::<_, i64>(10)? != 0,
+                        r.get(11)?,
+                        r.get(12)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((id, account_id, folder_id, subject, from_json, to_json, cc_json, rfc_id, date_ts, flags, body_synced, text_plain, text_html)) = row else {
+            return Ok(None);
+        };
+
+        let mut att_stmt = conn.prepare(
+            "SELECT id, filename, mime_type, size_bytes, is_inline, local_path
+             FROM attachments WHERE message_id = ?1 ORDER BY id ASC",
+        )?;
+        let attachments: Vec<serde_json::Value> = att_stmt
+            .query_map(params![message_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "filename": r.get::<_, String>(1)?,
+                    "mime_type": r.get::<_, String>(2)?,
+                    "size_bytes": r.get::<_, i64>(3)?,
+                    "is_inline": r.get::<_, i64>(4)? != 0,
+                    "local_path": r.get::<_, Option<String>>(5)?,
+                }))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(Some(serde_json::json!({
+            "id": id,
+            "account_id": account_id,
+            "folder_id": folder_id,
+            "subject": subject,
+            "from_json": from_json,
+            "to_json": to_json,
+            "cc_json": cc_json,
+            "message_id": rfc_id,
+            "date_ts": date_ts,
+            "flags_bitmask": flags,
+            "body_synced": body_synced,
+            "text_plain": text_plain,
+            "text_html": text_html,
+            "attachments": attachments,
+        })))
+    }
+
+    pub fn set_flags_optimistic(&self, message_id: i64, add_mask: i64, remove_mask: i64) -> Result<Option<(i64, i64)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let meta: Option<(i64, i64, i64)> = conn
+            .query_row(
+                "SELECT account_id, folder_id, uid FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((account_id, folder_id, uid)) = meta else {
+            return Ok(None);
+        };
+
+        conn.execute(
+            "UPDATE messages SET flags_bitmask = (flags_bitmask | ?1) & ~?2 WHERE id = ?3",
+            params![add_mask, remove_mask, message_id],
+        )?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let payload = serde_json::json!({ "add_mask": add_mask, "remove_mask": remove_mask }).to_string();
+        conn.execute(
+            "INSERT INTO pending_ops (account_id, folder_id, message_id, uid, op_type, payload_json, created_ts)
+             VALUES (?1, ?2, ?3, ?4, 'set_flags', ?5, ?6)",
+            params![account_id, folder_id, message_id, uid, payload, now],
+        )?;
+        Ok(Some((account_id, folder_id)))
+    }
+
+    pub fn delete_or_move_optimistic(&self, message_id: i64, target_role: &str) -> Result<Option<(i64, i64)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let meta: Option<(i64, i64, i64)> = conn
+            .query_row(
+                "SELECT account_id, folder_id, uid FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((account_id, folder_id, uid)) = meta else {
+            return Ok(None);
+        };
+
+        let target_folder: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM folders WHERE account_id = ?1 AND role = ?2 LIMIT 1",
+                params![account_id, target_role],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if let Some(tfid) = target_folder {
+            if tfid != folder_id {
+                conn.execute("UPDATE messages SET folder_id = ?1 WHERE id = ?2", params![tfid, message_id])?;
+            } else {
+                conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+            }
+        } else {
+            conn.execute("DELETE FROM messages WHERE id = ?1", params![message_id])?;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let payload = serde_json::json!({ "target_role": target_role }).to_string();
+        conn.execute(
+            "INSERT INTO pending_ops (account_id, folder_id, message_id, uid, op_type, payload_json, created_ts)
+             VALUES (?1, ?2, ?3, ?4, 'move_role', ?5, ?6)",
+            params![account_id, folder_id, message_id, uid, payload, now],
+        )?;
+        Ok(Some((account_id, folder_id)))
+    }
+
+    pub fn enqueue_outbox(&self, account_id: i64, payload_json: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "INSERT INTO outbox (account_id, payload_json, status) VALUES (?1, ?2, 'queued')",
+            params![account_id, payload_json],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
 }
