@@ -11,6 +11,7 @@ use crate::imap::client::ImapAuth;
 use crate::imap::idle_worker::run_idle_worker;
 use crate::imap::sync_worker::{run_sync_worker, SyncWakeCommand};
 use crate::ipc::protocol::RpcNotification;
+use crate::oauth::refresh_if_needed;
 use crate::secrets::{load_secret, AccountSecret};
 
 struct AccountHandle {
@@ -45,16 +46,25 @@ impl AccountSupervisor {
     pub async fn spawn_account(&self, account: AccountRow) {
         self.stop_account(account.id);
 
-        let auth = match load_secret(&account.email).await {
-            Ok(Some(AccountSecret::Password { password })) => ImapAuth::Password {
+        let raw_secret = match load_secret(&account.email).await {
+            Ok(Some(s)) => s,
+            _ => return,
+        };
+        let secret = if let Some(ref prov) = account.oauth_provider {
+            refresh_if_needed(&account.email, prov, raw_secret.clone()).await.unwrap_or(raw_secret)
+        } else {
+            raw_secret
+        };
+
+        let auth = match secret {
+            AccountSecret::Password { password } => ImapAuth::Password {
                 user: account.email.clone(),
                 password,
             },
-            Ok(Some(AccountSecret::OAuth2 { access_token, .. })) => ImapAuth::XOAuth2 {
+            AccountSecret::OAuth2 { access_token, .. } => ImapAuth::XOAuth2 {
                 user: account.email.clone(),
                 access_token,
             },
-            _ => return,
         };
 
         let cancel = CancellationToken::new();

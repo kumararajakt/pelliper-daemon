@@ -4,6 +4,7 @@ mod db;
 mod imap;
 mod ipc;
 mod mime;
+mod oauth;
 mod search;
 mod secrets;
 mod smtp;

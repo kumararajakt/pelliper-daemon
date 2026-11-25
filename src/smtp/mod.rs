@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use crate::db::Database;
 use crate::ipc::protocol::RpcNotification;
+use crate::oauth::refresh_if_needed;
 use crate::secrets::{load_secret, AccountSecret};
 
 #[derive(Debug, Clone)]
@@ -143,9 +144,14 @@ async fn send_single_outbox(db: &Database, account_id: i64, payload_json: &str) 
     let acc = db
         .get_account(account_id)?
         .context("account not found for outbox item")?;
-    let secret = load_secret(&acc.email)
+    let raw_secret = load_secret(&acc.email)
         .await?
         .context("credentials not found in keyring")?;
+    let secret = if let Some(ref prov) = acc.oauth_provider {
+        refresh_if_needed(&acc.email, prov, raw_secret).await?
+    } else {
+        raw_secret
+    };
 
     let auth = match secret {
         AccountSecret::Password { password } => SmtpAuth::Password {

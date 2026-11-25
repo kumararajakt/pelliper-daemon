@@ -14,6 +14,7 @@ use crate::db::Database;
 use crate::imap::client::{test_imap_connection, ImapAuth};
 use crate::imap::sync_worker::SyncWakeCommand;
 use crate::ipc::protocol::{RpcNotification, RpcRequest, RpcResponse};
+use crate::oauth::start_pkce_flow;
 use crate::search::parse_search_query;
 use crate::secrets::{delete_secret, store_secret, AccountSecret};
 use crate::smtp::{test_smtp_connection, SmtpAuth};
@@ -128,6 +129,7 @@ struct TestAndAddParams {
     password: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
+    expires_at: Option<i64>,
 }
 
 async fn dispatch(
@@ -163,6 +165,17 @@ async fn dispatch(
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
             }
         }
+        "account.oauth_start" => {
+            let provider = req.params.get("provider").and_then(|v| v.as_str()).unwrap_or("google");
+            let email = req.params.get("email").and_then(|v| v.as_str()).unwrap_or("");
+            let client_id = req.params.get("client_id").and_then(|v| v.as_str());
+            match start_pkce_flow(provider, email, client_id, events.clone()).await {
+                Ok((session_id, auth_url)) => {
+                    RpcResponse::ok(id, json!({ "session_id": session_id, "auth_url": auth_url }))
+                }
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
         "account.test_and_add" => {
             let p: TestAndAddParams = match serde_json::from_value(req.params) {
                 Ok(v) => v,
@@ -172,10 +185,11 @@ async fn dispatch(
             let (imap_auth, smtp_auth, secret) = if p.auth_type == "oauth2" {
                 let access = p.access_token.clone().unwrap_or_default();
                 let refresh = p.refresh_token.clone().unwrap_or_default();
+                let exp = p.expires_at.unwrap_or(0);
                 (
                     ImapAuth::XOAuth2 { user: p.email.clone(), access_token: access.clone() },
                     SmtpAuth::XOAuth2 { user: p.email.clone(), access_token: access.clone() },
-                    AccountSecret::OAuth2 { access_token: access, refresh_token: refresh, expires_at: 0 },
+                    AccountSecret::OAuth2 { access_token: access, refresh_token: refresh, expires_at: exp },
                 )
             } else {
                 let pass = p.password.clone().unwrap_or_default();
