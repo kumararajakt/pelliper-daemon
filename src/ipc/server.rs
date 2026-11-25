@@ -15,6 +15,7 @@ use crate::autoconfig::lookup_autoconfig;
 use crate::db::repo::AccountRow;
 use crate::db::Database;
 use crate::imap::client::{connect_imap_tls, test_imap_connection, ImapAuth};
+use crate::imap::priority::classify_folder;
 use crate::imap::sync_worker::SyncWakeCommand;
 use crate::ipc::protocol::{RpcNotification, RpcRequest, RpcResponse};
 use crate::mime::extract_attachment_bytes;
@@ -314,6 +315,60 @@ async fn dispatch(
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
             }
         }
+        "folder.create" => {
+            let account_id = req.params.get("account_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let full_path = req.params.get("full_path").and_then(|v| v.as_str()).unwrap_or("");
+            match imap_folder_create(account_id, full_path, db).await {
+                Ok(fid) => {
+                    let _ = events.send(RpcNotification::new(
+                        "folder.updated",
+                        json!({ "account_id": account_id, "folder_id": fid }),
+                    ));
+                    RpcResponse::ok(id, json!({ "folder_id": fid }))
+                }
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
+        "folder.rename" => {
+            let folder_id = req.params.get("folder_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let new_path = req.params.get("new_path").and_then(|v| v.as_str()).unwrap_or("");
+            match imap_folder_rename(folder_id, new_path, db).await {
+                Ok(account_id) => {
+                    let _ = events.send(RpcNotification::new(
+                        "folder.updated",
+                        json!({ "account_id": account_id, "folder_id": folder_id }),
+                    ));
+                    RpcResponse::ok(id, json!({ "ok": true }))
+                }
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
+        "folder.delete" => {
+            let folder_id = req.params.get("folder_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            match imap_folder_delete(folder_id, db).await {
+                Ok(account_id) => {
+                    let _ = events.send(RpcNotification::new(
+                        "folder.updated",
+                        json!({ "account_id": account_id, "folder_id": folder_id }),
+                    ));
+                    RpcResponse::ok(id, json!({ "ok": true }))
+                }
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
+        "folder.empty" => {
+            let folder_id = req.params.get("folder_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            match imap_folder_empty(folder_id, db).await {
+                Ok(account_id) => {
+                    let _ = events.send(RpcNotification::new(
+                        "folder.updated",
+                        json!({ "account_id": account_id, "folder_id": folder_id, "unread_count": 0, "total_count": 0 }),
+                    ));
+                    RpcResponse::ok(id, json!({ "ok": true }))
+                }
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
         "message.search" => {
             let folder_id = req.params.get("folder_id").and_then(|v| v.as_i64());
             let query_str = req.params.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -474,4 +529,64 @@ async fn resolve_attachment(att_id: i64, db: &Database, cache_dir: &Path) -> Res
     let dest_str = dest.to_string_lossy().into_owned();
     db.set_attachment_local_path(att_id, &dest_str)?;
     Ok((info.filename, info.mime_type, dest_str))
+}
+
+async fn connect_account_imap(account_id: i64, db: &Database) -> Result<crate::imap::client::ImapSession> {
+    let acc = db
+        .get_account(account_id)?
+        .ok_or_else(|| anyhow::anyhow!("account not found"))?;
+    let raw_secret = load_secret(&acc.email)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("credentials not found in keyring"))?;
+    let secret = if let Some(ref prov) = acc.oauth_provider {
+        refresh_if_needed(&acc.email, prov, raw_secret).await?
+    } else {
+        raw_secret
+    };
+    let auth = match secret {
+        AccountSecret::Password { password } => ImapAuth::Password { user: acc.email.clone(), password },
+        AccountSecret::OAuth2 { access_token, .. } => ImapAuth::XOAuth2 { user: acc.email.clone(), access_token },
+    };
+    connect_imap_tls(&acc.imap_host, acc.imap_port, &auth).await
+}
+
+async fn imap_folder_create(account_id: i64, full_path: &str, db: &Database) -> Result<i64> {
+    let mut session = connect_account_imap(account_id, db).await?;
+    session.create(full_path).await?;
+    let _ = session.logout().await;
+    let (role, prio) = classify_folder(full_path, &[]);
+    let name = full_path.rsplit('/').next().unwrap_or(full_path);
+    db.upsert_folder(account_id, name, full_path, "/", role.as_str(), prio)
+}
+
+async fn imap_folder_rename(folder_id: i64, new_path: &str, db: &Database) -> Result<i64> {
+    let folder = db.get_folder(folder_id)?.ok_or_else(|| anyhow::anyhow!("folder not found"))?;
+    let mut session = connect_account_imap(folder.account_id, db).await?;
+    session.rename(&folder.full_path, new_path).await?;
+    let _ = session.logout().await;
+    let new_name = new_path.rsplit(&folder.delimiter).next().unwrap_or(new_path);
+    db.rename_folder_row(folder_id, new_name, new_path)?;
+    Ok(folder.account_id)
+}
+
+async fn imap_folder_delete(folder_id: i64, db: &Database) -> Result<i64> {
+    let folder = db.get_folder(folder_id)?.ok_or_else(|| anyhow::anyhow!("folder not found"))?;
+    let mut session = connect_account_imap(folder.account_id, db).await?;
+    session.delete(&folder.full_path).await?;
+    let _ = session.logout().await;
+    db.delete_folder_row(folder_id)?;
+    Ok(folder.account_id)
+}
+
+async fn imap_folder_empty(folder_id: i64, db: &Database) -> Result<i64> {
+    let folder = db.get_folder(folder_id)?.ok_or_else(|| anyhow::anyhow!("folder not found"))?;
+    let mut session = connect_account_imap(folder.account_id, db).await?;
+    session.select(&folder.full_path).await?;
+    if let Ok(s) = session.uid_store("1:*", "+FLAGS.SILENT (\\Deleted)").await {
+        let _: Vec<_> = s.try_collect().await.unwrap_or_default();
+    }
+    let _ = session.expunge().await;
+    let _ = session.logout().await;
+    db.empty_folder_local(folder_id)?;
+    Ok(folder.account_id)
 }

@@ -889,4 +889,34 @@ impl Database {
         )?;
         Ok(())
     }
+
+    pub fn get_folder(&self, folder_id: i64) -> Result<Option<FolderRow>> {
+        let folders = self.list_folders(None)?;
+        Ok(folders.into_iter().find(|f| f.id == folder_id))
+    }
+
+    pub fn rename_folder_row(&self, folder_id: i64, new_name: &str, new_full_path: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE folders SET name = ?1, full_path = ?2 WHERE id = ?3",
+            params![new_name, new_full_path, folder_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_folder_row(&self, folder_id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute("DELETE FROM folders WHERE id = ?1", params![folder_id])?;
+        Ok(())
+    }
+
+    pub fn empty_folder_local(&self, folder_id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute("DELETE FROM messages WHERE folder_id = ?1", params![folder_id])?;
+        conn.execute(
+            "UPDATE folders SET total_count = 0, unread_count = 0 WHERE id = ?1",
+            params![folder_id],
+        )?;
+        Ok(())
+    }
 }

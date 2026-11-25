@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::db::Database;
+use crate::imap::client::{connect_imap_tls, ImapAuth};
 use crate::ipc::protocol::RpcNotification;
 use crate::oauth::refresh_if_needed;
 use crate::secrets::{load_secret, AccountSecret};
@@ -198,7 +199,22 @@ async fn send_single_outbox(db: &Database, account_id: i64, payload_json: &str) 
         builder.multipart(mp)?
     };
 
+    let raw_bytes = message.formatted();
     let transport = build_transport(&acc.smtp_host, acc.smtp_port, &acc.smtp_tls, &auth)?;
     transport.send(message).await?;
+
+    // Append to Sent folder via IMAP unless provider (e.g. Gmail) auto-saves to Sent
+    if !acc.imap_host.eq_ignore_ascii_case("imap.gmail.com") {
+        if let Ok(Some(sent_path)) = db.find_folder_path_by_role(acc.id, "sent") {
+            let imap_auth = match auth {
+                SmtpAuth::Password { user, password } => ImapAuth::Password { user, password },
+                SmtpAuth::XOAuth2 { user, access_token } => ImapAuth::XOAuth2 { user, access_token },
+            };
+            if let Ok(mut session) = connect_imap_tls(&acc.imap_host, acc.imap_port, &imap_auth).await {
+                let _ = session.append(&sent_path, Some("(\\Seen)"), None, &raw_bytes).await;
+                let _ = session.logout().await;
+            }
+        }
+    }
     Ok(())
 }
