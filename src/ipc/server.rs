@@ -411,7 +411,15 @@ async fn dispatch(
                     if !detail.get("body_synced").and_then(|v| v.as_bool()).unwrap_or(false) {
                         supervisor.wake_account(account_id, SyncWakeCommand::FetchBodyNow(message_id));
                     }
-                    RpcResponse::ok(id, json!({ "message": detail }))
+                    let thread = db.get_thread_messages(message_id).unwrap_or_default();
+                    for tm in &thread {
+                        if !tm.get("body_synced").and_then(|v| v.as_bool()).unwrap_or(true) {
+                            if let Some(tid) = tm.get("id").and_then(|v| v.as_i64()) {
+                                supervisor.wake_account(account_id, SyncWakeCommand::FetchBodyNow(tid));
+                            }
+                        }
+                    }
+                    RpcResponse::ok(id, json!({ "message": detail, "thread": thread }))
                 }
                 Ok(None) => {
                     supervisor.wake_account(account_id, SyncWakeCommand::FetchBodyNow(message_id));

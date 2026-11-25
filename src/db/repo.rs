@@ -1032,4 +1032,48 @@ impl Database {
         )?;
         Ok(())
     }
+
+    pub fn get_thread_messages(&self, message_id: i64) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let thread_info: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT account_id, thread_id FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((account_id, thread_id)) = thread_info else {
+            return Ok(Vec::new());
+        };
+
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.account_id, m.folder_id, m.subject, m.from_json, m.to_json,
+                    m.cc_json, m.date_ts, m.flags_bitmask, m.snippet, m.body_synced,
+                    b.text_plain, b.text_html
+             FROM messages m
+             LEFT JOIN message_bodies b ON b.message_id = m.id
+             WHERE m.account_id = ?1 AND m.thread_id = ?2
+             ORDER BY m.date_ts ASC, m.id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![account_id, thread_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "account_id": r.get::<_, i64>(1)?,
+                    "folder_id": r.get::<_, i64>(2)?,
+                    "subject": r.get::<_, String>(3)?,
+                    "from_json": r.get::<_, String>(4)?,
+                    "to_json": r.get::<_, String>(5)?,
+                    "cc_json": r.get::<_, String>(6)?,
+                    "date_ts": r.get::<_, i64>(7)?,
+                    "flags_bitmask": r.get::<_, i64>(8)?,
+                    "snippet": r.get::<_, String>(9)?,
+                    "body_synced": r.get::<_, i64>(10)? != 0,
+                    "text_plain": r.get::<_, Option<String>>(11)?,
+                    "text_html": r.get::<_, Option<String>>(12)?,
+                }))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
 }
