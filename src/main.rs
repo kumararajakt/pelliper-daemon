@@ -10,7 +10,8 @@ mod smtp;
 mod supervisor;
 
 use anyhow::Result;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -18,6 +19,7 @@ use crate::config::DaemonConfig;
 use crate::db::Database;
 use crate::ipc::protocol::RpcNotification;
 use crate::ipc::server::IpcServer;
+use crate::smtp::run_outbox_worker;
 use crate::supervisor::AccountSupervisor;
 
 #[tokio::main]
@@ -34,10 +36,20 @@ async fn main() -> Result<()> {
     info!("Starting pelliper-daemon (db: {})", cfg.db_path.display());
     let db = Database::open(&cfg.db_path)?;
     let (events_tx, _) = broadcast::channel::<RpcNotification>(128);
+    let (outbox_tx, outbox_rx) = mpsc::channel::<()>(32);
+    let outbox_cancel = CancellationToken::new();
+
+    tokio::spawn(run_outbox_worker(
+        db.clone(),
+        events_tx.clone(),
+        outbox_rx,
+        outbox_cancel.clone(),
+    ));
+
     let supervisor = AccountSupervisor::new(db.clone(), events_tx.clone());
     supervisor.start_all_enabled().await;
 
-    let ipc = IpcServer::new(db.clone(), supervisor.clone(), events_tx);
+    let ipc = IpcServer::new(db.clone(), supervisor.clone(), events_tx, outbox_tx);
 
     tokio::select! {
         res = ipc.run(&cfg.socket_path) => {
@@ -48,6 +60,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    outbox_cancel.cancel();
     supervisor.shutdown_all();
     let _ = db.checkpoint_wal();
     if cfg.socket_path.exists() {

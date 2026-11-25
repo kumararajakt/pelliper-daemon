@@ -3,7 +3,35 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
+use crate::mime::ParsedMessageBody;
 use crate::search::ParsedSearchQuery;
+
+#[derive(Debug, Clone)]
+pub struct NewHeaderRow {
+    pub account_id: i64,
+    pub folder_id: i64,
+    pub uid: i64,
+    pub message_id: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub references_header: Option<String>,
+    pub thread_id: String,
+    pub subject: String,
+    pub from_json: String,
+    pub to_json: String,
+    pub cc_json: String,
+    pub date_ts: i64,
+    pub internal_date_ts: i64,
+    pub size_bytes: i64,
+    pub flags_bitmask: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboxRow {
+    pub id: i64,
+    pub account_id: i64,
+    pub payload_json: String,
+    pub retry_count: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountRow {
@@ -517,5 +545,259 @@ impl Database {
             params![account_id, payload_json],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_ready_outbox(&self, now_ts: i64) -> Result<Vec<OutboxRow>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, payload_json, retry_count
+             FROM outbox
+             WHERE status IN ('queued', 'retrying') AND next_retry_ts <= ?1
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![now_ts], |r| {
+                Ok(OutboxRow {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    payload_json: r.get(2)?,
+                    retry_count: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_outbox(&self, outbox_id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute("DELETE FROM outbox WHERE id = ?1", params![outbox_id])?;
+        Ok(())
+    }
+
+    pub fn mark_outbox_retry(&self, outbox_id: i64, retry_count: i64, next_retry_ts: i64, err: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let status = if retry_count >= 5 { "failed" } else { "retrying" };
+        conn.execute(
+            "UPDATE outbox SET status = ?1, retry_count = ?2, next_retry_ts = ?3, last_error = ?4 WHERE id = ?5",
+            params![status, retry_count, next_retry_ts, err, outbox_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_folder_path(&self, folder_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT full_path FROM folders WHERE id = ?1",
+            params![folder_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn find_folder_path_by_role(&self, account_id: i64, role: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT full_path FROM folders WHERE account_id = ?1 AND role = ?2 LIMIT 1",
+            params![account_id, role],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn clear_folder_messages(&self, folder_id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute("DELETE FROM messages WHERE folder_id = ?1", params![folder_id])?;
+        conn.execute("UPDATE folders SET uid_next = 1 WHERE id = ?1", params![folder_id])?;
+        Ok(())
+    }
+
+    pub fn update_folder_uid_validity(&self, folder_id: i64, uid_validity: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE folders SET uid_validity = ?1 WHERE id = ?2",
+            params![uid_validity, folder_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_message_headers_batch(&self, rows: &[NewHeaderRow], folder_id: i64, max_uid: i64) -> Result<Vec<MessageSummary>> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut inserted = Vec::new();
+
+        for h in rows {
+            // Anti-ghost guard: skip if a pending move/delete exists for this (folder_id, uid)
+            let pending_move: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pending_ops WHERE folder_id = ?1 AND uid = ?2 AND op_type = 'move_role'",
+                params![h.folder_id, h.uid],
+                |r| r.get(0),
+            )?;
+            if pending_move > 0 {
+                continue;
+            }
+
+            tx.execute(
+                "INSERT INTO messages (account_id, folder_id, uid, message_id, in_reply_to, references_header,
+                                       thread_id, subject, from_json, to_json, cc_json,
+                                       date_ts, internal_date_ts, size_bytes, flags_bitmask)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 ON CONFLICT(folder_id, uid) DO UPDATE SET
+                    flags_bitmask = excluded.flags_bitmask",
+                params![
+                    h.account_id,
+                    h.folder_id,
+                    h.uid,
+                    h.message_id,
+                    h.in_reply_to,
+                    h.references_header,
+                    h.thread_id,
+                    h.subject,
+                    h.from_json,
+                    h.to_json,
+                    h.cc_json,
+                    h.date_ts,
+                    h.internal_date_ts,
+                    h.size_bytes,
+                    h.flags_bitmask,
+                ],
+            )?;
+
+            let id: i64 = tx.query_row(
+                "SELECT id FROM messages WHERE folder_id = ?1 AND uid = ?2",
+                params![h.folder_id, h.uid],
+                |r| r.get(0),
+            )?;
+            inserted.push(MessageSummary {
+                id,
+                account_id: h.account_id,
+                folder_id: h.folder_id,
+                uid: h.uid,
+                thread_id: h.thread_id.clone(),
+                subject: h.subject.clone(),
+                from_json: h.from_json.clone(),
+                date_ts: h.date_ts,
+                flags_bitmask: h.flags_bitmask,
+                snippet: String::new(),
+                has_attachments: false,
+                body_synced: false,
+            });
+        }
+
+        if max_uid > 0 {
+            tx.execute(
+                "UPDATE folders SET uid_next = MAX(uid_next, ?1) WHERE id = ?2",
+                params![max_uid + 1, folder_id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE folders SET
+                total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1),
+                unread_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND (flags_bitmask & 1) = 0)
+             WHERE id = ?1",
+            params![folder_id],
+        )?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn reconcile_folder_flags(&self, folder_id: i64, server_flags: &[(i64, i64)]) -> Result<()> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        for &(uid, flags) in server_flags {
+            tx.execute(
+                "UPDATE messages SET flags_bitmask = ?1 WHERE folder_id = ?2 AND uid = ?3",
+                params![flags, folder_id, uid],
+            )?;
+        }
+        tx.execute(
+            "UPDATE folders SET
+                total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1),
+                unread_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1 AND (flags_bitmask & 1) = 0)
+             WHERE id = ?1",
+            params![folder_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_message_uid_folder(&self, message_id: i64) -> Result<Option<(i64, i64, i64)>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT folder_id, uid, size_bytes FROM messages WHERE id = ?1 AND body_synced = 0",
+            params![message_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn save_parsed_bodies_batch(&self, items: &[(i64, ParsedMessageBody)]) -> Result<Vec<(i64, String)>> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let mut ready = Vec::with_capacity(items.len());
+
+        for (message_id, body) in items {
+            tx.execute(
+                "INSERT INTO message_bodies (message_id, text_plain, text_html, raw_size)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(message_id) DO UPDATE SET
+                    text_plain = excluded.text_plain,
+                    text_html = excluded.text_html,
+                    raw_size = excluded.raw_size",
+                params![message_id, body.text_plain, body.text_html, body.raw_size],
+            )?;
+
+            let has_att = body.attachments.iter().any(|a| !a.is_inline);
+            tx.execute(
+                "UPDATE messages SET snippet = ?1, has_attachments = ?2, body_synced = 1 WHERE id = ?3",
+                params![body.snippet, if has_att { 1 } else { 0 }, message_id],
+            )?;
+
+            tx.execute("DELETE FROM attachments WHERE message_id = ?1", params![message_id])?;
+            for att in &body.attachments {
+                tx.execute(
+                    "INSERT INTO attachments (message_id, part_id, content_id, filename, mime_type, size_bytes, is_inline)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        message_id,
+                        att.part_id,
+                        att.content_id,
+                        att.filename,
+                        att.mime_type,
+                        att.size_bytes,
+                        if att.is_inline { 1 } else { 0 }
+                    ],
+                )?;
+            }
+
+            let meta: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT subject, from_json, to_json FROM messages WHERE id = ?1",
+                    params![message_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((subj, from_j, to_j)) = meta {
+                tx.execute("DELETE FROM messages_fts WHERE message_id = ?1", params![message_id])?;
+                tx.execute(
+                    "INSERT INTO messages_fts (message_id, subject, from_text, to_text, body_text)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        message_id,
+                        subj,
+                        from_j,
+                        to_j,
+                        body.text_plain.as_deref().unwrap_or("")
+                    ],
+                )?;
+            }
+
+            ready.push((*message_id, body.snippet.clone()));
+        }
+
+        tx.commit()?;
+        Ok(ready)
     }
 }

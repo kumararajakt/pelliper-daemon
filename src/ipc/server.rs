@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::autoconfig::lookup_autoconfig;
@@ -23,6 +23,7 @@ pub struct IpcServer {
     db: Database,
     supervisor: AccountSupervisor,
     events: broadcast::Sender<RpcNotification>,
+    outbox_wake: mpsc::Sender<()>,
 }
 
 impl IpcServer {
@@ -30,11 +31,13 @@ impl IpcServer {
         db: Database,
         supervisor: AccountSupervisor,
         events: broadcast::Sender<RpcNotification>,
+        outbox_wake: mpsc::Sender<()>,
     ) -> Self {
         Self {
             db,
             supervisor,
             events,
+            outbox_wake,
         }
     }
 
@@ -51,10 +54,11 @@ impl IpcServer {
             let db = self.db.clone();
             let supervisor = self.supervisor.clone();
             let events_tx = self.events.clone();
+            let outbox_wake = self.outbox_wake.clone();
             let mut rx = self.events.subscribe();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, db, supervisor, events_tx, &mut rx).await {
+                if let Err(e) = handle_client(stream, db, supervisor, events_tx, outbox_wake, &mut rx).await {
                     warn!("IPC client disconnected: {e}");
                 }
             });
@@ -67,6 +71,7 @@ async fn handle_client(
     db: Database,
     supervisor: AccountSupervisor,
     events_tx: broadcast::Sender<RpcNotification>,
+    outbox_wake: mpsc::Sender<()>,
     events: &mut broadcast::Receiver<RpcNotification>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
@@ -83,7 +88,7 @@ async fn handle_client(
                 }
 
                 let response = match serde_json::from_str::<RpcRequest>(&line) {
-                    Ok(req) => dispatch(req, &db, &supervisor, &events_tx).await,
+                    Ok(req) => dispatch(req, &db, &supervisor, &events_tx, &outbox_wake).await,
                     Err(e) => RpcResponse::err(Value::Null, -32700, format!("parse error: {e}")),
                 };
 
@@ -130,6 +135,7 @@ async fn dispatch(
     db: &Database,
     supervisor: &AccountSupervisor,
     events: &broadcast::Sender<RpcNotification>,
+    outbox_wake: &mpsc::Sender<()>,
 ) -> RpcResponse {
     let id = req.id;
     match req.method.as_str() {
@@ -339,6 +345,7 @@ async fn dispatch(
                         "outbox.status",
                         json!({ "outbox_id": outbox_id, "status": "queued" }),
                     ));
+                    let _ = outbox_wake.try_send(());
                     RpcResponse::ok(id, json!({ "outbox_id": outbox_id, "status": "queued" }))
                 }
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
