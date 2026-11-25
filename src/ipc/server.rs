@@ -20,7 +20,7 @@ use crate::imap::sync_worker::SyncWakeCommand;
 use crate::ipc::protocol::{RpcNotification, RpcRequest, RpcResponse};
 use crate::mime::extract_attachment_bytes;
 use crate::oauth::{refresh_if_needed, start_pkce_flow};
-use crate::search::parse_search_query;
+use crate::search::{parse_search_query, to_imap_search_criteria};
 use crate::secrets::{delete_secret, load_secret, store_secret, AccountSecret};
 use crate::smtp::{test_smtp_connection, SmtpAuth};
 use crate::supervisor::AccountSupervisor;
@@ -373,9 +373,22 @@ async fn dispatch(
             let folder_id = req.params.get("folder_id").and_then(|v| v.as_i64());
             let query_str = req.params.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let limit = req.params.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
+            let server_search = req.params.get("server_search").and_then(|v| v.as_bool()).unwrap_or(false);
+            let search_id = req.params.get("search_id").and_then(|v| v.as_i64()).unwrap_or(0);
             let parsed = parse_search_query(query_str);
             match db.search_messages_local(folder_id, &parsed, limit) {
-                Ok(results) => RpcResponse::ok(id, json!({ "messages": results })),
+                Ok(results) => {
+                    if server_search && !query_str.trim().is_empty() {
+                        let db_bg = db.clone();
+                        let events_bg = events.clone();
+                        let criteria = to_imap_search_criteria(&parsed).join(" ");
+                        let seen_ids: std::collections::HashSet<i64> = results.iter().map(|m| m.id).collect();
+                        tokio::spawn(async move {
+                            run_background_imap_search(db_bg, events_bg, folder_id, criteria, search_id, seen_ids).await;
+                        });
+                    }
+                    RpcResponse::ok(id, json!({ "messages": results, "search_id": search_id }))
+                }
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
             }
         }
@@ -589,4 +602,54 @@ async fn imap_folder_empty(folder_id: i64, db: &Database) -> Result<i64> {
     let _ = session.logout().await;
     db.empty_folder_local(folder_id)?;
     Ok(folder.account_id)
+}
+
+async fn run_background_imap_search(
+    db: Database,
+    events: broadcast::Sender<RpcNotification>,
+    folder_id: Option<i64>,
+    criteria: String,
+    search_id: i64,
+    seen_ids: std::collections::HashSet<i64>,
+) {
+    let mut appended = Vec::new();
+    let target_folders = if let Some(fid) = folder_id {
+        db.get_folder(fid).ok().flatten().into_iter().collect::<Vec<_>>()
+    } else {
+        db.list_folders(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| f.role == "inbox")
+            .collect()
+    };
+
+    for folder in target_folders {
+        let Ok(mut session) = connect_account_imap(folder.account_id, &db).await else {
+            continue;
+        };
+        if session.select(&folder.full_path).await.is_ok() {
+            if let Ok(uids) = session.uid_search(&criteria).await {
+                let mut uid_vec: Vec<i64> = uids.into_iter().map(|u| u as i64).collect();
+                uid_vec.sort_unstable_by(|a, b| b.cmp(a));
+                uid_vec.truncate(50);
+                if let Ok(found) = db.list_summaries_by_uids(folder.id, &uid_vec) {
+                    for m in found {
+                        if !seen_ids.contains(&m.id) {
+                            appended.push(m);
+                        }
+                    }
+                }
+            }
+        }
+        let _ = session.logout().await;
+    }
+
+    let _ = events.send(RpcNotification::new(
+        "search.results_appended",
+        json!({
+            "search_id": search_id,
+            "messages": appended,
+            "done": true,
+        }),
+    ));
 }

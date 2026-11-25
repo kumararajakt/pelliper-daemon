@@ -919,4 +919,35 @@ impl Database {
         )?;
         Ok(())
     }
+
+    pub fn list_summaries_by_uids(&self, folder_id: i64, uids: &[i64]) -> Result<Vec<MessageSummary>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        let mut out = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, folder_id, uid, thread_id, subject,
+                    from_json, date_ts, flags_bitmask, snippet, has_attachments, body_synced
+             FROM messages WHERE folder_id = ?1 AND uid = ?2",
+        )?;
+        for &uid in uids {
+            if let Ok(row) = stmt.query_row(params![folder_id, uid], |r| {
+                Ok(MessageSummary {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    folder_id: r.get(2)?,
+                    uid: r.get(3)?,
+                    thread_id: r.get(4)?,
+                    subject: r.get(5)?,
+                    from_json: r.get(6)?,
+                    date_ts: r.get(7)?,
+                    flags_bitmask: r.get(8)?,
+                    snippet: r.get(9)?,
+                    has_attachments: r.get::<_, i64>(10)? != 0,
+                    body_synced: r.get::<_, i64>(11)? != 0,
+                })
+            }) {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
 }
