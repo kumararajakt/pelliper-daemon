@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     let supervisor = AccountSupervisor::new(db.clone(), events_tx.clone());
     supervisor.start_all_enabled().await;
 
-    let ipc = IpcServer::new(db.clone(), supervisor.clone(), events_tx, outbox_tx);
+    let ipc = IpcServer::new(db.clone(), supervisor.clone(), events_tx, outbox_tx, cfg.cache_dir.clone());
 
     tokio::select! {
         res = ipc.run(&cfg.socket_path) => {

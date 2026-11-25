@@ -71,6 +71,24 @@ pub fn parse_message_body(raw: &[u8]) -> Option<ParsedMessageBody> {
     })
 }
 
+/// Extracts raw attachment bytes by 1-based `part_id` (falling back to filename match).
+pub fn extract_attachment_bytes(raw: &[u8], part_id: &str, filename: &str) -> Option<Vec<u8>> {
+    let msg = MessageParser::default().parse(raw)?;
+    let target_idx: Option<usize> = part_id.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+
+    if let Some(idx) = target_idx {
+        if let Some(part) = msg.attachments().nth(idx) {
+            return Some(part.contents().to_vec());
+        }
+    }
+    for part in msg.attachments() {
+        if part.attachment_name() == Some(filename) {
+            return Some(part.contents().to_vec());
+        }
+    }
+    None
+}
+
 /// Computes a deterministic `thread_id` from `References` / `In-Reply-To` or normalized `Subject`.
 pub fn compute_thread_id(
     message_id: Option<&str>,

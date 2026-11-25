@@ -1,22 +1,26 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use futures::TryStreamExt;
+use mail_parser::MimeHeaders;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::autoconfig::lookup_autoconfig;
 use crate::db::repo::AccountRow;
 use crate::db::Database;
-use crate::imap::client::{test_imap_connection, ImapAuth};
+use crate::imap::client::{connect_imap_tls, test_imap_connection, ImapAuth};
 use crate::imap::sync_worker::SyncWakeCommand;
 use crate::ipc::protocol::{RpcNotification, RpcRequest, RpcResponse};
-use crate::oauth::start_pkce_flow;
+use crate::mime::extract_attachment_bytes;
+use crate::oauth::{refresh_if_needed, start_pkce_flow};
 use crate::search::parse_search_query;
-use crate::secrets::{delete_secret, store_secret, AccountSecret};
+use crate::secrets::{delete_secret, load_secret, store_secret, AccountSecret};
 use crate::smtp::{test_smtp_connection, SmtpAuth};
 use crate::supervisor::AccountSupervisor;
 
@@ -25,6 +29,7 @@ pub struct IpcServer {
     supervisor: AccountSupervisor,
     events: broadcast::Sender<RpcNotification>,
     outbox_wake: mpsc::Sender<()>,
+    cache_dir: PathBuf,
 }
 
 impl IpcServer {
@@ -33,12 +38,14 @@ impl IpcServer {
         supervisor: AccountSupervisor,
         events: broadcast::Sender<RpcNotification>,
         outbox_wake: mpsc::Sender<()>,
+        cache_dir: PathBuf,
     ) -> Self {
         Self {
             db,
             supervisor,
             events,
             outbox_wake,
+            cache_dir,
         }
     }
 
@@ -56,10 +63,11 @@ impl IpcServer {
             let supervisor = self.supervisor.clone();
             let events_tx = self.events.clone();
             let outbox_wake = self.outbox_wake.clone();
+            let cache_dir = self.cache_dir.clone();
             let mut rx = self.events.subscribe();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_client(stream, db, supervisor, events_tx, outbox_wake, &mut rx).await {
+                if let Err(e) = handle_client(stream, db, supervisor, events_tx, outbox_wake, cache_dir, &mut rx).await {
                     warn!("IPC client disconnected: {e}");
                 }
             });
@@ -73,6 +81,7 @@ async fn handle_client(
     supervisor: AccountSupervisor,
     events_tx: broadcast::Sender<RpcNotification>,
     outbox_wake: mpsc::Sender<()>,
+    cache_dir: PathBuf,
     events: &mut broadcast::Receiver<RpcNotification>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
@@ -89,7 +98,7 @@ async fn handle_client(
                 }
 
                 let response = match serde_json::from_str::<RpcRequest>(&line) {
-                    Ok(req) => dispatch(req, &db, &supervisor, &events_tx, &outbox_wake).await,
+                    Ok(req) => dispatch(req, &db, &supervisor, &events_tx, &outbox_wake, &cache_dir).await,
                     Err(e) => RpcResponse::err(Value::Null, -32700, format!("parse error: {e}")),
                 };
 
@@ -138,6 +147,7 @@ async fn dispatch(
     supervisor: &AccountSupervisor,
     events: &broadcast::Sender<RpcNotification>,
     outbox_wake: &mpsc::Sender<()>,
+    cache_dir: &Path,
 ) -> RpcResponse {
     let id = req.id;
     match req.method.as_str() {
@@ -365,6 +375,82 @@ async fn dispatch(
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
             }
         }
+        "attachment.get" => {
+            let att_id = req.params.get("attachment_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            match resolve_attachment(att_id, db, cache_dir).await {
+                Ok((filename, mime_type, local_path)) => RpcResponse::ok(
+                    id,
+                    json!({
+                        "attachment_id": att_id,
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "local_path": local_path,
+                    }),
+                ),
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
         other => RpcResponse::err(id, -32601, format!("method not found: {other}")),
     }
+}
+
+async fn resolve_attachment(att_id: i64, db: &Database, cache_dir: &Path) -> Result<(String, String, String)> {
+    let info = db
+        .get_attachment_download_info(att_id)?
+        .ok_or_else(|| anyhow::anyhow!("attachment not found"))?;
+
+    if let Some(ref existing) = info.local_path {
+        if Path::new(existing).exists() {
+            return Ok((info.filename, info.mime_type, existing.clone()));
+        }
+    }
+
+    let acc = db
+        .get_account(info.account_id)?
+        .ok_or_else(|| anyhow::anyhow!("account not found"))?;
+    let folder_path = db
+        .get_folder_path(info.folder_id)?
+        .ok_or_else(|| anyhow::anyhow!("folder not found"))?;
+
+    let raw_secret = load_secret(&acc.email)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("credentials not found in keyring"))?;
+    let secret = if let Some(ref prov) = acc.oauth_provider {
+        refresh_if_needed(&acc.email, prov, raw_secret).await?
+    } else {
+        raw_secret
+    };
+
+    let auth = match secret {
+        AccountSecret::Password { password } => ImapAuth::Password { user: acc.email.clone(), password },
+        AccountSecret::OAuth2 { access_token, .. } => ImapAuth::XOAuth2 { user: acc.email.clone(), access_token },
+    };
+
+    let mut session = connect_imap_tls(&acc.imap_host, acc.imap_port, &auth).await?;
+    session.select(&folder_path).await?;
+    let stream = session.uid_fetch(info.uid.to_string(), "(UID BODY.PEEK[])").await?;
+    let fetches: Vec<_> = stream.try_collect().await?;
+    let _ = session.logout().await;
+
+    let raw = fetches
+        .first()
+        .and_then(|f| f.body())
+        .ok_or_else(|| anyhow::anyhow!("message body not returned by IMAP"))?;
+
+    let bytes = extract_attachment_bytes(raw, &info.part_id, &info.filename)
+        .ok_or_else(|| anyhow::anyhow!("attachment part not found in MIME message"))?;
+
+    let acc_dir = cache_dir.join("attachments").join(info.account_id.to_string());
+    std::fs::create_dir_all(&acc_dir)?;
+    let safe_name: String = info
+        .filename
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c == '\0' { '_' } else { c })
+        .collect();
+    let dest = acc_dir.join(format!("{}_{}", info.message_id, safe_name));
+    std::fs::write(&dest, &bytes)?;
+
+    let dest_str = dest.to_string_lossy().into_owned();
+    db.set_attachment_local_path(att_id, &dest_str)?;
+    Ok((info.filename, info.mime_type, dest_str))
 }

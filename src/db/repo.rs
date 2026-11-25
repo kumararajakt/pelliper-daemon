@@ -33,6 +33,19 @@ pub struct OutboxRow {
     pub retry_count: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct AttachmentDownloadInfo {
+    pub id: i64,
+    pub message_id: i64,
+    pub account_id: i64,
+    pub folder_id: i64,
+    pub uid: i64,
+    pub part_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub local_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountRow {
     pub id: i64,
@@ -799,5 +812,41 @@ impl Database {
 
         tx.commit()?;
         Ok(ready)
+    }
+
+    pub fn get_attachment_download_info(&self, attachment_id: i64) -> Result<Option<AttachmentDownloadInfo>> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.query_row(
+            "SELECT a.id, a.message_id, m.account_id, m.folder_id, m.uid,
+                    a.part_id, a.filename, a.mime_type, a.local_path
+             FROM attachments a
+             JOIN messages m ON m.id = a.message_id
+             WHERE a.id = ?1",
+            params![attachment_id],
+            |r| {
+                Ok(AttachmentDownloadInfo {
+                    id: r.get(0)?,
+                    message_id: r.get(1)?,
+                    account_id: r.get(2)?,
+                    folder_id: r.get(3)?,
+                    uid: r.get(4)?,
+                    part_id: r.get(5)?,
+                    filename: r.get(6)?,
+                    mime_type: r.get(7)?,
+                    local_path: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn set_attachment_local_path(&self, attachment_id: i64, local_path: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "UPDATE attachments SET local_path = ?1 WHERE id = ?2",
+            params![local_path, attachment_id],
+        )?;
+        Ok(())
     }
 }
