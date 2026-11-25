@@ -950,4 +950,86 @@ impl Database {
         }
         Ok(out)
     }
+
+    pub fn save_draft_local(
+        &self,
+        draft_id: Option<i64>,
+        account_id: i64,
+        to: &str,
+        cc: &str,
+        bcc: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock().expect("db mutex poisoned");
+        let tx = conn.transaction()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let drafts_folder_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM folders WHERE account_id = ?1 AND role = 'drafts' LIMIT 1",
+                params![account_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let folder_id = match drafts_folder_id {
+            Some(fid) => fid,
+            None => tx
+                .query_row(
+                    "SELECT id FROM folders WHERE account_id = ?1 LIMIT 1",
+                    params![account_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0),
+        };
+
+        let id = if let Some(existing_id) = draft_id.filter(|&x| x > 0) {
+            tx.execute(
+                "UPDATE messages SET subject = ?1, to_json = ?2, cc_json = ?3, bcc_json = ?4, date_ts = ?5, snippet = ?6 WHERE id = ?7",
+                params![subject, to, cc, bcc, now, body.chars().take(120).collect::<String>(), existing_id],
+            )?;
+            existing_id
+        } else {
+            let local_uid = -(now % 1_000_000_000) - 1;
+            tx.execute(
+                "INSERT INTO messages (account_id, folder_id, uid, thread_id, subject, to_json, cc_json, bcc_json, date_ts, internal_date_ts, flags_bitmask, snippet, body_synced)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 8, ?10, 1)",
+                params![
+                    account_id,
+                    folder_id,
+                    local_uid,
+                    format!("draft:{now}"),
+                    subject,
+                    to,
+                    cc,
+                    bcc,
+                    now,
+                    body.chars().take(120).collect::<String>(),
+                ],
+            )?;
+            tx.last_insert_rowid()
+        };
+
+        tx.execute(
+            "INSERT INTO message_bodies (message_id, text_plain, raw_size)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(message_id) DO UPDATE SET text_plain = excluded.text_plain, raw_size = excluded.raw_size",
+            params![id, body, body.len() as i64],
+        )?;
+
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn discard_draft_local(&self, draft_id: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("db mutex poisoned");
+        conn.execute(
+            "DELETE FROM messages WHERE id = ?1 AND (flags_bitmask & 8) != 0",
+            params![draft_id],
+        )?;
+        Ok(())
+    }
 }

@@ -479,6 +479,26 @@ async fn dispatch(
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
             }
         }
+        "draft.save" => {
+            let draft_id = req.params.get("draft_id").and_then(|v| v.as_i64());
+            let account_id = req.params.get("account_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let to = req.params.get("to").and_then(|v| v.as_str()).unwrap_or("");
+            let cc = req.params.get("cc").and_then(|v| v.as_str()).unwrap_or("");
+            let bcc = req.params.get("bcc").and_then(|v| v.as_str()).unwrap_or("");
+            let subject = req.params.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+            let body = req.params.get("body").and_then(|v| v.as_str()).unwrap_or("");
+            match db.save_draft_local(draft_id, account_id, to, cc, bcc, subject, body) {
+                Ok(saved_id) => RpcResponse::ok(id, json!({ "draft_id": saved_id })),
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
+        "draft.discard" => {
+            let draft_id = req.params.get("draft_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            match db.discard_draft_local(draft_id) {
+                Ok(()) => RpcResponse::ok(id, json!({ "discarded": true })),
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
         other => RpcResponse::err(id, -32601, format!("method not found: {other}")),
     }
 }
