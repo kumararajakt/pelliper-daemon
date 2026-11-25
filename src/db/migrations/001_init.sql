@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     auth_type          TEXT NOT NULL,
     oauth_provider     TEXT,
     sync_interval_secs INTEGER NOT NULL DEFAULT 300,
+    signature          TEXT NOT NULL DEFAULT '',
     enabled            INTEGER NOT NULL DEFAULT 1,
     last_error         TEXT
 );

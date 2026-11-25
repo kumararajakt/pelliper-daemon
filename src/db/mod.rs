@@ -24,6 +24,7 @@ impl Database {
              PRAGMA busy_timeout = 5000;",
         )?;
         conn.execute_batch(MIGRATION_001)?;
+        let _ = conn.execute("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })

@@ -60,6 +60,7 @@ pub struct AccountRow {
     pub auth_type: String,
     pub oauth_provider: Option<String>,
     pub sync_interval_secs: i64,
+    pub signature: String,
     pub enabled: bool,
     pub last_error: Option<String>,
 }
@@ -113,7 +114,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT id, email, display_name, imap_host, imap_port, imap_tls,
                     smtp_host, smtp_port, smtp_tls, auth_type, oauth_provider,
-                    sync_interval_secs, enabled, last_error
+                    sync_interval_secs, COALESCE(signature, ''), enabled, last_error
              FROM accounts ORDER BY id ASC",
         )?;
         let rows = stmt
@@ -131,8 +132,9 @@ impl Database {
                     auth_type: r.get(9)?,
                     oauth_provider: r.get(10)?,
                     sync_interval_secs: r.get(11)?,
-                    enabled: r.get::<_, i64>(12)? != 0,
-                    last_error: r.get(13)?,
+                    signature: r.get(12)?,
+                    enabled: r.get::<_, i64>(13)? != 0,
+                    last_error: r.get(14)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -167,6 +169,44 @@ impl Database {
             ],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_account(
+        &self,
+        account_id: i64,
+        display_name: Option<&str>,
+        sync_interval_secs: Option<i64>,
+        signature: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Option<AccountRow>> {
+        {
+            let conn = self.conn.lock().expect("db mutex poisoned");
+            if let Some(name) = display_name {
+                conn.execute(
+                    "UPDATE accounts SET display_name = ?1 WHERE id = ?2",
+                    params![name, account_id],
+                )?;
+            }
+            if let Some(interval) = sync_interval_secs {
+                conn.execute(
+                    "UPDATE accounts SET sync_interval_secs = ?1 WHERE id = ?2",
+                    params![interval.max(60), account_id],
+                )?;
+            }
+            if let Some(sig) = signature {
+                conn.execute(
+                    "UPDATE accounts SET signature = ?1 WHERE id = ?2",
+                    params![sig, account_id],
+                )?;
+            }
+            if let Some(en) = enabled {
+                conn.execute(
+                    "UPDATE accounts SET enabled = ?1 WHERE id = ?2",
+                    params![if en { 1 } else { 0 }, account_id],
+                )?;
+            }
+        }
+        self.get_account(account_id)
     }
 
     pub fn delete_account(&self, account_id: i64) -> Result<Option<String>> {

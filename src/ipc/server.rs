@@ -234,6 +234,7 @@ async fn dispatch(
                 auth_type: p.auth_type,
                 oauth_provider: p.oauth_provider,
                 sync_interval_secs: 300,
+                signature: String::new(),
                 enabled: true,
                 last_error: None,
             };
@@ -244,6 +245,26 @@ async fn dispatch(
                     supervisor.spawn_account(row.clone()).await;
                     RpcResponse::ok(id, json!({ "account": row }))
                 }
+                Err(e) => RpcResponse::err(id, -32000, e.to_string()),
+            }
+        }
+        "account.update" => {
+            let account_id = req.params.get("account_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let display_name = req.params.get("display_name").and_then(|v| v.as_str());
+            let sync_interval = req.params.get("sync_interval_secs").and_then(|v| v.as_i64());
+            let signature = req.params.get("signature").and_then(|v| v.as_str());
+            let enabled = req.params.get("enabled").and_then(|v| v.as_bool());
+
+            match db.update_account(account_id, display_name, sync_interval, signature, enabled) {
+                Ok(Some(acc)) => {
+                    if acc.enabled {
+                        supervisor.spawn_account(acc.clone()).await;
+                    } else {
+                        supervisor.stop_account(acc.id);
+                    }
+                    RpcResponse::ok(id, json!({ "account": acc }))
+                }
+                Ok(None) => RpcResponse::err(id, -32004, "account not found"),
                 Err(e) => RpcResponse::err(id, -32000, e.to_string()),
             }
         }
