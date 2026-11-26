@@ -211,11 +211,22 @@ async fn dispatch(
                 )
             };
 
-            if let Err(e) = test_imap_connection(&p.imap_host, p.imap_port, &imap_auth).await {
-                return RpcResponse::err(id, -32001, format!("IMAP verification failed: {e}"));
+            info!(email = %p.email, imap = %p.imap_host, smtp = %p.smtp_host, auth = %p.auth_type, "Verifying IMAP and SMTP connection");
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                test_imap_connection(&p.imap_host, p.imap_port, &imap_auth),
+            ).await {
+                Ok(Ok(())) => info!(email = %p.email, "IMAP verification succeeded"),
+                Ok(Err(e)) => return RpcResponse::err(id, -32001, format!("IMAP verification failed: {e}")),
+                Err(_) => return RpcResponse::err(id, -32001, "IMAP verification timed out"),
             }
-            if let Err(e) = test_smtp_connection(&p.smtp_host, p.smtp_port, &p.smtp_tls, &smtp_auth).await {
-                return RpcResponse::err(id, -32002, format!("SMTP verification failed: {e}"));
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                test_smtp_connection(&p.smtp_host, p.smtp_port, &p.smtp_tls, &smtp_auth),
+            ).await {
+                Ok(Ok(())) => info!(email = %p.email, "SMTP verification succeeded"),
+                Ok(Err(e)) => return RpcResponse::err(id, -32002, format!("SMTP verification failed: {e}")),
+                Err(_) => return RpcResponse::err(id, -32002, "SMTP verification timed out"),
             }
 
             if let Err(e) = store_secret(&p.email, &secret).await {

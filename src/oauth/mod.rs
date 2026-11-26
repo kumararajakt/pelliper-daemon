@@ -48,8 +48,11 @@ pub fn provider_config(provider: &str, custom_client_id: Option<&str>) -> Result
             client_id: custom_client_id
                 .map(str::to_string)
                 .or_else(|| std::env::var("PELLIPER_GOOGLE_CLIENT_ID").ok())
+                .or_else(|| option_env!("PELLIPER_GOOGLE_CLIENT_ID").map(str::to_string))
                 .unwrap_or_default(),
-            client_secret: std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET").ok(),
+            client_secret: std::env::var("PELLIPER_GOOGLE_CLIENT_SECRET")
+                .ok()
+                .or_else(|| option_env!("PELLIPER_GOOGLE_CLIENT_SECRET").map(str::to_string)),
         }),
         "microsoft" | "outlook" | "office365" => Ok(OAuthProviderConfig {
             auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
