@@ -381,13 +381,14 @@ async fn dispatch(
             }
         }
         "message.search" => {
-            let folder_id = req.params.get("folder_id").and_then(|v| v.as_i64());
+            let folder_id = req.params.get("folder_id").and_then(|v| v.as_i64()).filter(|&id| id > 0);
+            let folder_role = req.params.get("folder_role").and_then(|v| v.as_str());
             let query_str = req.params.get("query").and_then(|v| v.as_str()).unwrap_or("");
             let limit = req.params.get("limit").and_then(|v| v.as_i64()).unwrap_or(100);
             let server_search = req.params.get("server_search").and_then(|v| v.as_bool()).unwrap_or(false);
             let search_id = req.params.get("search_id").and_then(|v| v.as_i64()).unwrap_or(0);
             let parsed = parse_search_query(query_str);
-            match db.search_messages_local(folder_id, &parsed, limit) {
+            match db.search_messages_local(folder_id, folder_role, &parsed, limit) {
                 Ok(results) => {
                     if server_search && !query_str.trim().is_empty() {
                         let db_bg = db.clone();

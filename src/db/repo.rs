@@ -69,6 +69,7 @@ pub struct AccountRow {
 pub struct FolderRow {
     pub id: i64,
     pub account_id: i64,
+    pub account_email: String,
     pub name: String,
     pub full_path: String,
     pub delimiter: String,
@@ -259,29 +260,34 @@ impl Database {
     pub fn list_folders(&self, account_id: Option<i64>) -> Result<Vec<FolderRow>> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         let sql = if account_id.is_some() {
-            "SELECT id, account_id, name, full_path, delimiter, role, priority,
-                    uid_validity, uid_next, highest_modseq, total_count, unread_count
-             FROM folders WHERE account_id = ?1 ORDER BY priority ASC, name ASC"
+            "SELECT f.id, f.account_id, a.email, f.name, f.full_path, f.delimiter, f.role, f.priority,
+                    f.uid_validity, f.uid_next, f.highest_modseq, f.total_count, f.unread_count
+             FROM folders f
+             JOIN accounts a ON a.id = f.account_id
+             WHERE f.account_id = ?1 ORDER BY f.priority ASC, f.full_path ASC"
         } else {
-            "SELECT id, account_id, name, full_path, delimiter, role, priority,
-                    uid_validity, uid_next, highest_modseq, total_count, unread_count
-             FROM folders ORDER BY account_id ASC, priority ASC, name ASC"
+            "SELECT f.id, f.account_id, a.email, f.name, f.full_path, f.delimiter, f.role, f.priority,
+                    f.uid_validity, f.uid_next, f.highest_modseq, f.total_count, f.unread_count
+             FROM folders f
+             JOIN accounts a ON a.id = f.account_id
+             ORDER BY f.account_id ASC, f.priority ASC, f.full_path ASC"
         };
         let mut stmt = conn.prepare(sql)?;
         let map_row = |r: &rusqlite::Row| {
             Ok(FolderRow {
                 id: r.get(0)?,
                 account_id: r.get(1)?,
-                name: r.get(2)?,
-                full_path: r.get(3)?,
-                delimiter: r.get(4)?,
-                role: r.get(5)?,
-                priority: r.get(6)?,
-                uid_validity: r.get(7)?,
-                uid_next: r.get(8)?,
-                highest_modseq: r.get(9)?,
-                total_count: r.get(10)?,
-                unread_count: r.get(11)?,
+                account_email: r.get(2)?,
+                name: r.get(3)?,
+                full_path: r.get(4)?,
+                delimiter: r.get(5)?,
+                role: r.get(6)?,
+                priority: r.get(7)?,
+                uid_validity: r.get(8)?,
+                uid_next: r.get(9)?,
+                highest_modseq: r.get(10)?,
+                total_count: r.get(11)?,
+                unread_count: r.get(12)?,
             })
         };
         let rows = if let Some(aid) = account_id {
@@ -352,6 +358,7 @@ impl Database {
     pub fn search_messages_local(
         &self,
         folder_id: Option<i64>,
+        folder_role: Option<&str>,
         q: &ParsedSearchQuery,
         limit: i64,
     ) -> Result<Vec<MessageSummary>> {
@@ -360,13 +367,22 @@ impl Database {
             "SELECT m.id, m.account_id, m.folder_id, m.uid, m.thread_id, m.subject,
                     m.from_json, m.date_ts, m.flags_bitmask, m.snippet,
                     m.has_attachments, m.body_synced
-             FROM messages m WHERE 1=1",
+             FROM messages m
+             JOIN folders f ON f.id = m.folder_id
+             WHERE 1=1",
         );
         let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
 
         if let Some(fid) = folder_id {
             sql.push_str(" AND m.folder_id = ?");
             bind_vals.push(fid.into());
+        } else if let Some(role) = folder_role.filter(|r| !r.is_empty()) {
+            if role == "important" {
+                sql.push_str(" AND ((m.flags_bitmask & 2) = 2 OR f.role = 'important')");
+            } else {
+                sql.push_str(" AND f.role = ?");
+                bind_vals.push(role.to_string().into());
+            }
         }
         for f in &q.from {
             sql.push_str(" AND m.from_json LIKE ?");
