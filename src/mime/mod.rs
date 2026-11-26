@@ -1,3 +1,4 @@
+use base64::Engine;
 use mail_parser::{MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +88,103 @@ pub fn extract_attachment_bytes(raw: &[u8], part_id: &str, filename: &str) -> Op
         }
     }
     None
+}
+
+/// Decodes RFC 2047 encoded-words (`=?UTF-8?Q?...?=` and `=?UTF-8?B?...?=`) in headers.
+pub fn decode_rfc2047(input: &str) -> String {
+    if !input.contains("=?") {
+        return input.to_string();
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut prev_was_encoded = false;
+
+    while let Some(start) = rest.find("=?") {
+        let prefix = &rest[..start];
+        if !(prev_was_encoded && prefix.chars().all(char::is_whitespace)) {
+            out.push_str(prefix);
+        }
+
+        let after_start = &rest[start + 2..];
+        let Some(q1) = after_start.find('?') else {
+            out.push_str("=?");
+            rest = after_start;
+            prev_was_encoded = false;
+            continue;
+        };
+        let after_charset = &after_start[q1 + 1..];
+        let Some(q2) = after_charset.find('?') else {
+            out.push_str(&rest[start..start + 2 + q1 + 1]);
+            rest = after_charset;
+            prev_was_encoded = false;
+            continue;
+        };
+        let encoding = &after_charset[..q2];
+        let after_enc = &after_charset[q2 + 1..];
+        let Some(end) = after_enc.find("?=") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let payload = &after_enc[..end];
+
+        let decoded_bytes: Option<Vec<u8>> = if encoding.eq_ignore_ascii_case("B") {
+            base64::engine::general_purpose::STANDARD.decode(payload).ok()
+        } else if encoding.eq_ignore_ascii_case("Q") {
+            Some(decode_q_encoding(payload))
+        } else {
+            None
+        };
+
+        if let Some(bytes) = decoded_bytes {
+            out.push_str(&String::from_utf8_lossy(&bytes));
+            prev_was_encoded = true;
+        } else {
+            out.push_str(&rest[start..start + 2 + q1 + 1 + q2 + 1 + end + 2]);
+            prev_was_encoded = false;
+        }
+        rest = &after_enc[end + 2..];
+    }
+
+    out.push_str(rest);
+    out
+}
+
+fn decode_q_encoding(s: &str) -> Vec<u8> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'_' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'=' if i + 2 < bytes.len() => {
+                if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                    out.push((h << 4) | l);
+                    i += 3;
+                } else {
+                    out.push(b'=');
+                    i += 1;
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Computes a deterministic `thread_id` from `References` / `In-Reply-To` or normalized `Subject`.
@@ -198,5 +296,13 @@ Hello   world,\r\nThis is a test body.\r\n";
         assert_eq!(t1, "subj:project plan");
         assert_eq!(t2, "ref:m0@x");
         assert_eq!(normalize_subject("Re: Fwd: Re: Budget"), "budget");
+    }
+
+    #[test]
+    fn decodes_rfc2047_q_and_b_headers() {
+        let raw = "=?UTF-8?Q?SBI_offers_=E2=82=B91.6_crore_for_Ch?= =?UTF-8?Q?ief_AI_Officer?=";
+        assert_eq!(decode_rfc2047(raw), "SBI offers ₹1.6 crore for Chief AI Officer");
+        let b64 = "=?UTF-8?B?SGVsbG8gUGVsbGlwZXI=?=";
+        assert_eq!(decode_rfc2047(b64), "Hello Pelliper");
     }
 }

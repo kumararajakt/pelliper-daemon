@@ -25,9 +25,30 @@ impl Database {
         )?;
         conn.execute_batch(MIGRATION_001)?;
         let _ = conn.execute("ALTER TABLE accounts ADD COLUMN signature TEXT NOT NULL DEFAULT ''", []);
+        Self::repair_rfc2047_headers(&conn);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    fn repair_rfc2047_headers(conn: &Connection) {
+        if let Ok(mut stmt) = conn.prepare("SELECT id, subject, from_json FROM messages WHERE subject LIKE '%=?%' OR from_json LIKE '%=?%'") {
+            let rows: Vec<(i64, String, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .collect();
+            for (id, subj, from_j) in rows {
+                let fixed_subj = crate::mime::decode_rfc2047(&subj);
+                let fixed_from = crate::mime::decode_rfc2047(&from_j);
+                let _ = conn.execute(
+                    "UPDATE messages SET subject = ?1, from_json = ?2 WHERE id = ?3",
+                    rusqlite::params![fixed_subj, fixed_from, id],
+                );
+            }
+        }
     }
 
     pub fn account_count(&self) -> Result<i64> {

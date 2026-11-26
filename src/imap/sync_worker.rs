@@ -13,7 +13,7 @@ use crate::db::Database;
 use crate::imap::client::{connect_imap_tls, ImapAuth, ImapSession};
 use crate::imap::priority::classify_folder;
 use crate::ipc::protocol::RpcNotification;
-use crate::mime::{compute_thread_id, parse_message_body};
+use crate::mime::{compute_thread_id, decode_rfc2047, parse_message_body};
 
 pub const BODY_WINDOW_DAYS: u64 = 90;
 pub const HEADER_BATCH_SIZE: usize = 200;
@@ -355,7 +355,7 @@ async fn sync_folder_headers(
                             (
                                 env.subject
                                     .as_ref()
-                                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                                    .map(|b| decode_rfc2047(&String::from_utf8_lossy(b)))
                                     .unwrap_or_default(),
                                 encode_addrs(env.from.as_deref()),
                                 encode_addrs(env.to.as_deref()),
@@ -536,7 +536,7 @@ fn encode_addrs(addrs: Option<&[async_imap::imap_proto::Address<'_>]>) -> String
             let name = a
                 .name
                 .as_ref()
-                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .map(|b| decode_rfc2047(&String::from_utf8_lossy(b)))
                 .unwrap_or_default();
             let mailbox = a
                 .mailbox
