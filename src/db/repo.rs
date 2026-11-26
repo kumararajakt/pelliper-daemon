@@ -1065,7 +1065,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT m.id, m.account_id, m.folder_id, m.subject, m.from_json, m.to_json,
                     m.cc_json, m.date_ts, m.flags_bitmask, m.snippet, m.body_synced,
-                    b.text_plain, b.text_html
+                    b.text_plain, b.text_html, m.message_id
              FROM messages m
              LEFT JOIN message_bodies b ON b.message_id = m.id
              WHERE m.account_id = ?1 AND m.thread_id = ?2
@@ -1073,24 +1073,54 @@ impl Database {
         )?;
         let rows = stmt
             .query_map(params![account_id, thread_id], |r| {
-                Ok(serde_json::json!({
-                    "id": r.get::<_, i64>(0)?,
+                let row_id: i64 = r.get(0)?;
+                let subject: String = r.get(3)?;
+                let from_json: String = r.get(4)?;
+                let date_ts: i64 = r.get(7)?;
+                let body_synced = r.get::<_, i64>(10)? != 0;
+                let msg_id_hdr: String = r.get::<_, Option<String>>(13)?.unwrap_or_default();
+                let dedup_key = if !msg_id_hdr.trim().is_empty() {
+                    format!("mid:{}", msg_id_hdr.trim())
+                } else {
+                    format!("hdr:{}:{}:{}", date_ts, from_json, subject)
+                };
+                let val = serde_json::json!({
+                    "id": row_id,
                     "account_id": r.get::<_, i64>(1)?,
                     "folder_id": r.get::<_, i64>(2)?,
-                    "subject": r.get::<_, String>(3)?,
-                    "from_json": r.get::<_, String>(4)?,
+                    "subject": subject,
+                    "from_json": from_json,
                     "to_json": r.get::<_, String>(5)?,
                     "cc_json": r.get::<_, String>(6)?,
-                    "date_ts": r.get::<_, i64>(7)?,
+                    "date_ts": date_ts,
                     "flags_bitmask": r.get::<_, i64>(8)?,
                     "snippet": r.get::<_, String>(9)?,
-                    "body_synced": r.get::<_, i64>(10)? != 0,
+                    "body_synced": body_synced,
                     "text_plain": r.get::<_, Option<String>>(11)?,
                     "text_html": r.get::<_, Option<String>>(12)?,
-                }))
+                });
+                Ok((dedup_key, row_id, body_synced, val))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+
+        // Deduplicate messages mirrored across multiple folders (e.g. INBOX and [Gmail]/All Mail),
+        // preferring the requested message_id or a copy whose body is already synced.
+        let mut deduped: Vec<(String, i64, bool, serde_json::Value)> = Vec::new();
+        let mut key_to_idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for item in rows {
+            if let Some(&existing_idx) = key_to_idx.get(&item.0) {
+                let existing = &deduped[existing_idx];
+                let replace = (item.1 == message_id && existing.1 != message_id)
+                    || (existing.1 != message_id && item.2 && !existing.2);
+                if replace {
+                    deduped[existing_idx] = item;
+                }
+            } else {
+                key_to_idx.insert(item.0.clone(), deduped.len());
+                deduped.push(item);
+            }
+        }
+        Ok(deduped.into_iter().map(|(_, _, _, v)| v).collect())
     }
 
     pub fn suggest_contacts(&self, query: &str, limit: i64) -> Result<Vec<serde_json::Value>> {
